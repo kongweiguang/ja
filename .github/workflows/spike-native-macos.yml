@@ -1,0 +1,231 @@
+# @author kongweiguang
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: JA macOS Native Image probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/spike-native-macos.yml"
+      - "spikes/native-image/macos/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ja-native-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-probe:
+    name: Native Image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            uname: x86_64
+            runner: macos-26-intel
+            nik_suffix: amd64
+            nik_sha256: 0BC3B9B18ED89275FA3992D25863310734EEED0C79673210708C44369B835310
+          - arch: arm64
+            uname: arm64
+            runner: macos-26
+            nik_suffix: aarch64
+            nik_sha256: 8C74D049FA2B83A6A23F6981293EC956E7195C5FF546B8EB0DD20DF0BD92A99B
+    env:
+      NIK_URL: https://download.bell-sw.com/vm/25.0.3/bellsoft-liberica-vm-openjdk25.0.3%2B12-25.0.3%2B2-macos-${{ matrix.nik_suffix }}.zip
+      NIK_SHA256: ${{ matrix.nik_sha256 }}
+      NIK_VERSION: 25.0.3+2
+      NIK_JAVA_VERSION: 25.0.3+12
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check native runner and Xcode toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "${{ matrix.uname }}"
+          xcode-select -p
+          command -v clang
+          command -v xcrun
+          python_path="$(command -v python3)"
+          test -n "$python_path"
+          python_real="$("$python_path" -c 'import os,sys; print(os.path.realpath(sys.executable))')"
+          case "$python_real" in
+            /*) ;;
+            *) echo 'python3 did not resolve to an absolute path' >&2; exit 1 ;;
+          esac
+          test -f "$python_real"
+          test -x "$python_real"
+          "$python_real" --version
+          printf 'MCP_PYTHON=%s\n' "$python_real" >> "$GITHUB_ENV"
+
+      - name: Install pinned BellSoft Liberica NIK
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/liberica-nik-${{ matrix.arch }}.zip"
+          extract="$RUNNER_TEMP/liberica-nik-${{ matrix.arch }}"
+          mkdir -p "$extract"
+          curl --fail --location --retry 3 --retry-delay 2 --proto '=https' --tlsv1.2 "$NIK_URL" -o "$archive"
+          printf '%s  %s\n' "$NIK_SHA256" "$archive" | shasum -a 256 --check
+          unzip -q "$archive" -d "$extract"
+          nik_home="$(find "$extract" -path '*/Contents/Home/bin/native-image' -print -quit | sed 's#/bin/native-image$##')"
+          test -n "$nik_home"
+          test -x "$nik_home/bin/java"
+          test -x "$nik_home/bin/native-image"
+          printf 'JAVA_HOME=%s\n' "$nik_home" >> "$GITHUB_ENV"
+          printf '%s/bin\n' "$nik_home" >> "$GITHUB_PATH"
+          printf 'NIK_HOME=%s\n' "$nik_home" >> "$GITHUB_ENV"
+
+      - name: Verify pinned toolchain identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(command -v java)" = "$JAVA_HOME/bin/java"
+          test "$(command -v native-image)" = "$JAVA_HOME/bin/native-image"
+          java -version 2>&1 | tee "$RUNNER_TEMP/java-version.txt"
+          native-image --version | tee "$RUNNER_TEMP/native-image-version.txt"
+          mvn --version | tee "$RUNNER_TEMP/maven-version.txt"
+          grep -F "25.0.3" "$RUNNER_TEMP/java-version.txt"
+          grep -F "25.0.3" "$RUNNER_TEMP/native-image-version.txt"
+
+      - name: Run JVM probe and dependency closure audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mvn -f spikes/native-image/macos/probe/pom.xml test
+          mvn -q -f spikes/native-image/macos/probe/pom.xml dependency:tree -DoutputFile="$RUNNER_TEMP/tree-sitter-dependency-tree.txt"
+          mvn -q -f spikes/native-image/macos/probe/pom.xml dependency:build-classpath -Dmdep.outputFile="$RUNNER_TEMP/probe-classpath.txt"
+          fixture="$GITHUB_WORKSPACE/spikes/native-image/macos/fixture/mcp-server.py"
+          timeout_script="$GITHUB_WORKSPACE/spikes/native-image/macos/scripts/run-with-timeout.sh"
+          test -f "$timeout_script"
+          bash "$timeout_script" 45 java --enable-native-access=ALL-UNNAMED \
+            -cp "spikes/native-image/macos/probe/target/classes:$(cat "$RUNNER_TEMP/probe-classpath.txt")" \
+            io.github.kongweiguang.ja.nativeprobe.NativeProbe --mcp-script "$fixture" --mcp-python "$MCP_PYTHON" \
+            > "$RUNNER_TEMP/jvm-probe.stdout" 2> "$RUNNER_TEMP/jvm-probe.stderr"
+          for marker in solon=ok jsonrpc=ok sqlite=ok skill=ok harness=ok providers=ok tls=ok mcp=ok subprocess=ok JA_NATIVE_PROBE=OK; do
+            grep -Fx "$marker" "$RUNNER_TEMP/jvm-probe.stdout"
+          done
+          test ! -s "$RUNNER_TEMP/jvm-probe.stderr"
+          if pgrep -f "$fixture" >/dev/null 2>&1; then
+            echo 'MCP fixture process survived JVM probe shutdown' >&2
+            exit 1
+          fi
+          if grep -Eiq 'api[_ -]?key|bearer|sk-[a-z0-9]|/Users/|/private/var|RUNNER_TEMP' "$RUNNER_TEMP/jvm-probe.stdout" "$RUNNER_TEMP/jvm-probe.stderr"; then
+            echo 'JVM probe output leaked a credential or host path' >&2
+            exit 1
+          fi
+          if grep -Eiq 'tree-sitter' "$RUNNER_TEMP/tree-sitter-dependency-tree.txt"; then
+            echo 'tree-sitter dependency detected; native reachability must be reviewed.'
+          else
+            echo 'tree-sitter dependency absent from the macOS probe closure.'
+          fi
+
+      - name: Build no-fallback native executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          mvn -f spikes/native-image/macos/probe/pom.xml -Pnative -DskipTests package
+
+      - name: Inspect native executable and run two isolated smoke cycles
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/ja-native-macos-evidence"
+          mkdir -p "$evidence"
+          probe="spikes/native-image/macos/probe/target/ja-native-image-macos-probe"
+          fixture="$GITHUB_WORKSPACE/spikes/native-image/macos/fixture/mcp-server.py"
+          timeout_script="$GITHUB_WORKSPACE/spikes/native-image/macos/scripts/run-with-timeout.sh"
+          test -x "$probe"
+          test -f "$timeout_script"
+          file "$probe" | tee "$evidence/file.txt"
+          grep -F "Mach-O 64-bit executable" "$evidence/file.txt"
+          grep -F "${{ matrix.arch }}" "$evidence/file.txt"
+          otool -L "$probe" | tee "$evidence/otool.txt"
+          if grep -Eiq 'java|jre|jdk' "$evidence/otool.txt"; then
+            echo 'native executable links to a JVM runtime' >&2
+            exit 1
+          fi
+          shasum -a 256 "$probe" | tee "$evidence/native.sha256"
+
+          smoke="$RUNNER_TEMP/JA Native 探针/run"
+          mkdir -p "$smoke"
+          cp "$probe" "$smoke/probe"
+          chmod +x "$smoke/probe"
+          # Run each cycle against the copied binary so path relocation and child shutdown are
+          # independently observed rather than hidden by a single in-place invocation.
+          run_probe() {
+            local label="$1"
+            local stdout="$evidence/$label.stdout"
+            local stderr="$evidence/$label.stderr"
+            set +e
+            bash "$timeout_script" 45 "$smoke/probe" --mcp-script "$fixture" --mcp-python "$MCP_PYTHON" >"$stdout" 2>"$stderr"
+            local status=$?
+            set -e
+            test "$status" -eq 0
+            for marker in solon=ok jsonrpc=ok sqlite=ok skill=ok harness=ok providers=ok tls=ok mcp=ok subprocess=ok JA_NATIVE_PROBE=OK; do
+              grep -Fx "$marker" "$stdout"
+            done
+            test ! -s "$stderr"
+            if grep -Eiq 'api[_ -]?key|bearer|sk-[a-z0-9]|/Users/|/private/var|RUNNER_TEMP' "$stdout" "$stderr"; then
+              echo 'probe output leaked a credential or host path' >&2
+              exit 1
+            fi
+            if pgrep -f "$fixture" >/dev/null 2>&1; then
+              echo 'MCP fixture process survived probe shutdown' >&2
+              exit 1
+            fi
+          }
+          run_probe first
+          run_probe second
+          set +e
+          bash "$timeout_script" 15 "$smoke/probe" --mcp-python "$MCP_PYTHON" >"$evidence/missing-script.stdout" 2>"$evidence/missing-script.stderr"
+          status=$?
+          set -e
+          test "$status" -ne 0
+          if grep -Fx 'JA_NATIVE_PROBE=OK' "$evidence/missing-script.stdout"; then
+            echo 'probe succeeded without its mandatory MCP fixture' >&2
+            exit 1
+          fi
+          set +e
+          bash "$timeout_script" 15 "$smoke/probe" --mcp-script "$fixture" >"$evidence/missing-interpreter.stdout" 2>"$evidence/missing-interpreter.stderr"
+          status=$?
+          set -e
+          test "$status" -ne 0
+          if grep -Fx 'JA_NATIVE_PROBE=OK' "$evidence/missing-interpreter.stdout"; then
+            echo 'probe succeeded without its mandatory MCP interpreter' >&2
+            exit 1
+          fi
+          {
+            echo "## JA macOS Native Image probe (${{ matrix.arch }})"
+            echo
+            echo "- runner: \`${{ matrix.runner }}\`"
+            echo "- architecture: \`${{ matrix.arch }}\`"
+            echo "- Liberica NIK: \`$NIK_VERSION\` (Java \`$NIK_JAVA_VERSION\`)"
+            echo "- native executable SHA-256: \`$(cut -d' ' -f1 "$evidence/native.sha256")\`"
+            echo "- smoke cycles: 2 isolated runs plus mandatory-argument negative case"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload bounded evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ja-native-macos-${{ matrix.arch }}-evidence
+          path: |
+            ${{ runner.temp }}/ja-native-macos-evidence
+            ${{ runner.temp }}/java-version.txt
+            ${{ runner.temp }}/native-image-version.txt
+            ${{ runner.temp }}/maven-version.txt
+            ${{ runner.temp }}/tree-sitter-dependency-tree.txt
+            ${{ runner.temp }}/probe-classpath.txt
+            ${{ runner.temp }}/jvm-probe.stdout
+            ${{ runner.temp }}/jvm-probe.stderr
+          if-no-files-found: warn
+          retention-days: 7
