@@ -18,6 +18,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::path::{PreparedPaths, prepare_paths};
+
 /// The cap is intentionally small enough to make a malicious worker unable
 /// to turn the host into an unbounded log buffer while still accepting normal
 /// tool diagnostics.
@@ -54,6 +56,19 @@ impl SandboxSpec {
             max_output_bytes: 64 * 1024,
         }
     }
+}
+
+/// Validated inputs reused by profile generation and process spawning.
+/// Canonicalizing once makes the Seatbelt path contract match the command's
+/// actual exec/current-directory paths instead of two independently resolved
+/// aliases.
+struct PreparedSandboxSpec {
+    worker: PathBuf,
+    workspace: PathBuf,
+    profile_path: PathBuf,
+    args: Vec<OsString>,
+    env: BTreeMap<OsString, OsString>,
+    max_output_bytes: usize,
 }
 
 /// Stable public errors omit absolute paths and environment values so a
@@ -181,7 +196,7 @@ pub struct SandboxChild {
 /// environment.  The wrapper is itself the group leader, so all normal
 /// descendants inherit the kill boundary before the worker executes.
 pub fn spawn(spec: SandboxSpec) -> Result<SandboxChild, SandboxError> {
-    validate_spec(&spec)?;
+    let spec = prepare_spec(spec)?;
     if !Path::new(SANDBOX_EXEC).is_file() {
         return Err(SandboxError::Unsupported);
     }
@@ -515,7 +530,8 @@ fn set_nonblocking<R: AsRawFd>(reader: &R) -> io::Result<()> {
 
 /// Validate every path and cap before any profile or child side effect is
 /// created; this keeps malformed user data fail-closed and deterministic.
-fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
+/// The returned canonical paths are the only paths used after preparation.
+fn prepare_spec(spec: SandboxSpec) -> Result<PreparedSandboxSpec, SandboxError> {
     if spec.max_output_bytes == 0 || spec.max_output_bytes > MAX_OUTPUT_BYTES {
         return Err(SandboxError::InvalidConfig(
             "output bound is outside hard limit",
@@ -528,34 +544,37 @@ fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
     if !spec.workspace.is_dir() {
         return Err(SandboxError::InvalidConfig("workspace is not a directory"));
     }
-    let profile_parent = spec
-        .profile_path
+    let PreparedPaths {
+        worker,
+        workspace,
+        profile_path,
+    } = prepare_paths(&spec.worker, &spec.workspace, &spec.profile_path)
+        .map_err(SandboxError::Io)?;
+    reject_workspace_links(&workspace)?;
+    let profile_parent = profile_path
         .parent()
         .ok_or(SandboxError::InvalidConfig("profile has no parent"))?;
-    if !profile_parent.is_dir() {
-        return Err(SandboxError::InvalidConfig(
-            "profile parent is not a directory",
-        ));
-    }
-    let workspace = fs::canonicalize(&spec.workspace).map_err(SandboxError::Io)?;
-    reject_workspace_links(&workspace)?;
-    let profile_parent = fs::canonicalize(profile_parent).map_err(SandboxError::Io)?;
     if profile_parent.starts_with(&workspace) {
         return Err(SandboxError::InvalidConfig(
             "profile cannot be workspace-owned",
         ));
     }
-    Ok(())
+    Ok(PreparedSandboxSpec {
+        worker,
+        workspace,
+        profile_path,
+        args: spec.args,
+        env: spec.env,
+        max_output_bytes: spec.max_output_bytes,
+    })
 }
 
 /// Generate a default-deny Seatbelt profile with only fixed worker/resource,
 /// workspace data and loader read access.  Network is intentionally absent.
-fn build_profile(spec: &SandboxSpec) -> Result<String, SandboxError> {
-    let worker_path = fs::canonicalize(&spec.worker).map_err(SandboxError::Io)?;
-    let workspace_path = fs::canonicalize(&spec.workspace).map_err(SandboxError::Io)?;
-    let worker = literal(&worker_path)?;
-    let workspace = literal(&workspace_path)?;
-    let metadata_rule = metadata_rule(&[worker_path, workspace_path])?;
+fn build_profile(spec: &PreparedSandboxSpec) -> Result<String, SandboxError> {
+    let worker = literal(&spec.worker)?;
+    let workspace = literal(&spec.workspace)?;
+    let metadata_rule = metadata_rule(&[spec.worker.clone(), spec.workspace.clone()])?;
     Ok(format!(
         "(version 1)\n\
 (deny default)\n\

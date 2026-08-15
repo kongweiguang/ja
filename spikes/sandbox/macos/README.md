@@ -16,6 +16,8 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   读写与 worker 自身 exec；metadata 仅覆盖 loader、worker/workspace 的根组件和
   精确父目录。resource sibling、workspace executable、product DB、secret、`..`、
   symlink escape 均必须失败，且 smoke 单独验证 protected metadata 不可见。
+- worker、workspace 和 profile parent 在准备阶段只 canonicalize 一次；profile 与
+  实际 exec/current directory 共用同一组路径，避免 `/var` 与 `/private/var` alias drift。
 - workspace 内 multiply-linked regular file 在 spawn 前 fail-closed；同文件系统的
   protected hardlink fixture 创建成功时必须拒绝启动且不生成 profile/worker report。
 - parent 环境被清空后只注入 `HOME/USER/LOGNAME/SHELL/TERM/TMPDIR`，`PATH` 和

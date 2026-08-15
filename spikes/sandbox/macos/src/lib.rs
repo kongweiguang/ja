@@ -5,6 +5,9 @@
 //! promoted into the Tauri host.  Unsupported hosts fail explicitly rather
 //! than turning this smoke test into a path-only pseudo-sandbox.
 
+#[cfg(any(target_os = "macos", test))]
+mod path;
+
 #[cfg(target_os = "macos")]
 mod macos;
 
