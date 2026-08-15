@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# @author kongweiguang
+
+[package]
+name = "ja-macos-sandbox-spike"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+publish = false
+description = "macOS Seatbelt and process-group sandbox probe for JA tool workers"
+
+[lib]
+name = "ja_macos_sandbox_spike"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ja-sandbox-probe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "ja-sandbox-worker"
+path = "src/bin/worker.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

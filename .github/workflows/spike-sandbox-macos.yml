@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# @author kongweiguang
+
+name: macOS sandbox spike
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "spikes/sandbox/macos/**"
+      - ".github/workflows/spike-sandbox-macos.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native-seatbelt:
+    name: Seatbelt ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-26-intel
+          - arch: arm64
+            runner: macos-26
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        shell: bash
+        timeout-minutes: 3
+        run: rustup toolchain install 1.88.0 --profile minimal --no-self-update
+
+      - name: Format gate
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          cargo +1.88.0 metadata --manifest-path spikes/sandbox/macos/Cargo.toml --locked --no-deps >/dev/null
+          # cargo fmt has no --locked option; the locked metadata check above
+          # verifies the manifest/lock contract before rustfmt runs.
+          cargo +1.88.0 fmt --manifest-path spikes/sandbox/macos/Cargo.toml -- --check
+
+      - name: Native compile gate
+        shell: bash
+        timeout-minutes: 5
+        run: cargo +1.88.0 check --manifest-path spikes/sandbox/macos/Cargo.toml --all-targets --locked
+
+      - name: Native lint gate
+        shell: bash
+        timeout-minutes: 5
+        run: cargo +1.88.0 clippy --manifest-path spikes/sandbox/macos/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Native security tests
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ja-sandbox-report"
+          for round in 1 2 3; do
+            cargo +1.88.0 test --manifest-path spikes/sandbox/macos/Cargo.toml --all-targets --locked 2>&1 \
+              | tee "$RUNNER_TEMP/ja-sandbox-report/test-${round}.log"
+          done
+
+      - name: Direct native probe
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo +1.88.0 run --manifest-path spikes/sandbox/macos/Cargo.toml --bin ja-sandbox-probe --locked 2>&1 \
+            | tee "$RUNNER_TEMP/ja-sandbox-report/probe.log"
+          grep -F "SANDBOX-PASS" "$RUNNER_TEMP/ja-sandbox-report/probe.log"
+
+      - name: Residual process gate
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          if ps -axo comm= | awk '$1 == "ja-sandbox-probe" || $1 == "ja-sandbox-worker" || $1 == "ja_sandbox_probe" || $1 == "ja_sandbox_worker" { found = 1 } END { exit !found }'; then
+            echo "JA sandbox process residue detected" >&2
+            exit 1
+          fi
+
+      - name: Upload bounded report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ja-sandbox-macos-${{ matrix.arch }}
+          path: ${{ runner.temp }}/ja-sandbox-report
+          if-no-files-found: ignore
+          retention-days: 7
