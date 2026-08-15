@@ -580,7 +580,8 @@ fn build_profile(spec: &PreparedSandboxSpec) -> Result<String, SandboxError> {
 (deny default)\n\
 (allow process-fork)\n\
 (allow process-exec (literal \"{worker}\"))\n\
-(allow signal (target self))\n\
+(allow process-info* (target same-sandbox))\n\
+(allow signal (target same-sandbox))\n\
 (allow sysctl-read)\n\
 (allow file-read* (subpath \"/usr/lib\") (subpath \"/System/Library\") (subpath \"/usr/share\"))\n\
 (allow file-read* (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\"))\n\
@@ -590,6 +591,43 @@ fn build_profile(spec: &PreparedSandboxSpec) -> Result<String, SandboxError> {
 (allow file-write* (subpath \"{workspace}\"))\n\
 (deny network*)\n",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PreparedSandboxSpec, build_profile};
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    /// Lock the process-control policy to same-sandbox targets so a future
+    /// profile edit cannot silently introduce unrestricted process access.
+    #[test]
+    fn profile_process_controls_are_same_sandbox_only() {
+        let profile = build_profile(&PreparedSandboxSpec {
+            worker: PathBuf::from("/private/var/tmp/worker"),
+            workspace: PathBuf::from("/private/var/tmp/workspace"),
+            profile_path: PathBuf::from("/private/var/tmp/profile.sb"),
+            args: Vec::<OsString>::new(),
+            env: BTreeMap::new(),
+            max_output_bytes: 64 * 1024,
+        })
+        .expect("build profile");
+
+        assert!(
+            profile
+                .lines()
+                .any(|line| line == "(allow process-info* (target same-sandbox))")
+        );
+        assert!(
+            profile
+                .lines()
+                .any(|line| line == "(allow signal (target same-sandbox))")
+        );
+        assert!(!profile.lines().any(|line| line == "(allow process-info*)"));
+        assert!(!profile.contains("(allow default)"));
+        assert!(!profile.contains("(allow process-info* (target all))"));
+    }
 }
 
 /// Reject multiply-linked regular files before Seatbelt setup so a workspace
