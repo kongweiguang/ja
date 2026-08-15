@@ -266,6 +266,15 @@ impl SandboxChild {
         result
     }
 
+    /// Poll the direct child without blocking so a caller can distinguish a
+    /// worker that never wrote its startup marker from a slow worker.
+    pub fn poll_status(&mut self) -> Result<Option<ExitStatus>, SandboxError> {
+        match self.child.try_wait() {
+            Ok(status) => Ok(status),
+            Err(error) => Err(self.cleanup_after_wait_error(SandboxError::Io(error))),
+        }
+    }
+
     /// Wait with a deadline, kill the full process group on every terminal
     /// path, then drain nonblocking pipes until EOF or a bounded cleanup
     /// deadline.  This avoids both lost final output and unbounded joins.
@@ -399,6 +408,16 @@ impl SandboxChild {
     /// limit after the process has started.
     fn max_output_bytes(&self) -> usize {
         self.max_output_bytes
+    }
+
+    /// Kill and bounded-reap after a status poll error so diagnostics never
+    /// trade a useful error category for an untracked live child.
+    fn cleanup_after_wait_error(&mut self, error: SandboxError) -> SandboxError {
+        let cleanup_error = self.terminate_group().err();
+        let _ = self.reap_direct_until(Instant::now() + CLEANUP_DEADLINE);
+        let _ = self.child.kill();
+        let _ = self.reap_direct_until(Instant::now() + CLEANUP_DEADLINE);
+        cleanup_error.unwrap_or(error)
     }
 
     /// Reuse the same cleanup ordering for malformed pipe state and setup

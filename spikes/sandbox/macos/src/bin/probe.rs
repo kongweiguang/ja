@@ -15,13 +15,14 @@ fn main() {
 #[cfg(target_os = "macos")]
 mod native {
     use ja_macos_sandbox_spike::{
-        SandboxError, SandboxSpec, kill_process, process_is_alive, spawn,
+        SandboxChild, SandboxError, SandboxSpec, kill_process, process_is_alive, spawn,
     };
     use std::collections::BTreeMap;
     use std::env;
     use std::fs;
     use std::net::TcpListener;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+    use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread;
@@ -348,9 +349,14 @@ mod native {
             path_arg(&release),
         ];
         spec.env = baseline_env();
-        let mut child = spawn(spec).map_err(|error| error.to_string())?;
+        let mut child = spawn(spec).map_err(|error| {
+            format!(
+                "clean preflight spawn failed: {}",
+                sandbox_error_category(&error)
+            )
+        })?;
         assert_private_mode(&profile, 0o600)?;
-        wait_for_file(&report, Duration::from_secs(2))?;
+        wait_for_report_or_exit(&mut child, &report, Duration::from_secs(2))?;
         child.cancel().map_err(|error| error.to_string())?;
         let result = child.wait_with_output(Duration::from_secs(2));
         drop(child);
@@ -363,6 +369,109 @@ mod native {
             return Err("clean workspace profile was not cleaned".into());
         }
         Ok(())
+    }
+
+    /// Wait for the startup marker while polling the direct child, so loader,
+    /// profile and exec failures are reported instead of becoming a generic
+    /// marker timeout.
+    fn wait_for_report_or_exit(
+        child: &mut SandboxChild,
+        report: &Path,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if report.is_file() {
+                return Ok(());
+            }
+            if let Some(status) = child.poll_status().map_err(|error| {
+                format!("startup poll failed: {}", sandbox_error_category(&error))
+            })? {
+                return Err(diagnose_terminal_child(child, &status));
+            }
+            if Instant::now() >= deadline {
+                let terminal = child.wait_with_output(Duration::ZERO);
+                return Err(match terminal {
+                    Ok(output) => format!(
+                        "startup marker deadline: child={}; stderr={}",
+                        exit_status_category(&output.outcome.status),
+                        stderr_category(&output.stderr)
+                    ),
+                    Err(error) => format!(
+                        "startup marker deadline: wait={}",
+                        sandbox_error_category(&error)
+                    ),
+                });
+            }
+            // This sleep only backs off between status/file observations; the
+            // report and direct-child state, not elapsed sleep, ends the wait.
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Drain a terminal worker within the normal bounded cleanup path and
+    /// expose only stable status/stderr categories, never raw process output.
+    fn diagnose_terminal_child(
+        child: &mut SandboxChild,
+        status: &std::process::ExitStatus,
+    ) -> String {
+        match child.wait_with_output(Duration::from_millis(100)) {
+            Ok(output) => format!(
+                "worker exited before startup marker: child={}; stderr={}",
+                exit_status_category(status),
+                stderr_category(&output.stderr)
+            ),
+            Err(error) => format!(
+                "worker exited before startup marker: child={}; wait={}",
+                exit_status_category(status),
+                sandbox_error_category(&error)
+            ),
+        }
+    }
+
+    /// Reduce sandbox errors to an audit-friendly category without leaking
+    /// filesystem paths, command arguments or provider credentials.
+    fn sandbox_error_category(error: &SandboxError) -> &'static str {
+        match error {
+            SandboxError::InvalidConfig(_) => "invalid-config",
+            SandboxError::Io(_) => "io",
+            SandboxError::Profile(_) => "profile",
+            SandboxError::Unsupported => "unsupported",
+            SandboxError::Timeout => "timeout",
+            SandboxError::Cancelled => "cancelled",
+            SandboxError::OutputOverflow => "output-overflow",
+            SandboxError::ChildCleanup(_) => "child-cleanup",
+        }
+    }
+
+    /// Report only exit class and not a platform-specific raw status string.
+    fn exit_status_category(status: &std::process::ExitStatus) -> String {
+        if status.success() {
+            "success".into()
+        } else if let Some(code) = status.code() {
+            format!("exit-code-{code}")
+        } else if let Some(signal) = status.signal() {
+            format!("signal-{signal}")
+        } else {
+            "unknown".into()
+        }
+    }
+
+    /// Classify stderr by known failure families and discard its contents so
+    /// profile paths, secrets and runner-specific diagnostics stay private.
+    fn stderr_category(stderr: &[u8]) -> &'static str {
+        let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+        if text.is_empty() {
+            "empty"
+        } else if text.contains("permission denied") || text.contains("operation not permitted") {
+            "permission-denied"
+        } else if text.contains("no such file") {
+            "not-found"
+        } else if text.contains("sandbox") || text.contains("seatbelt") {
+            "sandbox-policy"
+        } else {
+            "nonempty"
+        }
     }
 
     /// Timeout must kill a blocked parent and its real descendant before the

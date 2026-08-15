@@ -27,6 +27,8 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
 - 每次 worker 前后检查 ACL、mode、content hash 和 xattr；profile 使用 `0600`、probe
   temp root 使用 `0700`，profile、Unicode/space temp tree、report、worker 和 child
   必须在 probe 结束后清理。
+- clean workspace preflight 等待 report 或 direct child terminal；若 worker 提前退出，
+  只输出 exit/stderr category，不输出 profile 路径、命令参数或原始错误内容。
 
 ## 进程树不变量
 
