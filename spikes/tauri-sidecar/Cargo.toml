@@ -1,0 +1,26 @@
+# @author kongweiguang
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "ja-tauri-sidecar-spike"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+description = "隔离验证 JA Tauri sidecar 生命周期与进程树清理"
+
+[dependencies]
+# 使用成熟 JSON parser 让 framing 检查与握手判定拒绝伪造/畸形 JSON。
+serde_json = "=1.0.151"
+
+[lib]
+name = "ja_tauri_sidecar_spike"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ja-sidecar-spike-helper"
+path = "src/bin/helper.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

@@ -1,0 +1,991 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ja.invalid/contracts/ja-rpc/v1/schema/ja-rpc-v1.schema.json",
+  "title": "JA JSON-RPC v1 frame",
+  "description": "Machine-readable envelope and payload contract for the JA desktop sidecar channel.",
+  "oneOf": [
+    { "$ref": "#/$defs/clientRequest" },
+    { "$ref": "#/$defs/serverRequest" },
+    { "$ref": "#/$defs/response" },
+    { "$ref": "#/$defs/notification" }
+  ],
+  "$defs": {
+    "requestId": {
+      "type": "string",
+      "pattern": "^(c|s):[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 98
+    },
+    "clientRequestId": {
+      "type": "string",
+      "pattern": "^c:[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 98
+    },
+    "serverRequestId": {
+      "type": "string",
+      "pattern": "^s:[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 98
+    },
+    "threadId": {
+      "type": "string",
+      "pattern": "^thr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 100
+    },
+    "turnId": {
+      "type": "string",
+      "pattern": "^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 101
+    },
+    "itemId": {
+      "type": "string",
+      "pattern": "^item_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 101
+    },
+    "eventId": {
+      "type": "string",
+      "pattern": "^evt_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 100
+    },
+    "workspaceId": {
+      "type": "string",
+      "pattern": "^ws_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 99
+    },
+    "approvalId": {
+      "type": "string",
+      "pattern": "^appr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 101
+    },
+    "artifactId": {
+      "type": "string",
+      "pattern": "^artifact_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 105
+    },
+    "attachmentId": {
+      "type": "string",
+      "pattern": "^att_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 99
+    },
+    "profileRevision": {
+      "type": "string",
+      "pattern": "^profile_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 104
+    },
+    "skillRevision": {
+      "type": "string",
+      "pattern": "^skill_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 104
+    },
+    "mcpRevision": {
+      "type": "string",
+      "pattern": "^mcp_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 102
+    },
+    "serverInstanceId": {
+      "type": "string",
+      "pattern": "^srv_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+      "maxLength": 101
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 64
+    },
+    "jsonRpc": {
+      "const": "2.0"
+    },
+    "emptyParams": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "limits": {
+      "type": "object",
+      "required": [
+        "maxFrameBytes",
+        "maxInboundQueueFrames",
+        "maxOutboundQueueFrames",
+        "maxInFlightRequests",
+        "maxPendingRequests",
+        "maxItemDeltaBytes",
+        "maxInlineToolOutputBytes",
+        "maxArtifactBytes",
+        "maxLogBytes",
+        "defaultRequestDeadlineMs",
+        "defaultApprovalDeadlineMs"
+      ],
+      "properties": {
+        "maxFrameBytes": { "type": "integer", "minimum": 1024, "maximum": 16777216 },
+        "maxInboundQueueFrames": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "maxOutboundQueueFrames": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "maxInFlightRequests": { "type": "integer", "minimum": 1, "maximum": 1024 },
+        "maxPendingRequests": { "type": "integer", "minimum": 1, "maximum": 1024 },
+        "maxItemDeltaBytes": { "type": "integer", "minimum": 256, "maximum": 1048576 },
+        "maxInlineToolOutputBytes": { "type": "integer", "minimum": 1024, "maximum": 16777216 },
+        "maxArtifactBytes": { "type": "integer", "minimum": 1048576, "maximum": 1073741824 },
+        "maxLogBytes": { "type": "integer", "minimum": 4096, "maximum": 67108864 },
+        "defaultRequestDeadlineMs": { "type": "integer", "minimum": 1000, "maximum": 3600000 },
+        "defaultApprovalDeadlineMs": { "type": "integer", "minimum": 1000, "maximum": 3600000 }
+      },
+      "additionalProperties": true
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["methods", "events", "permissionModes", "itemKinds", "mcp"],
+      "properties": {
+        "methods": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 128 }, "maxItems": 256, "uniqueItems": true },
+        "events": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 128 }, "maxItems": 256, "uniqueItems": true },
+        "permissionModes": { "type": "array", "items": { "enum": ["plan", "workspace", "full_access"] }, "maxItems": 3, "uniqueItems": true },
+        "itemKinds": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 64 }, "maxItems": 64, "uniqueItems": true },
+        "mcp": {
+          "type": "object",
+          "required": ["protocolVersions", "transports", "features"],
+          "properties": {
+            "protocolVersions": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 32 }, "maxItems": 16, "uniqueItems": true },
+            "transports": { "type": "array", "items": { "enum": ["stdio", "streamable_http"] }, "maxItems": 2, "uniqueItems": true },
+            "features": { "type": "array", "items": { "enum": ["tools_list", "tools_call"] }, "maxItems": 2, "uniqueItems": true }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "requestBaseClient": {
+      "type": "object",
+      "required": ["jsonrpc", "id", "method", "params"],
+      "properties": {
+        "jsonrpc": { "$ref": "#/$defs/jsonRpc" },
+        "id": { "$ref": "#/$defs/clientRequestId" },
+        "method": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "params": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "requestBaseServer": {
+      "type": "object",
+      "required": ["jsonrpc", "id", "method", "params"],
+      "properties": {
+        "jsonrpc": { "$ref": "#/$defs/jsonRpc" },
+        "id": { "$ref": "#/$defs/serverRequestId" },
+        "method": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "params": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "initializeParams": {
+      "type": "object",
+      "required": ["protocolMajor", "protocolMinor", "minimumCompatibleMinor", "clientVersion", "capabilities", "limits"],
+      "properties": {
+        "protocolMajor": { "const": 1 },
+        "protocolMinor": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+        "minimumCompatibleMinor": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+        "clientVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "capabilities": { "$ref": "#/$defs/capabilities" },
+        "limits": { "$ref": "#/$defs/limits" },
+        "workspacePolicy": { "$ref": "#/$defs/workspacePolicy" }
+      },
+      "additionalProperties": true
+    },
+    "versionParams": {
+      "type": "object",
+      "properties": { "includeBuild": { "type": "boolean" } },
+      "additionalProperties": true
+    },
+    "capabilitiesReadParams": {
+      "type": "object",
+      "properties": { "includeUnavailable": { "type": "boolean" } },
+      "additionalProperties": true
+    },
+    "healthReadParams": {
+      "type": "object",
+      "properties": { "verbose": { "type": "boolean" } },
+      "additionalProperties": true
+    },
+    "diagnosticsReadParams": {
+      "type": "object",
+      "properties": { "includeLogs": { "type": "boolean" }, "maxBytes": { "type": "integer", "minimum": 1, "maximum": 67108864 } },
+      "additionalProperties": true
+    },
+    "shutdownParams": {
+      "type": "object",
+      "properties": { "reason": { "type": "string", "maxLength": 256 }, "deadlineMs": { "type": "integer", "minimum": 1, "maximum": 300000 } },
+      "additionalProperties": true
+    },
+    "workspaceOpenParams": {
+      "type": "object",
+      "required": ["workspaceId", "rootPath", "trust"],
+      "properties": {
+        "workspaceId": { "$ref": "#/$defs/workspaceId" },
+        "rootPath": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "trust": { "enum": ["untrusted", "trusted"] },
+        "displayName": { "type": "string", "maxLength": 256 }
+      },
+      "additionalProperties": true
+    },
+    "workspaceListParams": {
+      "type": "object",
+      "properties": { "includeArchived": { "type": "boolean" } },
+      "additionalProperties": true
+    },
+    "workspaceTrustParams": {
+      "type": "object",
+      "required": ["workspaceId", "trust"],
+      "properties": { "workspaceId": { "$ref": "#/$defs/workspaceId" }, "trust": { "enum": ["untrusted", "trusted"] } },
+      "additionalProperties": true
+    },
+    "workspaceIdParams": {
+      "type": "object",
+      "required": ["workspaceId"],
+      "properties": { "workspaceId": { "$ref": "#/$defs/workspaceId" } },
+      "additionalProperties": true
+    },
+    "threadCreateParams": {
+      "type": "object",
+      "required": ["workspaceId"],
+      "properties": { "workspaceId": { "$ref": "#/$defs/workspaceId" }, "title": { "type": "string", "maxLength": 512 }, "profileRevision": { "$ref": "#/$defs/profileRevision" } },
+      "additionalProperties": true
+    },
+    "threadListParams": {
+      "type": "object",
+      "required": ["workspaceId"],
+      "properties": { "workspaceId": { "$ref": "#/$defs/workspaceId" }, "includeArchived": { "type": "boolean" }, "limit": { "type": "integer", "minimum": 1, "maximum": 500 }, "cursor": { "type": "string", "maxLength": 256 } },
+      "additionalProperties": true
+    },
+    "threadReadParams": {
+      "type": "object",
+      "required": ["threadId"],
+      "properties": { "threadId": { "$ref": "#/$defs/threadId" }, "view": { "enum": ["snapshot"] }, "afterSeq": { "$ref": "#/$defs/seq" }, "limit": { "type": "integer", "minimum": 1, "maximum": 1000 } },
+      "additionalProperties": true
+    },
+    "threadSubscribeParams": {
+      "type": "object",
+      "required": ["threadId"],
+      "properties": { "threadId": { "$ref": "#/$defs/threadId" }, "fromSeq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "subscriptionId": { "type": "string", "pattern": "^sub_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 99 } },
+      "additionalProperties": true
+    },
+    "threadIdParams": {
+      "type": "object",
+      "required": ["threadId"],
+      "properties": { "threadId": { "$ref": "#/$defs/threadId" } },
+      "additionalProperties": true
+    },
+    "turnStartParams": {
+      "type": "object",
+      "required": ["threadId", "input", "mode", "permissionMode", "profileRevision"],
+      "properties": {
+        "threadId": { "$ref": "#/$defs/threadId" },
+        "input": { "type": "array", "items": { "$ref": "#/$defs/inputPart" }, "minItems": 1, "maxItems": 128 },
+        "mode": { "enum": ["plan", "workspace", "full_access"] },
+        "permissionMode": { "enum": ["allow", "ask", "deny"] },
+        "profileRevision": { "$ref": "#/$defs/profileRevision" },
+        "attachmentIds": { "type": "array", "items": { "$ref": "#/$defs/attachmentId" }, "maxItems": 64, "uniqueItems": true },
+        "clientRequestKey": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "additionalProperties": true
+    },
+    "turnControlParams": {
+      "type": "object",
+      "required": ["threadId", "turnId"],
+      "properties": { "threadId": { "$ref": "#/$defs/threadId" }, "turnId": { "$ref": "#/$defs/turnId" }, "reason": { "type": "string", "maxLength": 512 } },
+      "additionalProperties": true
+    },
+    "turnInputParams": {
+      "type": "object",
+      "required": ["threadId", "input"],
+      "properties": { "threadId": { "$ref": "#/$defs/threadId" }, "turnId": { "$ref": "#/$defs/turnId" }, "input": { "type": "array", "items": { "$ref": "#/$defs/inputPart" }, "minItems": 1, "maxItems": 128 } },
+      "additionalProperties": true
+    },
+    "profileRevisionParams": {
+      "type": "object",
+      "required": ["profileRevision"],
+      "properties": { "profileRevision": { "$ref": "#/$defs/profileRevision" } },
+      "additionalProperties": true
+    },
+    "profileSaveParams": {
+      "type": "object",
+      "required": ["profile"],
+      "properties": { "profile": { "$ref": "#/$defs/profile" }, "expectedRevision": { "$ref": "#/$defs/profileRevision" } },
+      "additionalProperties": true
+    },
+    "modelProbeParams": {
+      "type": "object",
+      "required": ["model"],
+      "properties": { "model": { "$ref": "#/$defs/modelProfile" }, "credentialRef": { "type": "string", "pattern": "^cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 100 } },
+      "additionalProperties": true
+    },
+    "skillImportParams": {
+      "type": "object",
+      "required": ["source"],
+      "properties": { "source": { "type": "object", "required": ["kind", "value"], "properties": { "kind": { "enum": ["builtin", "directory", "archive"] }, "value": { "type": "string", "minLength": 1, "maxLength": 4096 } }, "additionalProperties": true } },
+      "additionalProperties": true
+    },
+    "skillEnableParams": {
+      "type": "object",
+      "required": ["skillRevision", "enabled"],
+      "properties": { "skillRevision": { "$ref": "#/$defs/skillRevision" }, "enabled": { "type": "boolean" }, "scope": { "enum": ["user", "workspace", "thread"] }, "workspaceId": { "$ref": "#/$defs/workspaceId" }, "threadId": { "$ref": "#/$defs/threadId" } },
+      "additionalProperties": true
+    },
+    "skillHealthParams": {
+      "type": "object",
+      "properties": { "skillRevision": { "$ref": "#/$defs/skillRevision" } },
+      "additionalProperties": true
+    },
+    "mcpSaveParams": {
+      "type": "object",
+      "required": ["server"],
+      "properties": { "server": { "$ref": "#/$defs/mcpServer" }, "expectedRevision": { "$ref": "#/$defs/mcpRevision" } },
+      "additionalProperties": true
+    },
+    "mcpIdParams": {
+      "type": "object",
+      "required": ["mcpRevision"],
+      "properties": { "mcpRevision": { "$ref": "#/$defs/mcpRevision" } },
+      "additionalProperties": true
+    },
+    "mcpToolPolicyParams": {
+      "type": "object",
+      "required": ["mcpRevision", "toolName", "policy"],
+      "properties": { "mcpRevision": { "$ref": "#/$defs/mcpRevision" }, "toolName": { "type": "string", "minLength": 1, "maxLength": 256 }, "policy": { "enum": ["allow", "ask", "deny"] } },
+      "additionalProperties": true
+    },
+    "attachmentImportParams": {
+      "type": "object",
+      "required": ["sourceToken", "fileName", "mimeType", "sizeBytes", "sha256"],
+      "properties": { "sourceToken": { "type": "string", "pattern": "^pick_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 100 }, "fileName": { "type": "string", "minLength": 1, "maxLength": 512 }, "mimeType": { "type": "string", "minLength": 1, "maxLength": 128 }, "sizeBytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 }, "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" } },
+      "additionalProperties": true
+    },
+    "attachmentIdParams": {
+      "type": "object",
+      "required": ["attachmentId"],
+      "properties": { "attachmentId": { "$ref": "#/$defs/attachmentId" } },
+      "additionalProperties": true
+    },
+    "approvalRequestParams": {
+      "type": "object",
+      "required": ["approvalId", "threadId", "turnId", "itemId", "action", "risk", "policySource", "expiresAt"],
+      "properties": {
+        "approvalId": { "$ref": "#/$defs/approvalId" },
+        "threadId": { "$ref": "#/$defs/threadId" },
+        "turnId": { "$ref": "#/$defs/turnId" },
+        "itemId": { "$ref": "#/$defs/itemId" },
+        "action": { "$ref": "#/$defs/action" },
+        "risk": { "enum": ["low", "medium", "high", "critical"] },
+        "policySource": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "scopeOptions": { "type": "array", "items": { "enum": ["once", "thread", "workspace"] }, "maxItems": 3, "uniqueItems": true },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "reason": { "type": "string", "maxLength": 2048 }
+      },
+      "additionalProperties": true
+    },
+    "secretResolveParams": {
+      "type": "object",
+      "required": ["credentialRef", "purpose", "profileRevision"],
+      "properties": { "credentialRef": { "type": "string", "pattern": "^cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 100 }, "purpose": { "enum": ["model", "mcp" ] }, "profileRevision": { "$ref": "#/$defs/profileRevision" }, "mcpRevision": { "$ref": "#/$defs/mcpRevision" } },
+      "additionalProperties": true
+    },
+    "externalToolRequestParams": {
+      "type": "object",
+      "required": ["externalRequestId", "toolName", "input", "deadlineMs"],
+      "properties": { "externalRequestId": { "type": "string", "pattern": "^ext_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 100 }, "toolName": { "type": "string", "minLength": 1, "maxLength": 256 }, "input": { "type": "object", "additionalProperties": true }, "deadlineMs": { "type": "integer", "minimum": 1, "maximum": 3600000 }, "threadId": { "$ref": "#/$defs/threadId" }, "turnId": { "$ref": "#/$defs/turnId" }, "itemId": { "$ref": "#/$defs/itemId" } },
+      "additionalProperties": true
+    },
+    "clientRequest": {
+      "oneOf": [
+        { "$ref": "#/$defs/initializeRequest" },
+        { "$ref": "#/$defs/versionRequest" },
+        { "$ref": "#/$defs/capabilitiesReadRequest" },
+        { "$ref": "#/$defs/healthReadRequest" },
+        { "$ref": "#/$defs/diagnosticsReadRequest" },
+        { "$ref": "#/$defs/shutdownRequest" },
+        { "$ref": "#/$defs/workspaceOpenRequest" },
+        { "$ref": "#/$defs/workspaceListRequest" },
+        { "$ref": "#/$defs/workspaceTrustRequest" },
+        { "$ref": "#/$defs/workspaceUnregisterRequest" },
+        { "$ref": "#/$defs/threadCreateRequest" },
+        { "$ref": "#/$defs/threadListRequest" },
+        { "$ref": "#/$defs/threadReadRequest" },
+        { "$ref": "#/$defs/threadSubscribeRequest" },
+        { "$ref": "#/$defs/threadUnsubscribeRequest" },
+        { "$ref": "#/$defs/threadArchiveRequest" },
+        { "$ref": "#/$defs/threadDeleteRequest" },
+        { "$ref": "#/$defs/threadPurgeRequest" },
+        { "$ref": "#/$defs/turnStartRequest" },
+        { "$ref": "#/$defs/turnCancelRequest" },
+        { "$ref": "#/$defs/turnSteerRequest" },
+        { "$ref": "#/$defs/turnFollowUpRequest" },
+        { "$ref": "#/$defs/profileListRequest" },
+        { "$ref": "#/$defs/profileReadRequest" },
+        { "$ref": "#/$defs/profileSaveRequest" },
+        { "$ref": "#/$defs/profileActivateRequest" },
+        { "$ref": "#/$defs/modelProbeRequest" },
+        { "$ref": "#/$defs/modelCapabilitiesReadRequest" },
+        { "$ref": "#/$defs/skillListRequest" },
+        { "$ref": "#/$defs/skillImportRequest" },
+        { "$ref": "#/$defs/skillEnableRequest" },
+        { "$ref": "#/$defs/skillReloadRequest" },
+        { "$ref": "#/$defs/skillHealthReadRequest" },
+        { "$ref": "#/$defs/mcpListRequest" },
+        { "$ref": "#/$defs/mcpSaveRequest" },
+        { "$ref": "#/$defs/mcpDeleteRequest" },
+        { "$ref": "#/$defs/mcpTestRequest" },
+        { "$ref": "#/$defs/mcpReloadRequest" },
+        { "$ref": "#/$defs/mcpToolsReadRequest" },
+        { "$ref": "#/$defs/mcpToolPolicySetRequest" },
+        { "$ref": "#/$defs/attachmentImportRequest" },
+        { "$ref": "#/$defs/attachmentReadRequest" },
+        { "$ref": "#/$defs/attachmentDeleteRequest" }
+      ]
+    },
+    "serverRequest": {
+      "oneOf": [
+        { "$ref": "#/$defs/approvalRequest" },
+        { "$ref": "#/$defs/secretResolveRequest" },
+        { "$ref": "#/$defs/externalToolRequest" }
+      ]
+    },
+    "initializeRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "initialize" }, "params": { "$ref": "#/$defs/initializeParams" } }, "required": ["method", "params"] } ] },
+    "versionRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "version" }, "params": { "$ref": "#/$defs/versionParams" } }, "required": ["method", "params"] } ] },
+    "capabilitiesReadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "capabilities/read" }, "params": { "$ref": "#/$defs/capabilitiesReadParams" } }, "required": ["method", "params"] } ] },
+    "healthReadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "health/read" }, "params": { "$ref": "#/$defs/healthReadParams" } }, "required": ["method", "params"] } ] },
+    "diagnosticsReadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "diagnostics/read" }, "params": { "$ref": "#/$defs/diagnosticsReadParams" } }, "required": ["method", "params"] } ] },
+    "shutdownRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "shutdown" }, "params": { "$ref": "#/$defs/shutdownParams" } }, "required": ["method", "params"] } ] },
+    "workspaceOpenRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "workspace/open" }, "params": { "$ref": "#/$defs/workspaceOpenParams" } }, "required": ["method", "params"] } ] },
+    "workspaceListRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "workspace/list" }, "params": { "$ref": "#/$defs/workspaceListParams" } }, "required": ["method", "params"] } ] },
+    "workspaceTrustRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "workspace/trust/set" }, "params": { "$ref": "#/$defs/workspaceTrustParams" } }, "required": ["method", "params"] } ] },
+    "workspaceUnregisterRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "workspace/unregister" }, "params": { "$ref": "#/$defs/workspaceIdParams" } }, "required": ["method", "params"] } ] },
+    "threadCreateRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "thread/create" }, "params": { "$ref": "#/$defs/threadCreateParams" } }, "required": ["method", "params"] } ] },
+    "threadListRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "thread/list" }, "params": { "$ref": "#/$defs/threadListParams" } }, "required": ["method", "params"] } ] },
+    "threadReadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "thread/read" }, "params": { "$ref": "#/$defs/threadReadParams" } }, "required": ["method", "params"] } ] },
+    "threadSubscribeRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "thread/subscribe" }, "params": { "$ref": "#/$defs/threadSubscribeParams" } }, "required": ["method", "params"] } ] },
+    "threadUnsubscribeRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "thread/unsubscribe" }, "params": { "$ref": "#/$defs/threadSubscribeParams" } }, "required": ["method", "params"] } ] },
+    "threadArchiveRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "thread/archive" }, "params": { "$ref": "#/$defs/threadIdParams" } }, "required": ["method", "params"] } ] },
+    "threadDeleteRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "thread/delete" }, "params": { "$ref": "#/$defs/threadIdParams" } }, "required": ["method", "params"] } ] },
+    "threadPurgeRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "thread/purge" }, "params": { "$ref": "#/$defs/threadIdParams" } }, "required": ["method", "params"] } ] },
+    "turnStartRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "turn/start" }, "params": { "$ref": "#/$defs/turnStartParams" } }, "required": ["method", "params"] } ] },
+    "turnCancelRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "turn/cancel" }, "params": { "$ref": "#/$defs/turnControlParams" } }, "required": ["method", "params"] } ] },
+    "turnSteerRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "turn/steer" }, "params": { "$ref": "#/$defs/turnInputParams" } }, "required": ["method", "params"] } ] },
+    "turnFollowUpRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "turn/followUp" }, "params": { "$ref": "#/$defs/turnInputParams" } }, "required": ["method", "params"] } ] },
+    "profileListRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "profile/list" }, "params": { "$ref": "#/$defs/emptyParams" } }, "required": ["method", "params"] } ] },
+    "profileReadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "profile/read" }, "params": { "$ref": "#/$defs/profileRevisionParams" } }, "required": ["method", "params"] } ] },
+    "profileSaveRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "profile/save" }, "params": { "$ref": "#/$defs/profileSaveParams" } }, "required": ["method", "params"] } ] },
+    "profileActivateRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "profile/activate" }, "params": { "$ref": "#/$defs/profileRevisionParams" } }, "required": ["method", "params"] } ] },
+    "modelProbeRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "model/probe" }, "params": { "$ref": "#/$defs/modelProbeParams" } }, "required": ["method", "params"] } ] },
+    "modelCapabilitiesReadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "model/capabilities/read" }, "params": { "$ref": "#/$defs/emptyParams" } }, "required": ["method", "params"] } ] },
+    "skillListRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "skill/list" }, "params": { "$ref": "#/$defs/emptyParams" } }, "required": ["method", "params"] } ] },
+    "skillImportRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "skill/import" }, "params": { "$ref": "#/$defs/skillImportParams" } }, "required": ["method", "params"] } ] },
+    "skillEnableRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "skill/enable" }, "params": { "$ref": "#/$defs/skillEnableParams" } }, "required": ["method", "params"] } ] },
+    "skillReloadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "skill/reload" }, "params": { "$ref": "#/$defs/skillHealthParams" } }, "required": ["method", "params"] } ] },
+    "skillHealthReadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "skill/health/read" }, "params": { "$ref": "#/$defs/skillHealthParams" } }, "required": ["method", "params"] } ] },
+    "mcpListRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "mcp/list" }, "params": { "$ref": "#/$defs/emptyParams" } }, "required": ["method", "params"] } ] },
+    "mcpSaveRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "mcp/save" }, "params": { "$ref": "#/$defs/mcpSaveParams" } }, "required": ["method", "params"] } ] },
+    "mcpDeleteRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "mcp/delete" }, "params": { "$ref": "#/$defs/mcpIdParams" } }, "required": ["method", "params"] } ] },
+    "mcpTestRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "mcp/test" }, "params": { "$ref": "#/$defs/mcpIdParams" } }, "required": ["method", "params"] } ] },
+    "mcpReloadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "mcp/reload" }, "params": { "$ref": "#/$defs/mcpIdParams" } }, "required": ["method", "params"] } ] },
+    "mcpToolsReadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "mcp/tools/read" }, "params": { "$ref": "#/$defs/mcpIdParams" } }, "required": ["method", "params"] } ] },
+    "mcpToolPolicySetRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "mcp/toolPolicy/set" }, "params": { "$ref": "#/$defs/mcpToolPolicyParams" } }, "required": ["method", "params"] } ] },
+    "attachmentImportRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "attachment/import" }, "params": { "$ref": "#/$defs/attachmentImportParams" } }, "required": ["method", "params"] } ] },
+    "attachmentReadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "attachment/read" }, "params": { "$ref": "#/$defs/attachmentIdParams" } }, "required": ["method", "params"] } ] },
+    "attachmentDeleteRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "attachment/delete" }, "params": { "$ref": "#/$defs/attachmentIdParams" } }, "required": ["method", "params"] } ] },
+    "approvalRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseServer" }, { "type": "object", "properties": { "method": { "const": "approval/request" }, "params": { "$ref": "#/$defs/approvalRequestParams" } }, "required": ["method", "params"] } ] },
+    "secretResolveRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseServer" }, { "type": "object", "properties": { "method": { "const": "secret/resolve" }, "params": { "$ref": "#/$defs/secretResolveParams" } }, "required": ["method", "params"] } ] },
+    "externalToolRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseServer" }, { "type": "object", "properties": { "method": { "const": "externalTool/request" }, "params": { "$ref": "#/$defs/externalToolRequestParams" } }, "required": ["method", "params"] } ] },
+    "response": {
+      "type": "object",
+      "required": ["jsonrpc", "id"],
+      "properties": { "jsonrpc": { "$ref": "#/$defs/jsonRpc" }, "id": { "$ref": "#/$defs/requestId" }, "result": { "type": ["object", "array", "string", "number", "boolean", "null"] }, "error": { "$ref": "#/$defs/error" } },
+      "oneOf": [ { "required": ["result"], "not": { "required": ["error"] } }, { "required": ["error"], "not": { "required": ["result"] } } ],
+      "additionalProperties": true
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "data"],
+      "properties": {
+        "code": { "type": "integer", "minimum": -32768, "maximum": -32000 },
+        "message": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "data": {
+          "type": "object",
+          "required": ["jaCode", "retryable"],
+          "properties": {
+            "jaCode": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,63}$" },
+            "retryable": { "type": "boolean" },
+            "diagnosticId": { "type": "string", "pattern": "^diag_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 101 },
+            "field": { "type": "string", "maxLength": 256 },
+            "retryAfterMs": { "type": "integer", "minimum": 1, "maximum": 3600000 },
+            "details": { "type": "object", "additionalProperties": true }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "notification": {
+      "oneOf": [
+        { "$ref": "#/$defs/initializedNotification" },
+        { "$ref": "#/$defs/threadChangedNotification" },
+        { "$ref": "#/$defs/turnStartedNotification" },
+        { "$ref": "#/$defs/turnWaitingNotification" },
+        { "$ref": "#/$defs/turnCompletedNotification" },
+        { "$ref": "#/$defs/itemStartedNotification" },
+        { "$ref": "#/$defs/itemDeltaNotification" },
+        { "$ref": "#/$defs/itemUpdatedNotification" },
+        { "$ref": "#/$defs/itemCompletedNotification" },
+        { "$ref": "#/$defs/approvalRequestedNotification" },
+        { "$ref": "#/$defs/approvalResolvedNotification" },
+        { "$ref": "#/$defs/externalToolRequestedNotification" },
+        { "$ref": "#/$defs/runtimeStatusChangedNotification" },
+        { "$ref": "#/$defs/runtimeNoticeNotification" },
+        { "$ref": "#/$defs/runtimeOverloadNotification" }
+      ]
+    },
+    "notificationBase": {
+      "type": "object",
+      "required": ["jsonrpc", "method", "params"],
+      "properties": { "jsonrpc": { "$ref": "#/$defs/jsonRpc" }, "method": { "type": "string", "minLength": 1, "maxLength": 128 }, "params": { "type": "object" } },
+      "additionalProperties": true
+    },
+    "initializedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "initialized" }, "params": { "$ref": "#/$defs/emptyParams" } }, "required": ["method", "params"] } ] },
+    "threadEventBase": {
+      "type": "object",
+      "required": ["serverInstanceId", "threadId", "seq", "eventId", "occurredAt"],
+      "properties": { "serverInstanceId": { "$ref": "#/$defs/serverInstanceId" }, "threadId": { "$ref": "#/$defs/threadId" }, "seq": { "$ref": "#/$defs/seq" }, "eventId": { "$ref": "#/$defs/eventId" }, "occurredAt": { "$ref": "#/$defs/timestamp" } },
+      "additionalProperties": true
+    },
+    "runtimeEventBase": {
+      "type": "object",
+      "required": ["serverInstanceId", "eventId", "occurredAt"],
+      "properties": { "serverInstanceId": { "$ref": "#/$defs/serverInstanceId" }, "eventId": { "$ref": "#/$defs/eventId" }, "occurredAt": { "$ref": "#/$defs/timestamp" } },
+      "additionalProperties": true
+    },
+    "threadChangedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "thread/changed" }, "params": { "allOf": [ { "$ref": "#/$defs/threadEventBase" }, { "$ref": "#/$defs/threadChangedParams" } ] } }, "required": ["method", "params"] } ] },
+    "turnStartedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "turn/started" }, "params": { "allOf": [ { "$ref": "#/$defs/threadEventBase" }, { "$ref": "#/$defs/turnEventParams" } ] } }, "required": ["method", "params"] } ] },
+    "turnWaitingNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "turn/waiting" }, "params": { "allOf": [ { "$ref": "#/$defs/threadEventBase" }, { "$ref": "#/$defs/turnEventParams" } ] } }, "required": ["method", "params"] } ] },
+    "turnCompletedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "turn/completed" }, "params": { "allOf": [ { "$ref": "#/$defs/threadEventBase" }, { "$ref": "#/$defs/turnCompletedParams" } ] } }, "required": ["method", "params"] } ] },
+    "itemStartedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "item/started" }, "params": { "allOf": [ { "$ref": "#/$defs/threadEventBase" }, { "$ref": "#/$defs/itemEventParams" } ] } }, "required": ["method", "params"] } ] },
+    "itemDeltaNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "item/delta" }, "params": { "allOf": [ { "$ref": "#/$defs/threadEventBase" }, { "$ref": "#/$defs/itemDeltaParams" } ] } }, "required": ["method", "params"] } ] },
+    "itemUpdatedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "item/updated" }, "params": { "allOf": [ { "$ref": "#/$defs/threadEventBase" }, { "$ref": "#/$defs/itemEventParams" } ] } }, "required": ["method", "params"] } ] },
+    "itemCompletedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "item/completed" }, "params": { "allOf": [ { "$ref": "#/$defs/threadEventBase" }, { "$ref": "#/$defs/itemEventParams" } ] } }, "required": ["method", "params"] } ] },
+    "approvalRequestedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "approval/requested" }, "params": { "allOf": [ { "$ref": "#/$defs/threadEventBase" }, { "$ref": "#/$defs/approvalEventParams" } ] } }, "required": ["method", "params"] } ] },
+    "approvalResolvedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "approval/resolved" }, "params": { "allOf": [ { "$ref": "#/$defs/threadEventBase" }, { "$ref": "#/$defs/approvalResolvedParams" } ] } }, "required": ["method", "params"] } ] },
+    "externalToolRequestedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "externalTool/requested" }, "params": { "allOf": [ { "$ref": "#/$defs/threadEventBase" }, { "$ref": "#/$defs/externalToolEventParams" } ] } }, "required": ["method", "params"] } ] },
+    "runtimeStatusChangedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "runtime/statusChanged" }, "params": { "allOf": [ { "$ref": "#/$defs/runtimeEventBase" }, { "$ref": "#/$defs/runtimeStatusParams" } ] } }, "required": ["method", "params"] } ] },
+    "runtimeNoticeNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "runtime/notice" }, "params": { "allOf": [ { "$ref": "#/$defs/runtimeEventBase" }, { "$ref": "#/$defs/runtimeNoticeParams" } ] } }, "required": ["method", "params"] } ] },
+    "runtimeOverloadNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "runtime/overload" }, "params": { "allOf": [ { "$ref": "#/$defs/runtimeEventBase" }, { "$ref": "#/$defs/runtimeOverloadParams" } ] } }, "required": ["method", "params"] } ] },
+    "workspacePolicy": {
+      "type": "object",
+      "required": ["mode", "network", "enforcement"],
+      "properties": { "mode": { "enum": ["plan", "workspace", "full_access"] }, "network": { "enum": ["disabled", "restricted", "enabled"] }, "enforcement": { "enum": ["os_enforced", "partial", "unavailable"] }, "protectedRoots": { "type": "array", "items": { "type": "string", "maxLength": 4096 }, "maxItems": 32 } },
+      "additionalProperties": true
+    },
+    "inputPart": {
+      "type": "object",
+      "required": ["type"],
+      "properties": { "type": { "enum": ["text", "attachment"] }, "text": { "type": "string", "maxLength": 1048576 }, "attachmentId": { "$ref": "#/$defs/attachmentId" } },
+      "additionalProperties": true
+    },
+    "action": {
+      "type": "object",
+      "required": ["kind", "fingerprint"],
+      "properties": { "kind": { "enum": ["file_read", "file_write", "file_delete", "shell", "mcp_tool", "external_tool", "network" ] }, "fingerprint": { "type": "string", "pattern": "^act_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 100 }, "command": { "type": "string", "maxLength": 4096 }, "relativePaths": { "type": "array", "items": { "type": "string", "maxLength": 4096 }, "maxItems": 128 }, "networkTargets": { "type": "array", "items": { "type": "string", "maxLength": 2048 }, "maxItems": 64 } },
+      "additionalProperties": true
+    },
+    "workspace": {
+      "type": "object",
+      "required": ["workspaceId", "displayName", "rootPath", "trust"],
+      "properties": { "workspaceId": { "$ref": "#/$defs/workspaceId" }, "displayName": { "type": "string", "maxLength": 256 }, "rootPath": { "type": "string", "minLength": 1, "maxLength": 4096 }, "trust": { "enum": ["untrusted", "trusted"] }, "archived": { "type": "boolean" } },
+      "additionalProperties": true
+    },
+    "thread": {
+      "type": "object",
+      "required": ["threadId", "workspaceId", "title", "status", "lastSeq"],
+      "properties": { "threadId": { "$ref": "#/$defs/threadId" }, "workspaceId": { "$ref": "#/$defs/workspaceId" }, "title": { "type": "string", "maxLength": 512 }, "status": { "enum": ["idle", "running", "waiting_approval", "recovery_required", "archived"] }, "lastSeq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "activeTurnId": { "$ref": "#/$defs/turnId" } },
+      "additionalProperties": true
+    },
+    "turn": {
+      "type": "object",
+      "required": ["turnId", "threadId", "status", "mode", "permissionMode"],
+      "properties": { "turnId": { "$ref": "#/$defs/turnId" }, "threadId": { "$ref": "#/$defs/threadId" }, "status": { "enum": ["queued", "waiting_workspace", "running", "waiting_approval", "interrupting", "completed", "interrupted", "failed", "aborted_by_runtime", "recovery_required"] }, "mode": { "enum": ["plan", "workspace", "full_access"] }, "permissionMode": { "enum": ["allow", "ask", "deny"] }, "startedAt": { "$ref": "#/$defs/timestamp" }, "completedAt": { "$ref": "#/$defs/timestamp" }, "error": { "$ref": "#/$defs/error" } },
+      "additionalProperties": true
+    },
+    "item": {
+      "type": "object",
+      "required": ["itemId", "turnId", "kind", "status"],
+      "properties": { "itemId": { "$ref": "#/$defs/itemId" }, "turnId": { "$ref": "#/$defs/turnId" }, "kind": { "enum": ["user_message", "agent_message", "commentary", "reasoning_summary", "plan", "tool_call", "command", "file_change", "approval", "subagent", "context_compaction", "runtime_notice" ] }, "status": { "enum": ["started", "in_progress", "completed", "failed", "cancelled"] }, "title": { "type": "string", "maxLength": 512 }, "text": { "type": "string", "maxLength": 1048576 }, "artifact": { "$ref": "#/$defs/artifact" }, "metadata": { "type": "object", "additionalProperties": true } },
+      "additionalProperties": true
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["artifactId", "sizeBytes", "sha256", "mediaType"],
+      "properties": { "artifactId": { "$ref": "#/$defs/artifactId" }, "sizeBytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 }, "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" }, "mediaType": { "type": "string", "minLength": 1, "maxLength": 128 }, "displayName": { "type": "string", "maxLength": 512 } },
+      "additionalProperties": true
+    },
+    "profile": {
+      "type": "object",
+      "required": ["profileRevision", "name", "model", "mode"],
+      "properties": { "profileRevision": { "$ref": "#/$defs/profileRevision" }, "name": { "type": "string", "minLength": 1, "maxLength": 256 }, "model": { "$ref": "#/$defs/modelProfile" }, "mode": { "enum": ["plan", "workspace", "full_access"] }, "skillRevisions": { "type": "array", "items": { "$ref": "#/$defs/skillRevision" }, "maxItems": 128, "uniqueItems": true }, "mcpRevisions": { "type": "array", "items": { "$ref": "#/$defs/mcpRevision" }, "maxItems": 128, "uniqueItems": true } },
+      "additionalProperties": true
+    },
+    "modelProfile": {
+      "type": "object",
+      "required": ["provider", "protocol", "model"],
+      "properties": { "provider": { "type": "string", "minLength": 1, "maxLength": 128 }, "protocol": { "enum": ["anthropic_messages", "openai_chat_completions"] }, "model": { "type": "string", "minLength": 1, "maxLength": 256 }, "baseUrl": { "type": "string", "maxLength": 2048 }, "credentialRef": { "type": "string", "pattern": "^cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 100 }, "supportsVision": { "type": "boolean" } },
+      "additionalProperties": true
+    },
+    "mcpServer": {
+      "type": "object",
+      "required": ["mcpRevision", "name", "transport", "endpoint", "protocolVersion"],
+      "properties": { "mcpRevision": { "$ref": "#/$defs/mcpRevision" }, "name": { "type": "string", "minLength": 1, "maxLength": 256 }, "transport": { "enum": ["stdio", "streamable_http"] }, "endpoint": { "type": "string", "minLength": 1, "maxLength": 4096 }, "protocolVersion": { "type": "string", "minLength": 1, "maxLength": 32 }, "credentialRef": { "type": "string", "pattern": "^cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 100 }, "enabled": { "type": "boolean" } },
+      "additionalProperties": true
+    },
+    "turnEventParams": {
+      "type": "object",
+      "required": ["turn"],
+      "properties": { "turn": { "$ref": "#/$defs/turn" } },
+      "additionalProperties": true
+    },
+    "turnCompletedParams": {
+      "type": "object",
+      "required": ["turn", "terminalStatus"],
+      "properties": { "turn": { "$ref": "#/$defs/turn" }, "terminalStatus": { "enum": ["completed", "interrupted", "failed", "aborted_by_runtime", "recovery_required"] } },
+      "additionalProperties": true
+    },
+    "threadChangedParams": {
+      "type": "object",
+      "required": ["thread"],
+      "properties": { "thread": { "$ref": "#/$defs/thread" }, "change": { "enum": ["created", "updated", "archived", "deleted"] } },
+      "additionalProperties": true
+    },
+    "itemEventParams": {
+      "type": "object",
+      "required": ["item"],
+      "properties": { "item": { "$ref": "#/$defs/item" } },
+      "additionalProperties": true
+    },
+    "itemDeltaParams": {
+      "type": "object",
+      "required": ["itemId", "delta"],
+      "properties": { "itemId": { "$ref": "#/$defs/itemId" }, "delta": { "type": "string", "maxLength": 65536 }, "deltaBytes": { "type": "integer", "minimum": 0, "maximum": 1048576 } },
+      "additionalProperties": true
+    },
+    "approvalEventParams": {
+      "type": "object",
+      "required": ["approval"],
+      "properties": { "approval": { "$ref": "#/$defs/approvalSummary" } },
+      "additionalProperties": true
+    },
+    "approvalResolvedParams": {
+      "type": "object",
+      "required": ["approvalId", "decision", "resolvedAt"],
+      "properties": { "approvalId": { "$ref": "#/$defs/approvalId" }, "decision": { "enum": ["allow_once", "allow_scope", "deny", "expired", "disconnected"] }, "scope": { "enum": ["once", "thread", "workspace"] }, "resolvedAt": { "$ref": "#/$defs/timestamp" } },
+      "additionalProperties": true
+    },
+    "approvalSummary": {
+      "type": "object",
+      "required": ["approvalId", "threadId", "turnId", "itemId", "action", "risk", "expiresAt"],
+      "properties": { "approvalId": { "$ref": "#/$defs/approvalId" }, "threadId": { "$ref": "#/$defs/threadId" }, "turnId": { "$ref": "#/$defs/turnId" }, "itemId": { "$ref": "#/$defs/itemId" }, "action": { "$ref": "#/$defs/action" }, "risk": { "enum": ["low", "medium", "high", "critical"] }, "expiresAt": { "$ref": "#/$defs/timestamp" } },
+      "additionalProperties": true
+    },
+    "externalToolEventParams": {
+      "type": "object",
+      "required": ["externalRequestId", "toolName"],
+      "properties": { "externalRequestId": { "type": "string", "pattern": "^ext_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 100 }, "toolName": { "type": "string", "minLength": 1, "maxLength": 256 }, "threadId": { "$ref": "#/$defs/threadId" }, "turnId": { "$ref": "#/$defs/turnId" }, "itemId": { "$ref": "#/$defs/itemId" } },
+      "additionalProperties": true
+    },
+    "runtimeStatusParams": {
+      "type": "object",
+      "required": ["status"],
+      "properties": { "status": { "enum": ["starting", "ready", "degraded", "shutting_down", "stopped", "crashed"] }, "reason": { "type": "string", "maxLength": 1024 }, "health": { "type": "object", "additionalProperties": true } },
+      "additionalProperties": true
+    },
+    "runtimeNoticeParams": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": { "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,63}$" }, "message": { "type": "string", "maxLength": 2048 }, "threadId": { "$ref": "#/$defs/threadId" }, "turnId": { "$ref": "#/$defs/turnId" } },
+      "additionalProperties": true
+    },
+    "runtimeOverloadParams": {
+      "type": "object",
+      "required": ["queue", "retryable"],
+      "properties": { "queue": { "enum": ["inbound", "outbound", "pending", "artifact", "tool_output" ] }, "retryable": { "type": "boolean" }, "retryAfterMs": { "type": "integer", "minimum": 1, "maximum": 3600000 } },
+      "additionalProperties": true
+    },
+    "acceptedResult": {
+      "type": "object",
+      "required": ["accepted"],
+      "properties": { "accepted": { "type": "boolean" }, "queued": { "type": "boolean" }, "operationId": { "type": "string", "maxLength": 128 }, "status": { "type": "string", "maxLength": 64 } },
+      "additionalProperties": true
+    },
+    "initializeResult": {
+      "type": "object",
+      "required": ["protocolMajor", "protocolMinor", "serverVersion", "serverInstanceId", "capabilities", "limits"],
+      "properties": { "protocolMajor": { "const": 1 }, "protocolMinor": { "type": "integer", "minimum": 0 }, "serverVersion": { "type": "string", "minLength": 1, "maxLength": 128 }, "serverInstanceId": { "$ref": "#/$defs/serverInstanceId" }, "runtime": { "type": "object", "additionalProperties": true }, "capabilities": { "$ref": "#/$defs/capabilities" }, "limits": { "$ref": "#/$defs/limits" }, "workspacePolicy": { "$ref": "#/$defs/workspacePolicy" } },
+      "additionalProperties": true
+    },
+    "versionResult": {
+      "type": "object",
+      "required": ["protocolMajor", "protocolMinor", "serverVersion", "serverInstanceId", "runtime"],
+      "properties": { "protocolMajor": { "const": 1 }, "protocolMinor": { "type": "integer", "minimum": 0 }, "serverVersion": { "type": "string", "minLength": 1, "maxLength": 128 }, "serverInstanceId": { "$ref": "#/$defs/serverInstanceId" }, "runtime": { "type": "object", "additionalProperties": true }, "build": { "type": "object", "additionalProperties": true } },
+      "additionalProperties": true
+    },
+    "capabilitiesResult": {
+      "type": "object",
+      "required": ["capabilities"],
+      "properties": { "capabilities": { "$ref": "#/$defs/capabilities" }, "unsupported": { "type": "array", "items": { "type": "string", "maxLength": 128 }, "maxItems": 256 } },
+      "additionalProperties": true
+    },
+    "healthResult": {
+      "type": "object",
+      "required": ["status", "checks"],
+      "properties": { "status": { "enum": ["healthy", "degraded", "unhealthy", "stopped"] }, "checks": { "type": "object", "additionalProperties": true }, "serverInstanceId": { "$ref": "#/$defs/serverInstanceId" } },
+      "additionalProperties": true
+    },
+    "diagnosticsResult": {
+      "type": "object",
+      "required": ["status"],
+      "properties": { "status": { "enum": ["available", "degraded", "unavailable"] }, "report": { "type": "object", "additionalProperties": true }, "artifact": { "$ref": "#/$defs/artifact" } },
+      "additionalProperties": true
+    },
+    "shutdownResult": {
+      "allOf": [ { "$ref": "#/$defs/acceptedResult" }, { "type": "object", "required": ["status"], "properties": { "status": { "enum": ["accepted", "shutting_down", "stopped"] }, "deadlineMs": { "type": "integer", "minimum": 1, "maximum": 300000 } }, "additionalProperties": true } ]
+    },
+    "workspaceOpenResult": {
+      "type": "object",
+      "required": ["workspace"],
+      "properties": { "workspace": { "$ref": "#/$defs/workspace" } },
+      "additionalProperties": true
+    },
+    "workspaceListResult": {
+      "type": "object",
+      "required": ["workspaces"],
+      "properties": { "workspaces": { "type": "array", "items": { "$ref": "#/$defs/workspace" }, "maxItems": 500 }, "nextCursor": { "type": "string", "maxLength": 256 } },
+      "additionalProperties": true
+    },
+    "workspaceTrustResult": {
+      "type": "object",
+      "required": ["workspaceId", "trust"],
+      "properties": { "workspaceId": { "$ref": "#/$defs/workspaceId" }, "trust": { "enum": ["untrusted", "trusted"] } },
+      "additionalProperties": true
+    },
+    "workspaceUnregisterResult": {
+      "type": "object",
+      "required": ["accepted", "workspaceId"],
+      "properties": { "accepted": { "type": "boolean" }, "workspaceId": { "$ref": "#/$defs/workspaceId" }, "removed": { "type": "boolean" } },
+      "additionalProperties": true
+    },
+    "threadCreateResult": {
+      "type": "object",
+      "required": ["thread"],
+      "properties": { "thread": { "$ref": "#/$defs/thread" } },
+      "additionalProperties": true
+    },
+    "threadListResult": {
+      "type": "object",
+      "required": ["threads"],
+      "properties": { "threads": { "type": "array", "items": { "$ref": "#/$defs/thread" }, "maxItems": 500 }, "nextCursor": { "type": "string", "maxLength": 256 } },
+      "additionalProperties": true
+    },
+    "threadReadResult": {
+      "type": "object",
+      "required": ["serverInstanceId", "thread", "items", "snapshotSeq"],
+      "properties": { "serverInstanceId": { "$ref": "#/$defs/serverInstanceId" }, "thread": { "$ref": "#/$defs/thread" }, "items": { "type": "array", "items": { "$ref": "#/$defs/item" }, "maxItems": 10000 }, "events": { "type": "array", "items": { "type": "object", "additionalProperties": true }, "maxItems": 10000 }, "snapshotSeq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "nextSeq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 } },
+      "additionalProperties": true
+    },
+    "threadSubscribeResult": {
+      "type": "object",
+      "required": ["accepted", "subscriptionId", "fromSeq"],
+      "properties": { "accepted": { "type": "boolean" }, "subscriptionId": { "type": "string", "pattern": "^sub_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 99 }, "fromSeq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 } },
+      "additionalProperties": true
+    },
+    "threadUnsubscribeResult": {
+      "type": "object",
+      "required": ["accepted", "subscriptionId"],
+      "properties": { "accepted": { "type": "boolean" }, "subscriptionId": { "type": "string", "pattern": "^sub_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 99 } },
+      "additionalProperties": true
+    },
+    "threadMutationResult": {
+      "type": "object",
+      "required": ["accepted", "threadId"],
+      "properties": { "accepted": { "type": "boolean" }, "threadId": { "$ref": "#/$defs/threadId" }, "status": { "enum": ["idle", "archived", "deleted", "purged"] } },
+      "additionalProperties": true
+    },
+    "turnStartResult": {
+      "type": "object",
+      "required": ["accepted", "turnId", "queued"],
+      "properties": { "accepted": { "type": "boolean" }, "turnId": { "$ref": "#/$defs/turnId" }, "queued": { "type": "boolean" }, "status": { "$ref": "#/$defs/turn/properties/status" } },
+      "additionalProperties": true
+    },
+    "turnCancelResult": {
+      "type": "object",
+      "required": ["accepted", "turnId", "status"],
+      "properties": { "accepted": { "type": "boolean" }, "turnId": { "$ref": "#/$defs/turnId" }, "status": { "enum": ["interrupting", "interrupted", "recovery_required"] } },
+      "additionalProperties": true
+    },
+    "turnSteerResult": {
+      "allOf": [ { "$ref": "#/$defs/turnStartResult" }, { "type": "object", "required": ["turnId"] } ]
+    },
+    "turnFollowUpResult": {
+      "allOf": [ { "$ref": "#/$defs/turnStartResult" }, { "type": "object", "required": ["turnId"] } ]
+    },
+    "profileListResult": {
+      "type": "object",
+      "required": ["profiles"],
+      "properties": { "profiles": { "type": "array", "items": { "$ref": "#/$defs/profile" }, "maxItems": 256 }, "activeProfileRevision": { "$ref": "#/$defs/profileRevision" } },
+      "additionalProperties": true
+    },
+    "profileReadResult": {
+      "type": "object",
+      "required": ["profile"],
+      "properties": { "profile": { "$ref": "#/$defs/profile" } },
+      "additionalProperties": true
+    },
+    "profileSaveResult": {
+      "type": "object",
+      "required": ["profile"],
+      "properties": { "profile": { "$ref": "#/$defs/profile" }, "created": { "type": "boolean" } },
+      "additionalProperties": true
+    },
+    "profileActivateResult": {
+      "type": "object",
+      "required": ["accepted", "activeProfileRevision"],
+      "properties": { "accepted": { "type": "boolean" }, "activeProfileRevision": { "$ref": "#/$defs/profileRevision" } },
+      "additionalProperties": true
+    },
+    "modelProbeResult": {
+      "type": "object",
+      "required": ["supported", "status", "capabilities"],
+      "properties": { "supported": { "type": "boolean" }, "status": { "enum": ["available", "degraded", "unavailable"] }, "capabilities": { "type": "object", "additionalProperties": true }, "provider": { "type": "string", "maxLength": 128 }, "model": { "type": "string", "maxLength": 256 } },
+      "additionalProperties": true
+    },
+    "modelCapabilitiesResult": {
+      "type": "object",
+      "required": ["models"],
+      "properties": { "models": { "type": "array", "items": { "type": "object", "additionalProperties": true }, "maxItems": 256 } },
+      "additionalProperties": true
+    },
+    "skillSummary": {
+      "type": "object",
+      "required": ["skillRevision", "name", "scope", "enabled", "status"],
+      "properties": { "skillRevision": { "$ref": "#/$defs/skillRevision" }, "name": { "type": "string", "minLength": 1, "maxLength": 256 }, "scope": { "enum": ["builtin", "user", "workspace", "thread"] }, "enabled": { "type": "boolean" }, "status": { "enum": ["healthy", "degraded", "invalid", "disabled"] }, "contentHash": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" } },
+      "additionalProperties": true
+    },
+    "skillListResult": {
+      "type": "object",
+      "required": ["skills"],
+      "properties": { "skills": { "type": "array", "items": { "$ref": "#/$defs/skillSummary" }, "maxItems": 256 } },
+      "additionalProperties": true
+    },
+    "skillImportResult": {
+      "type": "object",
+      "required": ["skillRevision", "status"],
+      "properties": { "skillRevision": { "$ref": "#/$defs/skillRevision" }, "status": { "enum": ["healthy", "degraded", "invalid"] }, "contentHash": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" } },
+      "additionalProperties": true
+    },
+    "skillEnableResult": {
+      "type": "object",
+      "required": ["skillRevision", "enabled"],
+      "properties": { "skillRevision": { "$ref": "#/$defs/skillRevision" }, "enabled": { "type": "boolean" }, "scope": { "enum": ["user", "workspace", "thread"] } },
+      "additionalProperties": true
+    },
+    "skillReloadResult": {
+      "allOf": [ { "$ref": "#/$defs/skillImportResult" } ]
+    },
+    "skillHealthResult": {
+      "type": "object",
+      "required": ["skillRevision", "status"],
+      "properties": { "skillRevision": { "$ref": "#/$defs/skillRevision" }, "status": { "enum": ["healthy", "degraded", "invalid", "disabled"] }, "issues": { "type": "array", "items": { "type": "string", "maxLength": 1024 }, "maxItems": 128 } },
+      "additionalProperties": true
+    },
+    "mcpServerSummary": {
+      "allOf": [ { "$ref": "#/$defs/mcpServer" }, { "type": "object", "required": ["status"], "properties": { "status": { "enum": ["healthy", "degraded", "unavailable", "disabled"] }, "toolCount": { "type": "integer", "minimum": 0, "maximum": 10000 } }, "additionalProperties": true } ]
+    },
+    "mcpListResult": {
+      "type": "object",
+      "required": ["servers"],
+      "properties": { "servers": { "type": "array", "items": { "$ref": "#/$defs/mcpServerSummary" }, "maxItems": 256 } },
+      "additionalProperties": true
+    },
+    "mcpSaveResult": {
+      "type": "object",
+      "required": ["server"],
+      "properties": { "server": { "$ref": "#/$defs/mcpServerSummary" }, "created": { "type": "boolean" } },
+      "additionalProperties": true
+    },
+    "mcpDeleteResult": {
+      "type": "object",
+      "required": ["accepted", "mcpRevision"],
+      "properties": { "accepted": { "type": "boolean" }, "mcpRevision": { "$ref": "#/$defs/mcpRevision" } },
+      "additionalProperties": true
+    },
+    "mcpTestResult": {
+      "type": "object",
+      "required": ["mcpRevision", "status"],
+      "properties": { "mcpRevision": { "$ref": "#/$defs/mcpRevision" }, "status": { "enum": ["healthy", "degraded", "unavailable"] }, "protocolVersion": { "type": "string", "maxLength": 32 }, "toolCount": { "type": "integer", "minimum": 0, "maximum": 10000 } },
+      "additionalProperties": true
+    },
+    "mcpReloadResult": {
+      "allOf": [ { "$ref": "#/$defs/mcpTestResult" } ]
+    },
+    "mcpTool": {
+      "type": "object",
+      "required": ["name", "inputSchema", "policy"],
+      "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 256 }, "description": { "type": "string", "maxLength": 4096 }, "inputSchema": { "type": "object", "additionalProperties": true }, "policy": { "enum": ["allow", "ask", "deny"] } },
+      "additionalProperties": true
+    },
+    "mcpToolsReadResult": {
+      "type": "object",
+      "required": ["mcpRevision", "tools"],
+      "properties": { "mcpRevision": { "$ref": "#/$defs/mcpRevision" }, "tools": { "type": "array", "items": { "$ref": "#/$defs/mcpTool" }, "maxItems": 10000 } },
+      "additionalProperties": true
+    },
+    "mcpToolPolicyResult": {
+      "type": "object",
+      "required": ["mcpRevision", "toolName", "policy"],
+      "properties": { "mcpRevision": { "$ref": "#/$defs/mcpRevision" }, "toolName": { "type": "string", "minLength": 1, "maxLength": 256 }, "policy": { "enum": ["allow", "ask", "deny"] } },
+      "additionalProperties": true
+    },
+    "attachment": {
+      "type": "object",
+      "required": ["attachmentId", "fileName", "mimeType", "sizeBytes", "sha256", "artifact"],
+      "properties": { "attachmentId": { "$ref": "#/$defs/attachmentId" }, "fileName": { "type": "string", "minLength": 1, "maxLength": 512 }, "mimeType": { "type": "string", "minLength": 1, "maxLength": 128 }, "sizeBytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 }, "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" }, "artifact": { "$ref": "#/$defs/artifact" } },
+      "additionalProperties": true
+    },
+    "attachmentImportResult": {
+      "type": "object",
+      "required": ["attachment"],
+      "properties": { "attachment": { "$ref": "#/$defs/attachment" } },
+      "additionalProperties": true
+    },
+    "attachmentReadResult": {
+      "type": "object",
+      "required": ["attachment"],
+      "properties": { "attachment": { "$ref": "#/$defs/attachment" } },
+      "additionalProperties": true
+    },
+    "attachmentDeleteResult": {
+      "type": "object",
+      "required": ["accepted", "attachmentId"],
+      "properties": { "accepted": { "type": "boolean" }, "attachmentId": { "$ref": "#/$defs/attachmentId" } },
+      "additionalProperties": true
+    },
+    "approvalResponseResult": {
+      "type": "object",
+      "required": ["decision", "resolvedAt"],
+      "properties": { "decision": { "enum": ["allow_once", "allow_scope", "deny", "expired", "disconnected"] }, "scope": { "enum": ["once", "thread", "workspace"] }, "resolvedAt": { "$ref": "#/$defs/timestamp" } },
+      "additionalProperties": true
+    },
+    "secretResolveResult": {
+      "type": "object",
+      "required": ["secretValue"],
+      "properties": { "secretValue": { "type": "string", "minLength": 1, "maxLength": 1048576 }, "expiresAt": { "$ref": "#/$defs/timestamp" } },
+      "additionalProperties": true
+    },
+    "externalToolResponseResult": {
+      "type": "object",
+      "required": ["accepted", "status"],
+      "properties": { "accepted": { "type": "boolean" }, "status": { "enum": ["accepted", "completed", "failed", "cancelled"] }, "output": { "type": "object", "additionalProperties": true }, "artifact": { "$ref": "#/$defs/artifact" } },
+      "additionalProperties": true
+    }
+  }
+}

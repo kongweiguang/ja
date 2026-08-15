@@ -1,0 +1,4 @@
+{"id":"c:missing-jsonrpc","method":"version","params":{}}
+{"jsonrpc":"2.0","id":"c:both-result-error","result":{},"error":{"code":-32080,"message":"invalid fixture","data":{"jaCode":"INTERNAL_ERROR","retryable":false}}}
+{"jsonrpc":"2.0","id":"x:not-owned","method":"version","params":{}}
+{"jsonrpc":"2.0","id":"c:null-params","method":"turn/start","params":null}

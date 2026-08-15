@@ -1,0 +1,97 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+:root {
+  color-scheme: light;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --ja-background: #f7f8fa;
+  --ja-surface: #ffffff;
+  --ja-surface-muted: #eef1f5;
+  --ja-surface-raised: #ffffff;
+  --ja-border: #d9dee8;
+  --ja-border-strong: #b9c1d0;
+  --ja-foreground: #1f232b;
+  --ja-foreground-muted: #647084;
+  --ja-accent: #4b6baf;
+  --ja-accent-foreground: #ffffff;
+  --ja-focus: #5b8def;
+  --ja-success: #2f855a;
+  --ja-warning: #a86300;
+  --ja-danger: #c2414d;
+  --ja-radius-sm: 0.25rem;
+  --ja-radius-md: 0.45rem;
+  --ja-radius-lg: 0.7rem;
+  --ja-shadow-sm: 0 1px 2px rgb(31 35 43 / 8%);
+  --ja-shadow-md: 0 8px 24px rgb(31 35 43 / 12%);
+}
+
+:root[data-palette="xcode"] {
+  --ja-accent: #147ef5;
+  --ja-focus: #0a84ff;
+  --ja-success: #248a3d;
+  --ja-warning: #ad6800;
+}
+
+:root[data-palette="claude"] {
+  --ja-accent: #b35c37;
+  --ja-focus: #c56d45;
+  --ja-success: #387c62;
+  --ja-warning: #a86a32;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ja-background: #1e1f22;
+  --ja-surface: #25262a;
+  --ja-surface-muted: #303238;
+  --ja-surface-raised: #2b2d31;
+  --ja-border: #41444c;
+  --ja-border-strong: #5c606b;
+  --ja-foreground: #e6e8ed;
+  --ja-foreground-muted: #a5aab5;
+  --ja-accent: #8fafff;
+  --ja-accent-foreground: #15171b;
+  --ja-focus: #80a8ff;
+  --ja-success: #72c28d;
+  --ja-warning: #e2ad61;
+  --ja-danger: #ff8f9a;
+  --ja-shadow-sm: 0 1px 2px rgb(0 0 0 / 25%);
+  --ja-shadow-md: 0 8px 24px rgb(0 0 0 / 30%);
+}
+
+:root[data-high-contrast="true"] {
+  --ja-border: currentColor;
+  --ja-border-strong: currentColor;
+  --ja-focus: #00a3ff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    color-scheme: dark;
+    --ja-background: #1e1f22;
+    --ja-surface: #25262a;
+    --ja-surface-muted: #303238;
+    --ja-surface-raised: #2b2d31;
+    --ja-border: #41444c;
+    --ja-border-strong: #5c606b;
+    --ja-foreground: #e6e8ed;
+    --ja-foreground-muted: #a5aab5;
+    --ja-accent: #8fafff;
+    --ja-accent-foreground: #15171b;
+    --ja-focus: #80a8ff;
+    --ja-success: #72c28d;
+    --ja-warning: #e2ad61;
+    --ja-danger: #ff8f9a;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}

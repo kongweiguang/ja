@@ -1,0 +1,103 @@
+# JA is distributed with its lockfiles, license files, source resources, and
+# Native Image metadata. Build and machine-local state must stay outside the
+# source tree so a clean checkout remains reproducible.
+# @author kongweiguang
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Operating system and local editor state
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*.swn
+
+# Node.js / Vite / pnpm outputs
+node_modules/
+.pnpm-store/
+.vite/
+dist/
+dist-ssr/
+coverage/
+*.local
+pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+
+# Test and runtime logs/results are reproducible outputs, not source fixtures.
+/logs/
+/test-results/
+/playwright-report/
+/blob-report/
+
+# Keep the package lockfile: it is an input to reproducible desktop builds.
+!pnpm-lock.yaml
+
+# Rust / Tauri build outputs
+target/
+src-tauri/target/
+*.rlib
+*.rmeta
+*.pdb
+
+# Java / Maven / GraalVM build outputs
+agent/target/
+agent/build/
+agent/native-image/
+.native-image/
+*.class
+
+# Native desktop bundle outputs (the signed artifact manifest is tracked
+# separately when a release task creates one).
+artifacts/
+bundle/
+release/
+*.appimage
+*.dmg
+*.msi
+*.nsis.zip
+*.deb
+*.rpm
+*.exe
+
+# IDE metadata; keep the shared VS Code extension recommendations.
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.iml
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Updeng/Codex/Claude machine-local state. These paths are intentionally not
+# source documentation and must not leak local plans, prompts, or credentials.
+/.agents/
+/.claude/
+/.codex/
+/.updeng/
+/AGENTS.md
+/CLAUDE.md
+
+# Local configuration and credentials. Keep the template visible to users.
+.env
+.env.*
+!.env.example
+.secrets/
+secrets/
+*.secret
+credentials.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.mobileprovision
+
+# Keep legal files and source/native metadata visible to version control.
+!LICENSE
+!LICENSES/
+!LICENSES/**
+!agent/src/main/resources/META-INF/native-image/
+!agent/src/main/resources/META-INF/native-image/**
+!Cargo.lock

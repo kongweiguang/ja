@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- @author kongweiguang -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Keep probe output deterministic so it cannot leak temporary workspace paths. -->
+<configuration>
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>%level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+    <logger name="io.agentscope" level="WARN" />
+    <logger name="io.agentscope.harness.workspace" level="ERROR" />
+    <logger name="io.agentscope.harness.agent.workspace" level="ERROR" />
+    <logger name="io.modelcontextprotocol" level="WARN" />
+    <!-- StdioClientTransport destroys a Windows child during close; exit code 1 is expected after
+         the successful tools/call assertion, so keep product stdout/stderr free of false errors. -->
+    <logger name="io.modelcontextprotocol.client.transport.StdioClientTransport" level="ERROR" />
+    <logger name="org.noear.solon" level="WARN" />
+    <logger name="org.sqlite" level="WARN" />
+    <root level="WARN">
+        <appender-ref ref="CONSOLE" />
+    </root>
+</configuration>

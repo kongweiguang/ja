@@ -1,0 +1,8 @@
+{"jsonrpc":"2.0","id":"c:skill-import-1","method":"skill/import","params":{"source":{"kind":"directory","value":"skills/fixture"}}}
+{"jsonrpc":"2.0","id":"c:skill-import-1","result":{"skillRevision":"skill_fixture","status":"healthy","contentHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+{"jsonrpc":"2.0","id":"c:skill-enable-1","method":"skill/enable","params":{"skillRevision":"skill_fixture","enabled":true,"scope":"workspace","workspaceId":"ws_fixture"}}
+{"jsonrpc":"2.0","id":"c:skill-enable-1","result":{"skillRevision":"skill_fixture","enabled":true,"scope":"workspace"}}
+{"jsonrpc":"2.0","id":"c:mcp-save-1","method":"mcp/save","params":{"server":{"mcpRevision":"mcp_fixture","name":"fixture-tools","transport":"stdio","endpoint":"fixture-mcp","protocolVersion":"2025-11-25","enabled":true}}}
+{"jsonrpc":"2.0","id":"c:mcp-save-1","result":{"server":{"mcpRevision":"mcp_fixture","name":"fixture-tools","transport":"stdio","endpoint":"fixture-mcp","protocolVersion":"2025-11-25","enabled":true,"status":"healthy","toolCount":1}}}
+{"jsonrpc":"2.0","id":"c:mcp-tools-1","method":"mcp/tools/read","params":{"mcpRevision":"mcp_fixture"}}
+{"jsonrpc":"2.0","id":"c:mcp-tools-1","result":{"mcpRevision":"mcp_fixture","tools":[{"name":"fixture_tool","description":"read-only fixture tool","inputSchema":{"type":"object","properties":{}},"policy":"ask"}]}}

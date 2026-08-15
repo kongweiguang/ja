@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# @author kongweiguang
+
+[package]
+name = "ja-windows-sandbox-spike"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Windows AppContainer and Job Object sandbox probe for JA tool workers"
+
+[lib]
+name = "ja_windows_sandbox_spike"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ja-sandbox-worker"
+path = "src/bin/worker.rs"
+
+[[bin]]
+name = "ja-sandbox-probe"
+path = "src/bin/probe.rs"
+
+[target.'cfg(windows)'.dependencies]
+# This is Microsoft's low-level Win32 binding.  The probe needs the native
+# security boundary instead of a path-only policy implemented in Rust.
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

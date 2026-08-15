@@ -1,0 +1,161 @@
+[
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$JSONRPCMessage",
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$JSONRPCRequest",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$JSONRPCResponse",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$JSONRPCResponse$JSONRPCError",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$JSONRPCNotification",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$InitializeRequest",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$InitializeResult",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$ClientCapabilities",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$ClientCapabilities$RootCapabilities",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$ClientCapabilities$Sampling",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$ClientCapabilities$Elicitation",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$ServerCapabilities",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$ServerCapabilities$ToolCapabilities",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$ServerCapabilities$CompletionCapabilities",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$ServerCapabilities$LoggingCapabilities",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$ServerCapabilities$PromptCapabilities",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$ServerCapabilities$ResourceCapabilities",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$Implementation",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$PaginatedRequest",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$ListToolsResult",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$Tool",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$ToolAnnotations",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$JsonSchema",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$CallToolRequest",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$CallToolResult",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.modelcontextprotocol.spec.McpSchema$TextContent",
+    "allDeclaredConstructors": true,
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "org.sqlite.JDBC",
+    "allDeclaredConstructors": true,
+    "allPublicMethods": true
+  }
+]

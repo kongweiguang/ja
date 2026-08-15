@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:shutdown-1","method":"shutdown","params":{"reason":"fixture complete","deadlineMs":1000}}
+{"jsonrpc":"2.0","id":"c:shutdown-1","result":{"accepted":true,"status":"shutting_down","deadlineMs":1000}}
