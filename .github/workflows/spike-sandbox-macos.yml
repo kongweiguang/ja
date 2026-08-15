@@ -33,14 +33,14 @@ jobs:
       - name: Install Rust toolchain
         shell: bash
         timeout-minutes: 3
-        run: rustup toolchain install 1.88.0 --profile minimal --no-self-update
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy --no-self-update
 
       - name: Format gate
         shell: bash
         timeout-minutes: 3
         run: |
           set -euo pipefail
-          cargo +1.88.0 metadata --manifest-path spikes/sandbox/macos/Cargo.toml --locked --no-deps >/dev/null
+          cargo +1.88.0 metadata --manifest-path spikes/sandbox/macos/Cargo.toml --locked --format-version 1 --no-deps >/dev/null
           # cargo fmt has no --locked option; the locked metadata check above
           # verifies the manifest/lock contract before rustfmt runs.
           cargo +1.88.0 fmt --manifest-path spikes/sandbox/macos/Cargo.toml -- --check
