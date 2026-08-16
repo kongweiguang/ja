@@ -12,12 +12,20 @@ mod path;
 mod macos;
 
 #[cfg(target_os = "macos")]
+pub mod process;
+
+#[cfg(target_os = "macos")]
 pub mod marker_cleanup;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
     ChildOutcome, MAX_OUTPUT_BYTES, RunOutput, SandboxChild, SandboxError, SandboxSpec,
-    kill_process, process_is_alive, spawn,
+    process_group_is_gone, process_is_alive, spawn,
+};
+
+#[cfg(target_os = "macos")]
+pub use process::{
+    BoundedCommandOutput, run_bounded_command, safe_signal_group, safe_signal_pid, spawn_grouped,
 };
 
 /// Keep the crate linkable during Windows/Linux cross-target checks while

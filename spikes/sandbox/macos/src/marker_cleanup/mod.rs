@@ -5,18 +5,56 @@
 
 mod marker;
 mod process;
+mod process_scan;
 
 #[cfg(target_os = "macos")]
 mod fixture;
 
-use marker::{MarkerRecord, scan_root};
+use marker::{MarkerRecord, PendingMarker, scan_root};
 use process::{ProcessIdentity, current_pgid, query_identity, terminate_group};
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Stable identity data that a residual process-table scan may compare
+/// without exposing platform-specific process output to callers.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ControlledProcessIdentity {
+    pub pid: u32,
+    pub pgid: i32,
+    pub comm: String,
+    pub start_identity: String,
+}
+
+/// Query one already-controlled PID through the bounded production identity
+/// path so scope evidence never relies on an unbounded `ps` capture.
+pub fn query_controlled_identity(pid: u32) -> Result<ControlledProcessIdentity, &'static str> {
+    let identity = process::query_identity(pid)?;
+    Ok(ControlledProcessIdentity {
+        pid: identity.pid,
+        pgid: identity.pgid,
+        comm: identity.comm,
+        start_identity: identity.start_identity,
+    })
+}
+
+/// Reuse the production identity-checked group/direct cleanup for native
+/// fixtures, so a setsid descendant cannot be killed solely by a stale PID.
+pub fn terminate_controlled_identity(
+    identity: &ControlledProcessIdentity,
+    deadline: Duration,
+) -> Result<(), &'static str> {
+    let captured = ProcessIdentity {
+        pid: identity.pid,
+        pgid: identity.pgid,
+        comm: identity.comm.clone(),
+        start_identity: identity.start_identity.clone(),
+    };
+    terminate_group(&captured, Instant::now() + deadline)
+}
 
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(20);
 const MARKER_MODE: u32 = 0o600;
@@ -59,9 +97,16 @@ pub fn cleanup_markers(
             report_categories.insert("marker-owner-mismatch");
             continue;
         }
-        match terminate_group(record.pid, record.pgid, Instant::now() + CLEANUP_DEADLINE) {
+        match terminate_group(&actual, Instant::now() + CLEANUP_DEADLINE) {
             Ok(()) => {
-                if remove_identity_markers(root, record, &mut report_categories).is_err() {
+                let group = scan
+                    .records
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.owner_pid == record.owner_pid && candidate.nonce == record.nonce
+                    })
+                    .collect::<Vec<_>>();
+                if remove_identity_markers(root, &group, &mut report_categories).is_err() {
                     report_categories.insert("marker-remove-failed");
                 }
             }
@@ -75,9 +120,18 @@ pub fn cleanup_markers(
     // therefore are removed without sending any signal.
     for pending in scan.pending {
         report_categories.insert("marker-pending");
-        if fs::remove_file(pending).is_err() {
+        if remove_pending_marker(&pending).is_err() {
             report_categories.insert("marker-remove-failed");
         }
+    }
+    // The marker directory entry is part of the durable cleanup evidence; a
+    // successful unlink without a parent-directory sync cannot be reported as
+    // complete after a runner crash/restart boundary.
+    if File::open(root)
+        .and_then(|directory| directory.sync_all())
+        .is_err()
+    {
+        report_categories.insert("marker-remove-failed");
     }
     write_report(report, &report_categories, scan.records.len())?;
     if report_categories.is_empty() {
@@ -97,7 +151,8 @@ pub fn run_fixture() -> Result<(), &'static str> {
 /// Match the marker's immutable identity against one fresh process query;
 /// process-name and start-time checks prevent PID reuse from receiving a kill.
 fn identity_matches(record: &MarkerRecord, actual: &ProcessIdentity, allow_fixture: bool) -> bool {
-    actual.pgid == record.pgid
+    actual.pid == record.pid
+        && actual.pgid == record.pgid
         && actual.start_identity == record.start_identity
         && ((record.executable_kind == "log"
             && matches!(actual.comm.as_str(), "log" | "/usr/bin/log"))
@@ -109,24 +164,72 @@ fn identity_matches(record: &MarkerRecord, actual: &ProcessIdentity, allow_fixtu
 /// Remove only the exact sibling marker names derived from a validated owner
 /// and nonce, after the direct PID and complete group both report ESRCH.
 fn remove_identity_markers(
-    root: &Path,
-    record: &MarkerRecord,
+    _root: &Path,
+    records: &[&MarkerRecord],
     categories: &mut BTreeSet<&'static str>,
 ) -> Result<(), ()> {
-    let stem = format!(
-        "ja-sandbox-log-helper-{}-{}",
-        record.owner_pid, record.nonce
-    );
     let mut result = Ok(());
-    for suffix in ["marker", "fallback", "emergency"] {
-        let path = root.join(format!("{stem}.{suffix}"));
-        if let Err(error) = fs::remove_file(path)
-            && error.kind() != io::ErrorKind::NotFound
-        {
+    for record in records {
+        let file = match open_verified_marker(&record.path, record.file_identity) {
+            Ok(file) => file,
+            Err(()) => {
+                categories.insert("marker-remove-failed");
+                result = Err(());
+                continue;
+            }
+        };
+        if fs::remove_file(&record.path).is_err() {
             categories.insert("marker-remove-failed");
             result = Err(());
         }
+        // Keep the descriptor alive through unlink so the identity used for
+        // the final check remains owned until the path operation completes.
+        drop(file);
     }
+    result
+}
+
+/// Re-open each marker with no-follow flags and retain the descriptor through
+/// unlink; a path/inode swap after the initial scan therefore fails closed
+/// before any marker deletion is attempted.
+fn open_verified_marker(path: &Path, expected: marker::MarkerFileIdentity) -> Result<File, ()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW_FLAG | O_CLOEXEC_FLAG)
+        .open(path)
+        .map_err(|_| ())?;
+    let metadata = file.metadata().map_err(|_| ())?;
+    let actual = marker::MarkerFileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        nlink: metadata.nlink(),
+        mode: metadata.permissions().mode() & 0o777,
+        uid: metadata.uid(),
+    };
+    let path_metadata = fs::symlink_metadata(path).map_err(|_| ())?;
+    let path_identity = marker::MarkerFileIdentity {
+        dev: path_metadata.dev(),
+        ino: path_metadata.ino(),
+        nlink: path_metadata.nlink(),
+        mode: path_metadata.permissions().mode() & 0o777,
+        uid: path_metadata.uid(),
+    };
+    (metadata.file_type().is_file()
+        && !path_metadata.file_type().is_symlink()
+        && actual == expected
+        && path_identity == actual)
+        .then_some(file)
+        .ok_or(())
+}
+
+/// Apply the same identity recheck to incomplete activation files; a pending
+/// marker is never trusted as a process identity, but it is still evidence.
+fn remove_pending_marker(pending: &PendingMarker) -> Result<(), ()> {
+    let file = open_verified_marker(&pending.path, pending.file_identity)?;
+    // Keep the no-follow descriptor alive until the pending evidence unlink
+    // returns, so the identity check is not separated from deletion.
+    let result = fs::remove_file(&pending.path).map_err(|_| ());
+    drop(file);
     result
 }
 
@@ -136,6 +239,27 @@ fn write_report(
     report: &Path,
     categories: &BTreeSet<&'static str>,
     marker_count: usize,
+) -> Result<(), &'static str> {
+    write_report_with_count_label(report, categories, marker_count, "marker-count")
+}
+
+/// Write process-table evidence with a truthful scope count while sharing the
+/// same owner-only report file policy as marker cleanup.
+pub(super) fn write_scope_report(
+    report: &Path,
+    categories: &BTreeSet<&'static str>,
+    scope_count: usize,
+) -> Result<(), &'static str> {
+    write_report_with_count_label(report, categories, scope_count, "scope-count")
+}
+
+/// Keep report creation and fsync behavior identical for marker and scope
+/// evidence; only the fixed count field name differs by producer.
+fn write_report_with_count_label(
+    report: &Path,
+    categories: &BTreeSet<&'static str>,
+    count: usize,
+    count_label: &str,
 ) -> Result<(), &'static str> {
     let Some(parent) = report.parent() else {
         return Err("report-path-invalid");
@@ -152,8 +276,12 @@ fn write_report(
     for category in categories {
         writeln!(file, "{category}=true").map_err(|_| "report-write-failed")?;
     }
-    writeln!(file, "marker-count={marker_count}").map_err(|_| "report-write-failed")?;
+    writeln!(file, "{count_label}={count}").map_err(|_| "report-write-failed")?;
     file.sync_all().map_err(|_| "report-write-failed")?;
+    File::open(parent)
+        .map_err(|_| "report-write-failed")?
+        .sync_all()
+        .map_err(|_| "report-write-failed")?;
     Ok(())
 }
 
@@ -179,6 +307,14 @@ pub fn run_cli(arguments: &[String]) -> Result<(), &'static str> {
         {
             return Err("macOS-only fixture");
         }
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument == "--residual-scan")
+    {
+        let root = argument_path(arguments, "--root")?;
+        let report = argument_path(arguments, "--report")?;
+        return process_scan::run(&root, &report);
     }
     let root = argument_path(arguments, "--root")?;
     let report = argument_path(arguments, "--report")?;
@@ -211,6 +347,15 @@ mod unit_tests {
     #[test]
     fn identity_requires_pgid_start_and_known_comm() {
         let record = MarkerRecord {
+            path: PathBuf::new(),
+            suffix: "marker".into(),
+            file_identity: marker::MarkerFileIdentity {
+                dev: 0,
+                ino: 0,
+                nlink: 1,
+                mode: MARKER_MODE,
+                uid: process::current_uid(),
+            },
             owner_pid: 7,
             nonce: 8,
             pid: 9,
@@ -219,6 +364,7 @@ mod unit_tests {
             executable_kind: "log".into(),
         };
         let actual = ProcessIdentity {
+            pid: 9,
             pgid: 10,
             comm: "log".into(),
             start_identity: "start".into(),
@@ -255,6 +401,15 @@ mod unit_tests {
     fn marker_scan_entry_error_is_fail_closed() {
         let mut result = marker::ScanResult {
             records: vec![MarkerRecord {
+                path: PathBuf::new(),
+                suffix: "marker".into(),
+                file_identity: marker::MarkerFileIdentity {
+                    dev: 0,
+                    ino: 0,
+                    nlink: 1,
+                    mode: MARKER_MODE,
+                    uid: process::current_uid(),
+                },
                 owner_pid: 7,
                 nonce: 8,
                 pid: 9,

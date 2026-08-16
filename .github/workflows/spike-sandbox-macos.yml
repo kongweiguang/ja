@@ -26,9 +26,24 @@ jobs:
             runner: macos-26
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
+    env:
+      JA_SANDBOX_PRIVATE_ROOT: ${{ runner.temp }}/ja-sandbox-private
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Prepare private evidence root
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -e "$JA_SANDBOX_PRIVATE_ROOT" ]]; then
+            [[ -d "$JA_SANDBOX_PRIVATE_ROOT" ]]
+          else
+            mkdir -m 700 "$JA_SANDBOX_PRIVATE_ROOT"
+          fi
+          [[ "$(stat -f '%Lp' "$JA_SANDBOX_PRIVATE_ROOT")" == "700" ]]
 
       - name: Install Rust toolchain
         shell: bash
@@ -59,10 +74,15 @@ jobs:
             spikes/sandbox/macos/src/bin/probe_diagnostics/query.rs \
             spikes/sandbox/macos/src/bin/probe_diagnostics/redaction.rs \
             spikes/sandbox/macos/src/bin/probe_diagnostics/tests.rs \
+            spikes/sandbox/macos/src/bin/worker.rs \
             spikes/sandbox/macos/src/bin/marker_cleanup.rs \
+            spikes/sandbox/macos/src/lib.rs \
+            spikes/sandbox/macos/src/macos.rs \
+            spikes/sandbox/macos/src/process.rs \
             spikes/sandbox/macos/src/marker_cleanup/mod.rs \
             spikes/sandbox/macos/src/marker_cleanup/marker.rs \
             spikes/sandbox/macos/src/marker_cleanup/process.rs \
+            spikes/sandbox/macos/src/marker_cleanup/process_scan.rs \
             spikes/sandbox/macos/src/marker_cleanup/fixture.rs; do
             rustfmt +1.88.0 --edition 2024 --check "$source"
           done
@@ -88,12 +108,25 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/ja-sandbox-report"
+          first_failure=0
           for round in 1 2 3; do
+            set +e
             cargo +1.88.0 test --manifest-path spikes/sandbox/macos/Cargo.toml --all-targets --locked 2>&1 \
               | tee "$RUNNER_TEMP/ja-sandbox-report/test-${round}.log"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            round_status="${pipeline_status[0]}"
+            if [[ "$round_status" -eq 0 && "${pipeline_status[1]}" -ne 0 ]]; then
+              round_status="${pipeline_status[1]}"
+            fi
+            if [[ "$round_status" -ne 0 && "$first_failure" -eq 0 ]]; then
+              first_failure="$round_status"
+            fi
           done
+          exit "$first_failure"
 
       - name: Direct native probe
+        if: always()
         shell: bash
         timeout-minutes: 5
         run: |
@@ -114,7 +147,21 @@ jobs:
             --manifest-path spikes/sandbox/macos/Cargo.toml \
             --bin marker_cleanup \
             --locked \
-            -- --root "$RUNNER_TEMP" --report "$report_dir/helper-cleanup.log"
+            -- --root "$JA_SANDBOX_PRIVATE_ROOT" --report "$report_dir/helper-cleanup.log"
+
+      - name: Process-table residual gate
+        if: always()
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/ja-sandbox-report"
+          mkdir -p "$report_dir"
+          cargo +1.88.0 run \
+            --manifest-path spikes/sandbox/macos/Cargo.toml \
+            --bin marker_cleanup \
+            --locked \
+            -- --residual-scan --root "$JA_SANDBOX_PRIVATE_ROOT" --report "$report_dir/process-table.log"
 
       - name: Residual process gate
         if: always()
@@ -123,12 +170,46 @@ jobs:
         run: |
           set -euo pipefail
           cleanup_log="$RUNNER_TEMP/ja-sandbox-report/helper-cleanup.log"
-          if [[ -f "$cleanup_log" ]] && grep -Eq "marker-(residual|invalid|incomplete|entry-invalid|group-unsafe|owner-mismatch|remove-failed|fallback-missing|pending|stat-invalid|root-invalid|process-probe-failed|signal-failed|eperm|query-unreaped|query-group-residual)=true" "$cleanup_log"; then
+          process_table_log="$RUNNER_TEMP/ja-sandbox-report/process-table.log"
+          if [[ ! -f "$cleanup_log" ]]; then
+            echo "JA sandbox diagnostic helper cleanup report is missing" >&2
+            exit 1
+          fi
+          if grep -Eq "marker-(residual|invalid|incomplete|entry-invalid|group-unsafe|owner-mismatch|identity-lost|remove-failed|fallback-missing|pending|stat-invalid|root-invalid|process-probe-failed|signal-failed|eperm|query-unreaped|query-group-residual)=true" "$cleanup_log"; then
             echo "JA sandbox diagnostic helper cleanup evidence is unsafe or residual" >&2
             exit 1
           fi
+          if [[ ! -f "$process_table_log" ]] || grep -Eq "process-table-(residual|query|output|scope|root|entry|evidence|parse|identity|failure|quarantine|report)=true" "$process_table_log"; then
+            echo "JA sandbox process-table residual evidence is unsafe or unavailable" >&2
+            exit 1
+          fi
           shopt -s nullglob
-          residual_markers=("$RUNNER_TEMP"/ja-sandbox-log-helper-*.marker "$RUNNER_TEMP"/ja-sandbox-log-helper-*.fallback "$RUNNER_TEMP"/ja-sandbox-log-helper-*.emergency "$RUNNER_TEMP"/.ja-sandbox-log-helper-*.marker.pending "$RUNNER_TEMP"/.ja-sandbox-log-helper-*.fallback.pending "$RUNNER_TEMP"/.ja-sandbox-log-helper-*.emergency.pending)
+          residual_scopes=("$JA_SANDBOX_PRIVATE_ROOT"/ja-sandbox-probe-scope-*.scope)
+          if (( ${#residual_scopes[@]} > 0 )); then
+            echo "JA sandbox process scope evidence remained after the residual scan" >&2
+            exit 1
+          fi
+          residual_pending_scopes=("$JA_SANDBOX_PRIVATE_ROOT"/ja-sandbox-probe-scope-*.scope.pending-*)
+          if (( ${#residual_pending_scopes[@]} > 0 )); then
+            echo "JA sandbox pending process scope evidence remained after the residual scan" >&2
+            exit 1
+          fi
+          residual_scope_failures=("$JA_SANDBOX_PRIVATE_ROOT"/ja-sandbox-probe-scope-*.scope.failure)
+          if (( ${#residual_scope_failures[@]} > 0 )); then
+            echo "JA sandbox persistent child-cleanup failure evidence remained" >&2
+            exit 1
+          fi
+          residual_quarantine=("$JA_SANDBOX_PRIVATE_ROOT"/.ja-sandbox-probe-scope-quarantine*)
+          if (( ${#residual_quarantine[@]} > 0 )); then
+            echo "JA sandbox scope quarantine evidence remained after the residual scan" >&2
+            exit 1
+          fi
+          residual_escape=("$JA_SANDBOX_PRIVATE_ROOT"/ja-sandbox-escape-*.evidence* "$JA_SANDBOX_PRIVATE_ROOT"/.ja-sandbox-escape-*-pending "$JA_SANDBOX_PRIVATE_ROOT"/.ja-sandbox-escape-*-restore)
+          if (( ${#residual_escape[@]} > 0 )); then
+            echo "JA sandbox setsid escape evidence remained after bounded cleanup" >&2
+            exit 1
+          fi
+          residual_markers=("$JA_SANDBOX_PRIVATE_ROOT"/ja-sandbox-log-helper-*.marker "$JA_SANDBOX_PRIVATE_ROOT"/ja-sandbox-log-helper-*.fallback "$JA_SANDBOX_PRIVATE_ROOT"/ja-sandbox-log-helper-*.emergency "$JA_SANDBOX_PRIVATE_ROOT"/.ja-sandbox-log-helper-*.marker.pending "$JA_SANDBOX_PRIVATE_ROOT"/.ja-sandbox-log-helper-*.fallback.pending "$JA_SANDBOX_PRIVATE_ROOT"/.ja-sandbox-log-helper-*.emergency.pending)
           if (( ${#residual_markers[@]} > 0 )); then
             echo "JA sandbox marker residue detected" >&2
             exit 1

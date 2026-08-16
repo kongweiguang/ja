@@ -7,12 +7,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::redaction::{safe_operation, safe_process};
 use super::*;
+use ja_macos_sandbox_spike::spawn_grouped;
 
 /// Prove diagnostic output cannot echo a fixture path while retaining
 /// the operation token needed to identify a missing Seatbelt rule.
@@ -188,14 +188,13 @@ fn controlled_helper_diagnostics() -> (
     write_prepared_marker(&fallback, owner_pid, nonce).expect("prepared fallback marker");
     write_prepared_marker(&emergency, owner_pid, nonce).expect("prepared emergency marker");
 
-    let mut child = Command::new("/bin/sh")
+    let mut command = Command::new("/bin/sh");
+    command
         .args(["-c", "/bin/sleep 30 & wait"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .expect("controlled helper spawn");
+        .stderr(Stdio::piped());
+    let mut child = spawn_grouped(&mut command).expect("controlled helper spawn");
     let pid = child.id();
     let process_group = i32::try_from(pid).expect("helper pid fits process group");
     let start_identity = process_start_identity(pid).expect("helper start identity");
@@ -239,9 +238,13 @@ fn controlled_helper_diagnostics() -> (
 fn helper_group_gone(pid: u32, process_group: i32) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
-        let child_gone =
-            unsafe { kill(i32::try_from(pid).unwrap_or(-1), 0) == -1 && *__error() == ESRCH };
-        let group_gone = unsafe { kill(-process_group, 0) == -1 && *__error() == ESRCH };
+        let child_gone = if let Ok(pid) = i32::try_from(pid) {
+            pid > 1 && unsafe { kill(pid, 0) == -1 && *__error() == ESRCH }
+        } else {
+            false
+        };
+        let group_gone =
+            process_group > 1 && unsafe { kill(-process_group, 0) == -1 && *__error() == ESRCH };
         if child_gone && group_gone {
             return true;
         }
@@ -285,14 +288,13 @@ fn controlled_helper_group_drop_reaps() {
 #[cfg(target_os = "macos")]
 #[test]
 fn reaped_parent_does_not_skip_descendant_group_cleanup() {
-    let mut child = Command::new("/bin/sh")
+    let mut command = Command::new("/bin/sh");
+    command
         .args(["-c", "/bin/sleep 30 & exit 0"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .expect("descendant helper spawn");
+        .stderr(Stdio::null());
+    let mut child = spawn_grouped(&mut command).expect("descendant helper spawn");
     let pid = child.id();
     let process_group = i32::try_from(pid).expect("descendant group fits");
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -345,7 +347,8 @@ fn diagnostic_switch_is_pure() {
 #[test]
 fn marker_directory_rejects_shared_write_modes() {
     assert!(marker_directory_mode_safe(0o700));
-    assert!(marker_directory_mode_safe(0o755));
+    assert!(!marker_directory_mode_safe(0o755));
+    assert!(!marker_directory_mode_safe(0o701));
     assert!(!marker_directory_mode_safe(0o702));
     assert!(!marker_directory_mode_safe(0o777));
 }

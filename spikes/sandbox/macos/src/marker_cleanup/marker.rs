@@ -17,6 +17,9 @@ const O_NOFOLLOW_FLAG: i32 = 0x0000_0100;
 /// exact process cleanup routine.
 #[derive(Debug, Clone)]
 pub(super) struct MarkerRecord {
+    pub(super) path: PathBuf,
+    pub(super) suffix: String,
+    pub(super) file_identity: MarkerFileIdentity,
     pub(super) owner_pid: u32,
     pub(super) nonce: u128,
     pub(super) pid: u32,
@@ -25,12 +28,27 @@ pub(super) struct MarkerRecord {
     pub(super) executable_kind: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct MarkerFileIdentity {
+    pub(super) dev: u64,
+    pub(super) ino: u64,
+    pub(super) nlink: u64,
+    pub(super) mode: u32,
+    pub(super) uid: u32,
+}
+
+#[derive(Debug)]
+pub(super) struct PendingMarker {
+    pub(super) path: PathBuf,
+    pub(super) file_identity: MarkerFileIdentity,
+}
+
 /// Discovery output keeps invalid/pending categories separate so no invalid
 /// file can accidentally be promoted to a signal target.
 #[derive(Debug)]
 pub(super) struct ScanResult {
     pub(super) records: Vec<MarkerRecord>,
-    pub(super) pending: Vec<PathBuf>,
+    pub(super) pending: Vec<PendingMarker>,
     pub(super) categories: Vec<&'static str>,
 }
 
@@ -56,7 +74,7 @@ pub(super) fn scan_root(root: &Path, allow_fixture: bool) -> ScanResult {
     if !root_metadata.file_type().is_dir()
         || root_metadata.file_type().is_symlink()
         || root_metadata.uid() != current_uid()
-        || root_mode & 0o022 != 0
+        || root_mode != 0o700
     {
         result.categories.push("marker-root-invalid");
         return result;
@@ -93,13 +111,23 @@ where
             continue;
         };
         if is_pending_name(name) {
-            result.pending.push(path);
+            if parse_pending_name(name).is_none() {
+                result.categories.push("marker-owner-mismatch");
+                continue;
+            }
+            match marker_path_identity(&path) {
+                Ok(file_identity) => result.pending.push(PendingMarker {
+                    path,
+                    file_identity,
+                }),
+                Err(_) => result.categories.push("marker-stat-invalid"),
+            }
             continue;
         }
-        let Some((owner_pid, nonce, _suffix)) = parse_marker_name(name) else {
+        let Some((owner_pid, nonce, suffix)) = parse_marker_name(name) else {
             continue;
         };
-        match parse_marker(&path, owner_pid, nonce, allow_fixture) {
+        match parse_marker(&path, owner_pid, nonce, suffix, allow_fixture) {
             Ok(record) => result.records.push(record),
             Err(category) => result.categories.push(category),
         }
@@ -120,7 +148,9 @@ pub(super) fn write_fixture_marker(path: &Path, contents: &str) -> Result<(), &'
     validate_marker_file(&file).map_err(|_| "marker-stat-invalid")?;
     std::io::Write::write_all(&mut file, contents.as_bytes()).map_err(|_| "marker-write-failed")?;
     file.sync_all().map_err(|_| "marker-write-failed")?;
-    validate_marker_file(&file).map_err(|_| "marker-stat-invalid")
+    validate_marker_file(&file)
+        .map(|_| ())
+        .map_err(|_| "marker-stat-invalid")
 }
 
 /// Parse a trusted marker only after descriptor-bound metadata validation.
@@ -128,6 +158,7 @@ fn parse_marker(
     path: &Path,
     file_owner: u32,
     file_nonce: u128,
+    suffix: &str,
     allow_fixture: bool,
 ) -> Result<MarkerRecord, &'static str> {
     let file = OpenOptions::new()
@@ -135,12 +166,16 @@ fn parse_marker(
         .custom_flags(O_NOFOLLOW_FLAG | O_CLOEXEC_FLAG)
         .open(path)
         .map_err(|_| "marker-stat-invalid")?;
-    validate_marker_file(&file).map_err(|_| "marker-stat-invalid")?;
+    let file_identity = validate_marker_file(&file).map_err(|_| "marker-stat-invalid")?;
     let mut contents = String::new();
     file.take(4096)
         .read_to_string(&mut contents)
         .map_err(|_| "marker-incomplete")?;
-    parse_contents(file_owner, file_nonce, &contents, allow_fixture)
+    let mut record = parse_contents(file_owner, file_nonce, &contents, allow_fixture)?;
+    record.path = path.to_owned();
+    record.suffix = suffix.to_owned();
+    record.file_identity = file_identity;
+    Ok(record)
 }
 
 /// Validate exactly seven fixed fields, rejecting duplicates, unknown keys,
@@ -199,6 +234,15 @@ fn parse_contents(
         return Err("marker-owner-mismatch");
     }
     Ok(MarkerRecord {
+        path: PathBuf::new(),
+        suffix: String::new(),
+        file_identity: MarkerFileIdentity {
+            dev: 0,
+            ino: 0,
+            nlink: 1,
+            mode: MARKER_MODE,
+            uid: current_uid(),
+        },
         owner_pid,
         nonce,
         pid,
@@ -241,16 +285,34 @@ fn valid_identity(value: &str) -> bool {
 
 /// Reject symlinks, hardlinks, wrong owners and mode changes on the opened
 /// descriptor before its contents become a signal target.
-fn validate_marker_file(file: &File) -> Result<(), ()> {
+fn validate_marker_file(file: &File) -> Result<MarkerFileIdentity, ()> {
     let metadata = file.metadata().map_err(|_| ())?;
+    let identity = MarkerFileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        nlink: metadata.nlink(),
+        mode: metadata.permissions().mode() & 0o777,
+        uid: metadata.uid(),
+    };
     if !metadata.file_type().is_file()
-        || metadata.uid() != current_uid()
-        || metadata.permissions().mode() & 0o777 != MARKER_MODE
-        || metadata.nlink() != 1
+        || identity.uid != current_uid()
+        || identity.mode != MARKER_MODE
+        || identity.nlink != 1
     {
         return Err(());
     }
-    Ok(())
+    Ok(identity)
+}
+
+/// Capture an owner-only regular marker inode before a pending file can be
+/// removed; deletion callers must compare this identity again immediately.
+fn marker_path_identity(path: &Path) -> Result<MarkerFileIdentity, ()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW_FLAG | O_CLOEXEC_FLAG)
+        .open(path)
+        .map_err(|_| ())?;
+    validate_marker_file(&file)
 }
 
 /// Parse active names and bind filename owner/nonce to content fields.
@@ -262,7 +324,7 @@ fn parse_marker_name(name: &str) -> Option<(u32, u128, &str)> {
     }
     let (owner, nonce) = ids.split_once('-')?;
     Some((
-        owner.parse::<u32>().ok().filter(|value| *value > 0)?,
+        owner.parse::<u32>().ok().filter(|value| *value > 1)?,
         nonce.parse::<u128>().ok().filter(|value| *value > 0)?,
         suffix,
     ))
@@ -273,4 +335,37 @@ fn is_pending_name(name: &str) -> bool {
     name.starts_with(".ja-sandbox-log-helper-") && name.ends_with(".marker.pending")
         || name.starts_with(".ja-sandbox-log-helper-") && name.ends_with(".fallback.pending")
         || name.starts_with(".ja-sandbox-log-helper-") && name.ends_with(".emergency.pending")
+}
+
+/// Parse pending owner/nonce names too; pending files carry no trusted
+/// process identity, but reserved owner values must still fail closed.
+fn parse_pending_name(name: &str) -> Option<(u32, u128)> {
+    let body = name.strip_prefix(".ja-sandbox-log-helper-")?;
+    let (ids, suffix) = body.rsplit_once('.')?;
+    if !matches!(
+        suffix,
+        "marker.pending" | "fallback.pending" | "emergency.pending"
+    ) {
+        return None;
+    }
+    let (owner, nonce) = ids.split_once('-')?;
+    Some((
+        owner.parse::<u32>().ok().filter(|value| *value > 1)?,
+        nonce.parse::<u128>().ok().filter(|value| *value > 0)?,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_positive_i32, parse_positive_u32};
+
+    /// Marker parsing rejects all reserved PID/PGID values before cleanup can
+    /// derive a direct or negative process-group signal target.
+    #[test]
+    fn reserved_marker_ids_are_rejected() {
+        for value in ["-1", "0", "1"] {
+            assert!(parse_positive_u32(value).is_none());
+            assert!(parse_positive_i32(value).is_none());
+        }
+    }
 }

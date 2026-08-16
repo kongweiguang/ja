@@ -14,6 +14,7 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use ja_macos_sandbox_spike::{run_bounded_command, spawn_grouped};
     use std::env;
     use std::fs::{self, OpenOptions};
     use std::io::{self, Write};
@@ -112,7 +113,8 @@ mod macos {
         let child_report = path_arg(args, "--child-report")?;
         let release = path_arg(args, "--release")?;
         let executable = env::current_exe().map_err(|error| error.to_string())?;
-        let child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .args([
                 "--mode",
                 "idle",
@@ -124,9 +126,9 @@ mod macos {
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| format!("spawn descendant: {error}"))?;
+            .stderr(Stdio::null());
+        let child =
+            spawn_grouped(&mut command).map_err(|error| format!("spawn descendant: {error}"))?;
         write_report(
             &report,
             &format!("grandchild-started=true\npid={}", child.id()),
@@ -140,7 +142,8 @@ mod macos {
         let child_report = path_arg(args, "--child-report")?;
         let release = path_arg(args, "--release")?;
         let executable = env::current_exe().map_err(|error| error.to_string())?;
-        let _child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .args([
                 "--mode",
                 "idle",
@@ -152,8 +155,8 @@ mod macos {
             .env_clear()
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
+            .stderr(Stdio::inherit());
+        let _child = spawn_grouped(&mut command)
             .map_err(|error| format!("spawn inherited descendant: {error}"))?;
         write_report(&report, "grandchild-started=true")
     }
@@ -165,7 +168,8 @@ mod macos {
         let child_report = path_arg(args, "--child-report")?;
         let release = path_arg(args, "--release")?;
         let executable = env::current_exe().map_err(|error| error.to_string())?;
-        let _child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .args([
                 "--mode",
                 "idle",
@@ -177,8 +181,8 @@ mod macos {
             .env_clear()
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
+            .stderr(Stdio::inherit());
+        let _child = spawn_grouped(&mut command)
             .map_err(|error| format!("spawn overflow descendant: {error}"))?;
         write_report(&report, "grandchild-started=true")?;
         let mut output = io::stdout().lock();
@@ -227,8 +231,10 @@ mod macos {
                 }
             });
         }
-        let started = match command.spawn() {
+        let started = match spawn_grouped(&mut command) {
             Ok(child) => {
+                // Keep the marker and PID as one fixed record so the host can
+                // reject duplicates, unknown fields, and mixed denial states.
                 write_report(&report, &format!("setsid-started=true\npid={}", child.id()))?;
                 true
             }
@@ -324,20 +330,20 @@ mod macos {
         {
             return false;
         }
-        Command::new(path)
+        let mut command = Command::new(path);
+        command
             .arg("--mode")
             .arg("idle")
             .arg("--report")
             .arg(path.with_extension("exec.report"))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map(|mut child| {
-                let _ = child.kill();
-                let _ = child.wait();
-                false
-            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Use the same bounded group/reap primitive as host capability probes;
+        // a denied executable must not leave a live child merely because this
+        // boolean fixture is running inside the sandbox.
+        run_bounded_command(command, Duration::from_secs(2), 4096, 4096)
+            .map(|output| !output.status.success())
             .unwrap_or(true)
     }
 

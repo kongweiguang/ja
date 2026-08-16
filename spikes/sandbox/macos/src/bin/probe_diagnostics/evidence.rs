@@ -4,7 +4,10 @@
 //! Durable marker evidence and failure-path removal.
 
 use super::SandboxDenialDiagnostics;
-use super::marker::{marker_open_flags, sync_parent_directory, validate_marker_file};
+use super::marker::{
+    marker_open_flags, sync_parent_directory, validate_marker_file, validate_marker_file_identity,
+    validate_marker_path_identity,
+};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -16,16 +19,56 @@ fn remove_marker_path(slot: &mut Option<PathBuf>) -> bool {
     let Some(path) = slot.as_ref() else {
         return true;
     };
+    let expected = match OpenOptions::new()
+        .read(true)
+        .custom_flags(marker_open_flags())
+        .open(path)
+        .and_then(|file| validate_marker_file(&file))
+    {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            *slot = None;
+            return true;
+        }
+        Err(_) => return false,
+    };
+    // Re-open and re-check the identity immediately before unlink so a
+    // same-user path replacement cannot make cleanup delete a new file.
+    let current = OpenOptions::new()
+        .read(true)
+        .custom_flags(marker_open_flags())
+        .open(path)
+        .and_then(|file| {
+            validate_marker_file_identity(&file, expected)?;
+            Ok(file)
+        });
+    let Ok(current) = current else {
+        return false;
+    };
+    if validate_marker_path_identity(path, expected).is_err() {
+        return false;
+    }
+    // Keep the descriptor alive through unlink so the second identity check
+    // is not separated from the path operation by another open/close window.
     match fs::remove_file(path) {
         Ok(()) => {
+            drop(current);
+            if sync_parent_directory(path).is_err() {
+                return false;
+            }
             *slot = None;
             true
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            drop(current);
+            let _ = sync_parent_directory(path);
             *slot = None;
             true
         }
-        Err(_) => false,
+        Err(_) => {
+            drop(current);
+            false
+        }
     }
 }
 

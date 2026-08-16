@@ -7,6 +7,7 @@ use super::{
     __error, CleanupPhase, CleanupPhaseResult, CleanupPoll, DIAGNOSTIC_DEADLINE, ESRCH, SIGKILL,
     SIGTERM, SandboxDenialDiagnostics, cleanup_decision, kill,
 };
+use ja_macos_sandbox_spike::{safe_signal_group, safe_signal_pid};
 use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -75,7 +76,9 @@ impl SandboxDenialDiagnostics {
     /// kill/reap remains mandatory because a group signal is not a reap.
     pub(super) fn kill_helper_group(&self, signal: i32) {
         if let Some(group) = self.process_group {
-            let _ = unsafe { kill(-group, signal) };
+            if group > 1 {
+                let _ = safe_signal_group(group, signal);
+            }
         }
     }
 
@@ -84,8 +87,9 @@ impl SandboxDenialDiagnostics {
     fn signal_direct_child(&self, signal: i32) {
         if let Some(child) = self.child.as_ref()
             && let Ok(pid) = i32::try_from(child.id())
+            && pid > 1
         {
-            let _ = unsafe { kill(pid, signal) };
+            let _ = safe_signal_pid(pid, signal);
         }
     }
 
@@ -93,7 +97,11 @@ impl SandboxDenialDiagnostics {
     /// leaves ownership available for the retry phase and `Drop`.
     pub(super) fn wait_child_until(&mut self, deadline: Instant) -> CleanupPoll {
         loop {
-            self.pump();
+            // A missing or failed nonblocking setup means the pipe may still
+            // block; cleanup must close it and poll ownership without reading.
+            if self.pipes_nonblocking {
+                self.pump();
+            }
             let poll = match self.child.as_mut() {
                 Some(child) => child.try_wait(),
                 None => {
@@ -199,6 +207,9 @@ impl Drop for SandboxDenialDiagnostics {
 /// Treat a process group as gone only when `kill(-pgid, 0)` reports ESRCH;
 /// EPERM and other errors are deliberately not interpreted as success.
 fn process_group_is_empty(process_group: i32) -> bool {
+    if process_group <= 1 {
+        return false;
+    }
     let result = unsafe { kill(-process_group, 0) };
     result == -1 && unsafe { *__error() } == ESRCH
 }

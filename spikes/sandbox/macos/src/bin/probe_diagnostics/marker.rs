@@ -6,7 +6,7 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,9 +32,13 @@ pub(super) struct PreparedHelperMarker {
 /// `log`; this proves the runner directory is safe and leaves evidence if
 /// activation fails.
 pub(super) fn prepare_helper_marker() -> io::Result<PreparedHelperMarker> {
-    let root = env::var_os("RUNNER_TEMP")
+    let root = env::var_os("JA_SANDBOX_PRIVATE_ROOT")
+        .or_else(|| env::var_os("RUNNER_TEMP"))
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir);
+    if !root.exists() {
+        fs::DirBuilder::new().mode(0o700).create(&root)?;
+    }
     let metadata = fs::symlink_metadata(&root)?;
     let mode = metadata.permissions().mode() & 0o777;
     let owner_uid = unsafe { geteuid() };
@@ -62,22 +66,22 @@ pub(super) fn prepare_helper_marker() -> io::Result<PreparedHelperMarker> {
         nonce,
     };
     if let Err(error) = write_prepared_marker(&prepared.path, prepared.owner_pid, prepared.nonce) {
-        let _ = fs::remove_file(&prepared.path);
+        let _ = remove_marker_if_owned(&prepared.path);
         return Err(error);
     }
     if let Err(error) =
         write_prepared_marker(&prepared.fallback_path, prepared.owner_pid, prepared.nonce)
     {
-        let _ = fs::remove_file(&prepared.path);
-        let _ = fs::remove_file(&prepared.fallback_path);
+        let _ = remove_marker_if_owned(&prepared.path);
+        let _ = remove_marker_if_owned(&prepared.fallback_path);
         return Err(error);
     }
     if let Err(error) =
         write_prepared_marker(&prepared.emergency_path, prepared.owner_pid, prepared.nonce)
     {
-        let _ = fs::remove_file(&prepared.path);
-        let _ = fs::remove_file(&prepared.fallback_path);
-        let _ = fs::remove_file(&prepared.emergency_path);
+        let _ = remove_marker_if_owned(&prepared.path);
+        let _ = remove_marker_if_owned(&prepared.fallback_path);
+        let _ = remove_marker_if_owned(&prepared.emergency_path);
         return Err(error);
     }
     Ok(prepared)
@@ -86,14 +90,20 @@ pub(super) fn prepare_helper_marker() -> io::Result<PreparedHelperMarker> {
 /// Require a marker root that another local user cannot modify or replace;
 /// marker contents remain owner-only through each file's 0600 mode.
 pub(super) fn marker_directory_mode_safe(mode: u32) -> bool {
-    mode & 0o022 == 0
+    mode == 0o700
 }
 
 /// Write a prepared marker with a create-time 0600 mode, preventing a
 /// create-then-chmod visibility window for another local user.
 pub(super) fn write_prepared_marker(path: &Path, owner_pid: u32, nonce: u128) -> io::Result<()> {
+    if owner_pid <= 1 || nonce == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reserved marker owner",
+        ));
+    }
     let contents = format!("owner_pid={owner_pid}\nnonce={nonce}\nstate={MARKER_STATE_PREPARED}\n");
-    write_new_marker_file(path, &contents)
+    write_new_marker_file(path, &contents).map(|_| ())
 }
 
 /// Activate all independent marker files atomically; in-place rewrite is only
@@ -139,6 +149,12 @@ pub(super) fn marker_contents(
     process_group: i32,
     start_identity: &str,
 ) -> io::Result<String> {
+    if owner_pid <= 1 || pid <= 1 || process_group <= 1 || nonce == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reserved marker identity",
+        ));
+    }
     if !super::query::valid_start_identity(start_identity) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -160,14 +176,19 @@ fn activate_marker_file(path: &Path, contents: &str) -> io::Result<()> {
     // map both `.marker` and `.fallback` to one shared temporary file.
     let pending = path.with_file_name(format!(".{}.pending", file_name.to_string_lossy()));
     let result = (|| {
-        write_new_marker_file(&pending, contents)?;
+        let pending_identity = write_new_marker_file(&pending, contents)?;
         fs::rename(&pending, path)?;
+        let current = OpenOptions::new()
+            .read(true)
+            .custom_flags(marker_open_flags())
+            .open(path)?;
+        validate_marker_file_identity(&current, pending_identity)?;
         sync_parent_directory(path)
     })();
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
-            let _ = fs::remove_file(&pending);
+            let _ = remove_marker_if_owned(&pending);
             let _ = write_marker_file(path, contents);
             Err(error)
         }
@@ -192,7 +213,7 @@ pub(super) fn write_marker_file(path: &Path, contents: &str) -> io::Result<()> {
 }
 
 /// Create a new marker with the restrictive mode applied in the open syscall.
-fn write_new_marker_file(path: &Path, contents: &str) -> io::Result<()> {
+fn write_new_marker_file(path: &Path, contents: &str) -> io::Result<MarkerFileIdentity> {
     let mut marker = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -202,7 +223,8 @@ fn write_new_marker_file(path: &Path, contents: &str) -> io::Result<()> {
     let identity = validate_marker_file(&marker)?;
     marker.write_all(contents.as_bytes())?;
     marker.sync_all()?;
-    validate_marker_file_identity(&marker, identity)
+    validate_marker_file_identity(&marker, identity)?;
+    Ok(identity)
 }
 
 /// Open marker files with no-follow/close-on-exec flags so descriptor checks
@@ -213,8 +235,11 @@ pub(super) fn marker_open_flags() -> i32 {
 
 #[derive(Clone, Copy)]
 pub(super) struct MarkerFileIdentity {
-    device: u64,
-    inode: u64,
+    pub(super) device: u64,
+    pub(super) inode: u64,
+    pub(super) nlink: u64,
+    pub(super) mode: u32,
+    pub(super) uid: u32,
 }
 
 /// Enforce owner-only regular-file evidence before any marker write.
@@ -234,19 +259,81 @@ pub(super) fn validate_marker_file(file: &File) -> io::Result<MarkerFileIdentity
     Ok(MarkerFileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
+        nlink: metadata.nlink(),
+        mode,
+        uid: metadata.uid(),
     })
 }
 
 /// Reject inode replacement or a newly-created hardlink after the write.
-fn validate_marker_file_identity(file: &File, expected: MarkerFileIdentity) -> io::Result<()> {
+pub(super) fn validate_marker_file_identity(
+    file: &File,
+    expected: MarkerFileIdentity,
+) -> io::Result<()> {
     let actual = validate_marker_file(file)?;
-    if actual.device != expected.device || actual.inode != expected.inode {
+    if actual.device != expected.device
+        || actual.inode != expected.inode
+        || actual.nlink != expected.nlink
+        || actual.mode != expected.mode
+        || actual.uid != expected.uid
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "marker inode changed",
         ));
     }
     Ok(())
+}
+
+/// Compare the pathname's immediate lstat with the already-validated
+/// descriptor before unlink.  Descriptor-only validation cannot prove that a
+/// concurrent replacement has not changed what the directory entry names.
+pub(super) fn validate_marker_path_identity(
+    path: &Path,
+    expected: MarkerFileIdentity,
+) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    let actual = MarkerFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        nlink: metadata.nlink(),
+        mode: metadata.permissions().mode() & 0o777,
+        uid: metadata.uid(),
+    };
+    if metadata.file_type().is_symlink()
+        || actual.device != expected.device
+        || actual.inode != expected.inode
+        || actual.nlink != expected.nlink
+        || actual.mode != expected.mode
+        || actual.uid != expected.uid
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "marker pathname identity changed",
+        ));
+    }
+    Ok(())
+}
+
+/// Remove only an owner-only marker inode whose identity is checked twice;
+/// partial setup cleanup must not unlink an attacker-replaced path.
+fn remove_marker_if_owned(path: &Path) -> io::Result<()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(marker_open_flags())
+        .open(path)?;
+    let expected = validate_marker_file(&file)?;
+    drop(file);
+    let current = OpenOptions::new()
+        .read(true)
+        .custom_flags(marker_open_flags())
+        .open(path)?;
+    validate_marker_file_identity(&current, expected)?;
+    validate_marker_path_identity(path, expected)?;
+    fs::remove_file(path)?;
+    // A marker is only considered gone after its directory entry is durable;
+    // otherwise a crash can resurrect the cleanup evidence unexpectedly.
+    sync_parent_directory(path)
 }
 
 /// Make the rename durable as far as the filesystem API allows by syncing the

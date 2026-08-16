@@ -4,8 +4,8 @@
 //! Bounded process-start identity queries and their private supervisors.
 
 use super::SandboxDenialDiagnostics;
+use ja_macos_sandbox_spike::{safe_signal_group, spawn_grouped};
 use std::io::{self, Read, Write};
-use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,15 +35,17 @@ fn process_start_identity_inner(
     owner: Option<&mut SandboxDenialDiagnostics>,
     pid: u32,
 ) -> Option<String> {
+    if pid <= 1 {
+        abort_identity_query(owner, "pid-range");
+    }
     let pid = pid.to_string();
-    let mut child = Command::new("/bin/ps")
+    let mut command = Command::new("/bin/ps");
+    command
         .args(["-o", "lstart=", "-p", &pid])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    let mut child = spawn_grouped(&mut command).ok()?;
     let process_group = match i32::try_from(child.id()).ok().filter(|value| *value > 1) {
         Some(process_group) => process_group,
         None => {
@@ -169,7 +171,10 @@ fn finish_start_identity_query(
     owner: Option<&mut SandboxDenialDiagnostics>,
 ) -> Option<String> {
     if child.try_wait().ok().flatten().is_none() {
-        let _ = unsafe { kill(-process_group, super::SIGKILL) };
+        if process_group <= 1 {
+            abort_identity_query(owner, "group-range");
+        }
+        let _ = safe_signal_group(process_group, super::SIGKILL);
         let _ = child.kill();
     }
     let deadline = Instant::now() + START_QUERY_DEADLINE;
@@ -189,7 +194,7 @@ fn finish_start_identity_query(
     }
     let group_deadline = Instant::now() + START_QUERY_DEADLINE;
     while !query_group_empty(process_group) && Instant::now() < group_deadline {
-        let _ = unsafe { kill(-process_group, super::SIGKILL) };
+        let _ = safe_signal_group(process_group, super::SIGKILL);
         thread::sleep(Duration::from_millis(5));
     }
     if !query_group_empty(process_group) {
@@ -235,6 +240,9 @@ fn reap_query_child_without_group(child: &mut Child) -> bool {
 /// Verify the query group vanished with ESRCH, not merely with a generic
 /// nonzero status that could mean permission failure.
 fn query_group_empty(process_group: i32) -> bool {
+    if process_group <= 1 {
+        return false;
+    }
     unsafe { kill(-process_group, 0) == -1 && *__error() == super::ESRCH }
 }
 

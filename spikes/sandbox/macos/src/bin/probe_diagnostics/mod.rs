@@ -7,10 +7,10 @@ use super::super::{
     CleanupPhase, CleanupPhaseResult, CleanupPoll, cleanup_decision, diagnostic_pump_allowed,
     marker_identity_safe,
 };
+use ja_macos_sandbox_spike::spawn_grouped;
 use std::collections::BTreeMap;
 use std::env;
 use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::time::Duration;
@@ -84,7 +84,8 @@ impl SandboxDenialDiagnostics {
             Ok(marker) => marker,
             Err(_) => return Self::unavailable("marker-preparation"),
         };
-        let mut child = match Command::new("/usr/bin/log")
+        let mut command = Command::new("/usr/bin/log");
+        command
             .args([
                 "stream",
                 "--style",
@@ -94,12 +95,8 @@ impl SandboxDenialDiagnostics {
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // A dedicated group lets cleanup target only this log helper
-            // and any descendants, never the runner's other log clients.
-            .process_group(0)
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+        let mut child = match spawn_grouped(&mut command) {
             Ok(child) => child,
             Err(_) => {
                 let mut diagnostics = Self::unavailable("spawn");
@@ -142,12 +139,22 @@ impl SandboxDenialDiagnostics {
             diagnostics.process_group,
             diagnostics.child.as_ref().map(Child::id),
         ) {
-            (Some(group), Some(pid)) => match process_start_identity_owned(&mut diagnostics, pid) {
-                Some(start_identity) => {
-                    activate_helper_marker(&prepared_marker, pid, group, &start_identity).is_err()
+            (Some(group), Some(pid)) => {
+                // Publish the provisional PID/PGID before querying start
+                // identity; a query failure therefore leaves actionable
+                // owner evidence instead of an empty marker window.
+                if activate_helper_marker(&prepared_marker, pid, group, "provisional").is_err() {
+                    true
+                } else {
+                    match process_start_identity_owned(&mut diagnostics, pid) {
+                        Some(start_identity) => {
+                            activate_helper_marker(&prepared_marker, pid, group, &start_identity)
+                                .is_err()
+                        }
+                        None => true,
+                    }
                 }
-                None => true,
-            },
+            }
             _ => false,
         };
         if marker_failed {

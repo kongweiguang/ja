@@ -5,10 +5,11 @@
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::{safe_signal_group, safe_signal_pid, spawn_grouped};
 
 const ESRCH: i32 = 3;
 pub(super) const EPERM: i32 = 1;
@@ -29,8 +30,9 @@ pub(super) enum ProcessState {
 }
 
 /// Minimal identity data used to prevent PID reuse before a group signal.
-#[derive(Debug)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct ProcessIdentity {
+    pub(super) pid: u32,
     pub(super) pgid: i32,
     pub(super) comm: String,
     pub(super) start_identity: String,
@@ -59,19 +61,25 @@ pub(super) fn current_uid() -> u32 {
 
 /// Probe an exact PID or process group using kernel errno semantics.
 pub(super) fn pid_state(pid: i32) -> ProcessState {
+    if pid <= 1 {
+        return ProcessState::Other(22);
+    }
     classify_kill_result(unsafe { kill(pid, 0) })
 }
 
 /// Query process group/name/start identity through a supervised bounded `ps`.
 pub(super) fn query_identity(pid: u32) -> Result<ProcessIdentity, &'static str> {
-    let mut child = Command::new("/bin/ps")
-        .args(["-o", "pgid=,comm=,lstart=", "-p", &pid.to_string()])
+    if pid <= 1 {
+        return Err("marker-owner-mismatch");
+    }
+    let mut command = Command::new("/bin/ps");
+    let pid_argument = pid.to_string();
+    command
+        .args(["-o", "pgid=,comm=,lstart=", "-p", &pid_argument])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|_| "marker-owner-mismatch")?;
+        .stderr(Stdio::piped());
+    let mut child = spawn_grouped(&mut command).map_err(|_| "marker-owner-mismatch")?;
     // macOS PIDs are bounded by pid_t/i32; validate the conversion and reserve
     // PID/group values before any negative process-group operation is formed.
     let process_group = match i32::try_from(child.id()).ok().filter(|value| *value > 1) {
@@ -126,7 +134,19 @@ pub(super) fn query_identity(pid: u32) -> Result<ProcessIdentity, &'static str> 
         return query_failure(&mut child, process_group);
     }
     let identity = terminate_query(&mut child, process_group, Some(output))?;
-    parse_identity(&identity)
+    let mut identity = parse_identity(&identity)?;
+    identity.pid = pid_from_argument(&pid_argument)?;
+    Ok(identity)
+}
+
+/// Parse the already validated decimal PID used by the identity helper so the
+/// capture includes the numeric owner as well as start/comm/PGID fields.
+fn pid_from_argument(value: &str) -> Result<u32, &'static str> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 1)
+        .ok_or("marker-owner-mismatch")
 }
 
 /// Reap a fixture launcher with an absolute deadline; a failed read must not
@@ -139,7 +159,8 @@ pub(super) fn reap_child_bounded(
     process_group: i32,
     deadline: Instant,
 ) -> Result<(), &'static str> {
-    finalize_child(child, process_group, deadline, "fixture-unreaped")
+    finalize_child(child, process_group, deadline, "fixture-unreaped")?;
+    require_group_empty(process_group, deadline)
 }
 
 /// Reap a failed query child before returning a fixed identity error; this
@@ -169,26 +190,43 @@ pub(super) fn reap_child_without_group(child: &mut Child) -> bool {
 /// Kill the exact group and direct PID, then require both to report ESRCH
 /// before allowing sibling marker deletion.
 pub(super) fn terminate_group(
-    pid: u32,
-    process_group: i32,
+    captured: &ProcessIdentity,
     deadline: Instant,
 ) -> Result<(), &'static str> {
-    let group_signal = signal_group(process_group)?;
+    validate_captured_identity(captured)?;
+    let group_signal = signal_group_captured(captured)?;
     if group_signal == ProcessState::Empty {
         // The group disappearing before the direct signal is a PID-reuse
         // boundary: never send a signal to a new process that inherited the
         // old numeric PID after the validated group vanished.
-        return match pid_state(i32::try_from(pid).map_err(|_| "marker-owner-mismatch")?) {
+        return match pid_state(i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?) {
             ProcessState::Empty => Ok(()),
             ProcessState::PermissionDenied => Err("marker-eperm"),
-            ProcessState::Present => Err("marker-owner-mismatch"),
+            ProcessState::Present => Err("marker-identity-lost"),
             ProcessState::Other(_) => Err("marker-process-probe-failed"),
         };
     }
-    signal_pid(pid)?;
+    let direct = pid_state(i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?);
+    let group = group_state(captured.pgid);
+    match (direct, group) {
+        (ProcessState::Empty, ProcessState::Empty) => return Ok(()),
+        (ProcessState::PermissionDenied, _) | (_, ProcessState::PermissionDenied) => {
+            return Err("marker-eperm");
+        }
+        (ProcessState::Other(_), _) | (_, ProcessState::Other(_)) => {
+            return Err("marker-process-probe-failed");
+        }
+        (ProcessState::Empty, ProcessState::Present) => return Err("marker-identity-lost"),
+        (ProcessState::Present, ProcessState::Empty) => return Err("marker-identity-lost"),
+        (ProcessState::Present, ProcessState::Present) => {}
+    }
+    // The group signal may have raced with exit/reuse.  A fresh full identity
+    // query is mandatory before direct PID signalling can be attempted.
+    validate_captured_identity(captured)?;
+    signal_pid(captured.pid)?;
     loop {
-        let direct = pid_state(i32::try_from(pid).map_err(|_| "marker-owner-mismatch")?);
-        let group = group_state(process_group);
+        let direct = pid_state(i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?);
+        let group = group_state(captured.pgid);
         match (direct, group) {
             (ProcessState::Empty, ProcessState::Empty) => return Ok(()),
             (ProcessState::PermissionDenied, _) | (_, ProcessState::PermissionDenied) => {
@@ -203,41 +241,54 @@ pub(super) fn terminate_group(
     }
 }
 
-/// Finish cleanup when the direct launcher has already been reaped but a
-/// descendant group remains; no direct PID signal is attempted in this path.
-#[cfg(target_os = "macos")]
-pub(super) fn terminate_group_only(
-    process_group: i32,
-    deadline: Instant,
-) -> Result<(), &'static str> {
-    let mut backend = RealGroupCleanupBackend { process_group };
-    terminate_group_backend(&mut backend, deadline)
+/// Re-query every immutable field captured before cleanup; a PID or PGID
+/// mismatch is an identity-loss failure and never authorizes a signal.
+fn validate_captured_identity(captured: &ProcessIdentity) -> Result<(), &'static str> {
+    if captured.pid <= 1 || captured.pgid <= 1 {
+        return Err("marker-owner-mismatch");
+    }
+    let current = query_identity(captured.pid).map_err(|_| "marker-identity-lost")?;
+    if !same_captured_identity(captured, &current) {
+        return Err("marker-identity-lost");
+    }
+    Ok(())
 }
 
-/// Keep group cleanup injectable so residual, permission and kernel-probe
-/// failures are tested through the same state machine used by real fixtures.
+/// Signal a captured identity's group only after the complete identity has
+/// been refreshed immediately before the kernel operation.
+fn signal_group_captured(captured: &ProcessIdentity) -> Result<ProcessState, &'static str> {
+    validate_captured_identity(captured)?;
+    signal_group(captured.pgid)
+}
+
+/// Keep the direct Child alive until it is reaped, then require its captured
+/// group to disappear; this helper deliberately sends no stale group signal.
+fn require_group_empty(process_group: i32, deadline: Instant) -> Result<(), &'static str> {
+    if process_group <= 1 {
+        return Err("marker-owner-mismatch");
+    }
+    loop {
+        match group_state(process_group) {
+            ProcessState::Empty => return Ok(()),
+            ProcessState::PermissionDenied => return Err("marker-eperm"),
+            ProcessState::Other(_) => return Err("marker-process-probe-failed"),
+            ProcessState::Present if Instant::now() >= deadline => return Err("marker-residual"),
+            ProcessState::Present => thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+/// Keep a pure group state machine injectable for regression tests; production
+/// group signals go only through `terminate_group`'s captured identity path.
+#[cfg(test)]
 trait GroupCleanupBackend {
     fn signal(&mut self) -> Result<ProcessState, &'static str>;
     fn state(&mut self) -> ProcessState;
 }
 
-/// Production adapter for exact process-group signal and liveness probes.
-struct RealGroupCleanupBackend {
-    process_group: i32,
-}
-
-impl GroupCleanupBackend for RealGroupCleanupBackend {
-    fn signal(&mut self) -> Result<ProcessState, &'static str> {
-        signal_group(self.process_group)
-    }
-
-    fn state(&mut self) -> ProcessState {
-        group_state(self.process_group)
-    }
-}
-
 /// Require a group to report empty within a bounded window; every non-empty
 /// terminal state is a fixed failure and can never be mistaken for success.
+#[cfg(test)]
 fn terminate_group_backend<B: GroupCleanupBackend>(
     backend: &mut B,
     deadline: Instant,
@@ -256,26 +307,36 @@ fn terminate_group_backend<B: GroupCleanupBackend>(
 
 /// Probe a process group exactly; `PermissionDenied` is never treated as gone.
 pub(super) fn group_state(process_group: i32) -> ProcessState {
-    pid_state(-process_group)
+    if process_group <= 1 {
+        return ProcessState::Other(22);
+    }
+    classify_kill_result(unsafe { kill(-process_group, 0) })
 }
 
 /// Send SIGKILL only to a previously validated exact process group.
 fn signal_group(process_group: i32) -> Result<ProcessState, &'static str> {
-    match classify_kill_result(unsafe { kill(-process_group, SIGKILL) }) {
-        ProcessState::Empty => Ok(ProcessState::Empty),
-        ProcessState::Present => Ok(ProcessState::Present),
-        ProcessState::PermissionDenied => Err("marker-eperm"),
-        ProcessState::Other(_) => Err("marker-signal-failed"),
+    if process_group <= 1 {
+        return Err("marker-owner-mismatch");
+    }
+    match safe_signal_group(process_group, SIGKILL) {
+        Ok(()) => Ok(ProcessState::Present),
+        Err(error) if error.raw_os_error() == Some(ESRCH) => Ok(ProcessState::Empty),
+        Err(error) if error.raw_os_error() == Some(EPERM) => Err("marker-eperm"),
+        Err(_) => Err("marker-signal-failed"),
     }
 }
 
 /// Send SIGKILL only to the validated direct PID after the group signal.
 fn signal_pid(pid: u32) -> Result<(), &'static str> {
     let pid = i32::try_from(pid).map_err(|_| "marker-owner-mismatch")?;
-    match classify_kill_result(unsafe { kill(pid, SIGKILL) }) {
-        ProcessState::Empty | ProcessState::Present => Ok(()),
-        ProcessState::PermissionDenied => Err("marker-eperm"),
-        ProcessState::Other(_) => Err("marker-signal-failed"),
+    if pid <= 1 {
+        return Err("marker-owner-mismatch");
+    }
+    match safe_signal_pid(pid, SIGKILL) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(ESRCH) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(EPERM) => Err("marker-eperm"),
+        Err(_) => Err("marker-signal-failed"),
     }
 }
 
@@ -306,7 +367,6 @@ trait QueryChildBackend {
 /// an unresolved fault cannot be silently consumed by a temporary wrapper.
 struct RealQueryChild<'a> {
     child: &'a mut Child,
-    process_group: i32,
 }
 
 impl QueryChildBackend for RealQueryChild<'_> {
@@ -319,7 +379,10 @@ impl QueryChildBackend for RealQueryChild<'_> {
     }
 
     fn force_kill(&mut self) {
-        let _ = unsafe { kill(-self.process_group, SIGKILL) };
+        // The helper's captured group is only observed after direct reap; a
+        // stale group signal here could target a PID-reused process, so the
+        // production recovery path kills the owned Child directly and then
+        // fails closed if its group does not disappear.
         let _ = self.child.kill();
     }
 }
@@ -371,10 +434,7 @@ fn finalize_child(
         // unowned, so fail closed after the direct child is known gone.
         abort_unreaped_query("group-unsafe");
     }
-    let mut backend = RealQueryChild {
-        child,
-        process_group,
-    };
+    let mut backend = RealQueryChild { child };
     if !bounded_reap_backend(&mut backend, deadline, QUERY_DEADLINE)
         && !bounded_reap_backend(&mut backend, Instant::now(), QUERY_DEADLINE)
     {
@@ -403,14 +463,8 @@ fn terminate_query(
         Instant::now() + QUERY_DEADLINE,
         "query-unreaped",
     )?;
-    let group_deadline = Instant::now() + QUERY_DEADLINE;
-    while group_state(process_group) != ProcessState::Empty && Instant::now() < group_deadline {
-        let _ = unsafe { kill(-process_group, SIGKILL) };
-        thread::sleep(Duration::from_millis(5));
-    }
-    if group_state(process_group) != ProcessState::Empty {
-        return Err("marker-query-group-residual");
-    }
+    require_group_empty(process_group, Instant::now() + QUERY_DEADLINE)
+        .map_err(|_| "marker-query-group-residual")?;
     output.ok_or("marker-owner-mismatch")
 }
 
@@ -429,10 +483,25 @@ fn parse_identity(output: &[u8]) -> Result<ProcessIdentity, &'static str> {
     let comm = fields[1].to_owned();
     let start_identity = fields[2..].join(" ");
     Ok(ProcessIdentity {
+        // The query caller fills the already validated target PID after the
+        // helper output is parsed, so an untrusted `ps` row cannot choose it.
+        pid: 0,
         pgid,
         comm,
         start_identity,
     })
+}
+
+/// Compare every captured identity field before a signal; this pure boundary
+/// makes PID-reuse and deterministic fault cases testable without sending a
+/// signal to a real process.
+fn same_captured_identity(expected: &ProcessIdentity, current: &ProcessIdentity) -> bool {
+    expected.pid > 1
+        && expected.pgid > 1
+        && current.pid == expected.pid
+        && current.pgid == expected.pgid
+        && current.comm == expected.comm
+        && current.start_identity == expected.start_identity
 }
 
 /// Read only currently available bytes from a nonblocking identity pipe and
@@ -539,6 +608,50 @@ mod tests {
         assert!(backend.killed);
     }
 
+    /// Reserved direct and group identifiers are classified without crossing
+    /// the signal boundary, protecting the runner from process-wide targets.
+    #[test]
+    fn reserved_probe_ids_are_not_clean() {
+        for value in [-1, 0, 1] {
+            assert_eq!(pid_state(value), ProcessState::Other(22));
+            assert_eq!(group_state(value), ProcessState::Other(22));
+        }
+    }
+
+    /// A deterministic PID-reuse table proves that every changed identity
+    /// field blocks the signal boundary before any OS call is attempted.
+    #[test]
+    fn captured_identity_reuse_is_rejected() {
+        let captured = ProcessIdentity {
+            pid: 42,
+            pgid: 43,
+            comm: "ja-sandbox-worker".to_owned(),
+            start_identity: "Mon Jan 1 00:00:00 2026".to_owned(),
+        };
+        let cases = [
+            ProcessIdentity {
+                pid: 41,
+                ..captured.clone()
+            },
+            ProcessIdentity {
+                pgid: 44,
+                ..captured.clone()
+            },
+            ProcessIdentity {
+                comm: "unrelated".to_owned(),
+                ..captured.clone()
+            },
+            ProcessIdentity {
+                start_identity: "Tue Jan 2 00:00:00 2026".to_owned(),
+                ..captured.clone()
+            },
+        ];
+        for reused in cases {
+            assert!(!same_captured_identity(&captured, &reused));
+        }
+        assert!(same_captured_identity(&captured, &captured));
+    }
+
     struct FakeGroupBackend {
         signal_result: Result<ProcessState, &'static str>,
         states: VecDeque<ProcessState>,
@@ -618,22 +731,18 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn real_query_child_is_reaped_after_forced_kill() {
-        let mut child = Command::new("/bin/sleep")
+        let mut command = Command::new("/bin/sleep");
+        command
             .arg("30")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .expect("spawn bounded query fixture");
+            .stderr(Stdio::null());
+        let mut child = spawn_grouped(&mut command).expect("spawn bounded query fixture");
         let process_group = i32::try_from(child.id())
             .ok()
             .filter(|value| *value > 1)
             .expect("fixture process group");
-        let mut backend = RealQueryChild {
-            child: &mut child,
-            process_group,
-        };
+        let mut backend = RealQueryChild { child: &mut child };
         assert!(bounded_reap_backend(
             &mut backend,
             Instant::now(),

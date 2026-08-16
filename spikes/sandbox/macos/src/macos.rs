@@ -12,13 +12,13 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::path::{PreparedPaths, prepare_paths};
+use crate::process::{safe_signal_group, spawn_grouped};
 
 /// The cap is intentionally small enough to make a malicious worker unable
 /// to turn the host into an unbounded log buffer while still accepting normal
@@ -189,6 +189,7 @@ pub struct SandboxChild {
     profile_path: PathBuf,
     terminated: bool,
     cancelled: bool,
+    reaped: bool,
     max_output_bytes: usize,
 }
 
@@ -228,12 +229,9 @@ pub fn spawn(spec: SandboxSpec) -> Result<SandboxChild, SandboxError> {
         .envs(spec.env.iter())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // process_group(0) is applied before exec, closing the spawn/kill
-        // race without relying on a shell or a post-spawn setpgid window.
-        .process_group(0);
+        .stderr(Stdio::piped());
 
-    let result = command.spawn();
+    let result = spawn_grouped(&mut command);
     let child = match result {
         Ok(child) => child,
         Err(error) => {
@@ -241,7 +239,15 @@ pub fn spawn(spec: SandboxSpec) -> Result<SandboxChild, SandboxError> {
             return Err(SandboxError::Io(error));
         }
     };
-    let process_group = child.id() as i32;
+    let process_group = match i32::try_from(child.id()) {
+        Ok(process_group) => process_group,
+        Err(_) => {
+            let mut child = child;
+            terminate_untracked_child(&mut child, 0);
+            let _ = fs::remove_file(&spec.profile_path);
+            return Err(SandboxError::InvalidConfig("invalid worker process group"));
+        }
+    };
     if child.stdout.is_none() || child.stderr.is_none() {
         let mut child = child;
         terminate_untracked_child(&mut child, process_group);
@@ -250,7 +256,7 @@ pub fn spawn(spec: SandboxSpec) -> Result<SandboxChild, SandboxError> {
             "sandbox output pipe unavailable",
         ));
     }
-    if process_group <= 0 || process_group == std::process::id() as i32 {
+    if process_group <= 1 || process_group == std::process::id() as i32 {
         let mut child = child;
         terminate_untracked_child(&mut child, 0);
         let _ = fs::remove_file(&spec.profile_path);
@@ -262,11 +268,33 @@ pub fn spawn(spec: SandboxSpec) -> Result<SandboxChild, SandboxError> {
         profile_path: spec.profile_path,
         terminated: false,
         cancelled: false,
+        reaped: false,
         max_output_bytes: spec.max_output_bytes,
     })
 }
 
 impl SandboxChild {
+    /// Expose the direct PID so the native residual-evidence owner can bind a
+    /// process-table row to this exact child instead of matching command paths.
+    pub fn process_id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Expose the validated process-group leader used by every cleanup path;
+    /// evidence must retain this identity before any descendant can escape.
+    pub fn process_group_id(&self) -> i32 {
+        self.process_group
+    }
+
+    /// Report whether the direct child was reaped and its original process
+    /// group is gone; the native scope owner uses this proof before deleting
+    /// the child identity from durable evidence.
+    pub fn cleanup_confirmed(&self) -> bool {
+        self.reaped
+            && self.terminated
+            && matches!(process_group_is_gone(self.process_group), Ok(true))
+    }
+
     /// Cancel the complete process group before waiting, preserving a
     /// separate cancelled result so UI cancellation cannot look successful.
     pub fn cancel(&mut self) -> Result<(), SandboxError> {
@@ -285,7 +313,12 @@ impl SandboxChild {
     /// worker that never wrote its startup marker from a slow worker.
     pub fn poll_status(&mut self) -> Result<Option<ExitStatus>, SandboxError> {
         match self.child.try_wait() {
-            Ok(status) => Ok(status),
+            Ok(status) => {
+                if status.is_some() {
+                    self.reaped = true;
+                }
+                Ok(status)
+            }
             Err(error) => Err(self.cleanup_after_wait_error(SandboxError::Io(error))),
         }
     }
@@ -333,6 +366,7 @@ impl SandboxChild {
             match self.child.try_wait() {
                 Ok(Some(value)) => {
                     status = Some(value);
+                    self.reaped = true;
                     // A direct parent can exit while an inherited pipe remains
                     // open in a grandchild, so group termination happens first.
                     break;
@@ -453,7 +487,10 @@ impl SandboxChild {
     fn reap_direct_until(&mut self, deadline: Instant) -> Result<Option<ExitStatus>, SandboxError> {
         loop {
             match self.child.try_wait() {
-                Ok(Some(status)) => return Ok(Some(status)),
+                Ok(Some(status)) => {
+                    self.reaped = true;
+                    return Ok(Some(status));
+                }
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
                 Ok(None) => return Ok(None),
                 Err(error) => {
@@ -470,9 +507,8 @@ impl SandboxChild {
         if self.terminated {
             return Ok(());
         }
-        let result = unsafe { kill(-(self.process_group), SIGKILL) };
-        if result == -1 {
-            let error = io::Error::last_os_error();
+        let result = safe_signal_group(self.process_group, SIGKILL);
+        if let Err(error) = result {
             if error.raw_os_error() != Some(ESRCH) {
                 let _ = self.child.kill();
                 return Err(SandboxError::Io(error));
@@ -484,12 +520,23 @@ impl SandboxChild {
 }
 
 impl Drop for SandboxChild {
-    /// Drop is a last-resort fail-closed guard for panic/error paths; profile
-    /// deletion is delayed until the process group has been signalled.
+    /// Drop is a last-resort fail-closed guard for panic/error paths; it aborts
+    /// when bounded polling cannot prove both direct reap and group `ESRCH`,
+    /// because releasing a live `Child` would orphan an untracked descendant.
     fn drop(&mut self) {
         let _ = self.terminate_group();
         let _ = self.child.kill();
         let _ = self.reap_direct_until(Instant::now() + CLEANUP_DEADLINE);
+        if !self.reaped {
+            // A transient try_wait error must not become ownership loss; give
+            // the exact direct child one final bounded kill/reap observation.
+            let _ = self.child.kill();
+            let _ = self.reap_direct_until(Instant::now() + CLEANUP_DEADLINE);
+        }
+        if !self.cleanup_confirmed() {
+            eprintln!("SANDBOX-CHILD: cleanup-unconfirmed");
+            std::process::abort();
+        }
         let _ = fs::remove_file(&self.profile_path);
     }
 }
@@ -502,16 +549,54 @@ const O_NONBLOCK: i32 = 0x0004;
 /// Fail closed for a child that could not be wrapped in `SandboxChild`; this
 /// path still signals its group and uses bounded polling instead of `wait()`.
 fn terminate_untracked_child(child: &mut Child, process_group: i32) {
-    if process_group > 0 && process_group != std::process::id() as i32 {
-        let _ = unsafe { kill(-process_group, SIGKILL) };
+    let group_is_safe = process_group > 1 && process_group != std::process::id() as i32;
+    if group_is_safe {
+        let _ = safe_signal_group(process_group, SIGKILL);
     }
     let _ = child.kill();
-    let deadline = Instant::now() + CLEANUP_DEADLINE;
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => thread::sleep(Duration::from_millis(5)),
+    let mut reaped = false;
+    for _ in 0..2 {
+        let deadline = Instant::now() + CLEANUP_DEADLINE;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    reaped = true;
+                    break;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(5)),
+                Err(_) => thread::sleep(Duration::from_millis(5)),
+            }
         }
+        if reaped {
+            break;
+        }
+        let _ = child.kill();
+    }
+    // An invalid/reserved group is unknown, never equivalent to “already
+    // gone”; the final branch must abort rather than release an untracked
+    // child after only direct reaping.
+    let mut group_gone = false;
+    if group_is_safe {
+        let deadline = Instant::now() + CLEANUP_DEADLINE;
+        while Instant::now() < deadline {
+            match process_group_is_gone(process_group) {
+                Ok(true) => {
+                    group_gone = true;
+                    break;
+                }
+                Ok(false) => {
+                    let _ = safe_signal_group(process_group, SIGKILL);
+                    thread::sleep(Duration::from_millis(5));
+                }
+                // Reserved/invalid values are not “gone”.  Keeping the
+                // false state forces the caller into the aborting fail-safe.
+                Err(_) => break,
+            }
+        }
+    }
+    if !reaped || !group_gone {
+        eprintln!("SANDBOX-NATIVE-CHILD: invalid-child-unreaped");
+        std::process::abort();
     }
 }
 
@@ -570,7 +655,9 @@ fn prepare_spec(spec: SandboxSpec) -> Result<PreparedSandboxSpec, SandboxError> 
 }
 
 /// Generate a default-deny Seatbelt profile with only fixed worker/resource,
-/// workspace data and loader read access.  Network is intentionally absent.
+/// workspace data and system loader read/map access.  Network is intentionally
+/// absent because mapping executable code from mutable workspace paths would
+/// turn a path read allowance into a code-execution escape.
 fn build_profile(spec: &PreparedSandboxSpec) -> Result<String, SandboxError> {
     let worker = literal(&spec.worker)?;
     let workspace = literal(&spec.workspace)?;
@@ -584,6 +671,7 @@ fn build_profile(spec: &PreparedSandboxSpec) -> Result<String, SandboxError> {
 (allow signal (target same-sandbox))\n\
 (allow sysctl-read)\n\
 (allow file-read* (subpath \"/usr/lib\") (subpath \"/System/Library\") (subpath \"/usr/share\"))\n\
+(allow file-map-executable (subpath \"/usr/lib\") (subpath \"/System/Library\"))\n\
 (allow file-read* (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\"))\n\
 (allow file-read* (literal \"{worker}\"))\n\
 {metadata_rule}\
@@ -595,7 +683,9 @@ fn build_profile(spec: &PreparedSandboxSpec) -> Result<String, SandboxError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedSandboxSpec, build_profile};
+    use super::{
+        PreparedSandboxSpec, SandboxError, build_profile, process_group_is_gone, process_is_alive,
+    };
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -627,6 +717,27 @@ mod tests {
         assert!(!profile.lines().any(|line| line == "(allow process-info*)"));
         assert!(!profile.contains("(allow default)"));
         assert!(!profile.contains("(allow process-info* (target all))"));
+        assert!(profile.lines().any(|line| {
+            line == "(allow file-map-executable (subpath \"/usr/lib\") (subpath \"/System/Library\"))"
+        }));
+        assert!(!profile.contains("file-map-executable (subpath \"/private/var"));
+    }
+
+    /// Reserved process identifiers are typed errors rather than “gone”
+    /// results; this prevents a caller from treating pid 0/1/-1 as cleanup
+    /// proof and accidentally widening a later signal target.
+    #[test]
+    fn reserved_process_queries_fail_closed() {
+        for pid in [-1, 0, 1] {
+            assert!(matches!(
+                process_is_alive(pid),
+                Err(SandboxError::InvalidConfig("reserved process id"))
+            ));
+            assert!(matches!(
+                process_group_is_gone(pid),
+                Err(SandboxError::InvalidConfig("reserved process group"))
+            ));
+        }
     }
 }
 
@@ -687,21 +798,26 @@ fn literal(path: &Path) -> Result<String, SandboxError> {
 
 /// Query a PID without process-name matching; the probe uses this to prove
 /// that a reported grandchild really left the system after group cleanup.
-pub fn process_is_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
+pub fn process_is_alive(pid: i32) -> Result<bool, SandboxError> {
+    if pid <= 1 {
+        return Err(SandboxError::InvalidConfig("reserved process id"));
     }
-    unsafe { kill(pid, 0) == 0 }
+    let result = unsafe { kill(pid, 0) };
+    // Only ESRCH proves absence; EPERM and any other probe error remain
+    // conservatively present so errno ambiguity cannot pass cleanup.
+    Ok(result == 0 || unsafe { *__error() != ESRCH })
 }
 
-/// Kill only the PID reported by the escape fixture so a failed negative case
-/// leaves no worker behind while still returning a production-blocking error.
-pub fn kill_process(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
+/// Distinguish an absent group from an inaccessible group; EPERM is never
+/// treated as proof that a child group was cleaned up.
+pub fn process_group_is_gone(process_group: i32) -> Result<bool, SandboxError> {
+    if process_group <= 1 {
+        return Err(SandboxError::InvalidConfig("reserved process group"));
     }
-    let result = unsafe { kill(pid, SIGKILL) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(ESRCH)
+    if unsafe { kill(-process_group, 0) } == 0 {
+        return Ok(false);
+    }
+    Ok(unsafe { *__error() == ESRCH })
 }
 
 // Raw POSIX kill is used instead of a shell command so cancellation cannot
@@ -709,4 +825,5 @@ pub fn kill_process(pid: i32) -> bool {
 unsafe extern "C" {
     fn fcntl(fd: i32, command: i32, ...) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
+    fn __error() -> *mut i32;
 }

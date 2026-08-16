@@ -4,13 +4,16 @@
 // Native Seatbelt orchestration imports setup and probe cases by responsibility.
 
 use ja_macos_sandbox_spike::{
-    SandboxChild, SandboxError, SandboxSpec, kill_process, process_is_alive, spawn,
+    RunOutput, SandboxChild, SandboxError, SandboxSpec, marker_cleanup::ControlledProcessIdentity,
+    marker_cleanup::query_controlled_identity, marker_cleanup::terminate_controlled_identity,
+    process_group_is_gone, process_is_alive, run_bounded_command, spawn,
 };
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,3 +35,8 @@ macro_rules! argv {
 
 include!("setup.rs");
 include!("probes.rs");
+
+unsafe extern "C" {
+    fn geteuid() -> u32;
+    fn getpgrp() -> i32;
+}
