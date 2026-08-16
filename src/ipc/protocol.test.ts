@@ -6,6 +6,7 @@ import { parseMethodParams, parseMethodResult, parseServerMethodParams } from ".
 import {
   ArtifactSchema,
   assertSafePayload,
+  assertNoReadyTokenLeak,
   InitializeParamsSchema,
   ProfileSchema,
   parseEvent,
@@ -107,6 +108,7 @@ describe("JA protocol boundary", () => {
         eventId: "evt_one",
         occurredAt: "2026-08-16T00:00:00Z",
         status: "ready",
+        readyToken: "0123456789abcdef0123456789abcdef",
       },
     })).toThrow();
     expect(() => parseEvent({
@@ -117,6 +119,7 @@ describe("JA protocol boundary", () => {
         eventId: "evt_one",
         occurredAt: "2026-08-16T00:00:00Z",
         status: "ready",
+        readyToken: "0123456789abcdef0123456789abcdef",
       },
       result: { accepted: true },
     })).toThrow();
@@ -152,6 +155,7 @@ describe("JA protocol boundary", () => {
         eventId: "evt_one",
         occurredAt: "2026-08-16T00:00:00Z",
         status: "ready",
+        readyToken: "0123456789abcdef0123456789abcdef",
       },
       traceId: "trace_extension",
     });
@@ -207,6 +211,7 @@ describe("JA protocol boundary", () => {
         eventId: "evt_one",
         occurredAt: "2026-08-16T00:00:00Z",
         status: "ready",
+        readyToken: "0123456789abcdef0123456789abcdef",
         extension: "kept-in-params",
         id: "params-id-extension",
         result: { future: true },
@@ -343,5 +348,32 @@ describe("JA protocol boundary", () => {
     const cyclic: Record<string, unknown> = {};
     cyclic["self"] = cyclic;
     expect(() => assertSafePayload(cyclic)).toThrow("cyclic payload");
+
+    const wide = Array.from({ length: 20_001 }, () => ({}));
+    expect(() => assertSafePayload(wide)).toThrow("payload contains too many nodes");
+  });
+
+  it("does not reject unrelated 32-character hex payload values", () => {
+    expect(() => parseResponse({
+      jsonrpc: "2.0",
+      id: "c:random-hex",
+      error: {
+        code: -32080,
+        message: "internal",
+        data: { jaCode: "INTERNAL_ERROR", retryable: false, details: { digest: "fedcba9876543210fedcba9876543210" } },
+      },
+    })).not.toThrow();
+  });
+
+  it("rejects current/history challenge substrings in values and object keys", () => {
+    const token = "0123456789abcdef0123456789abcdef";
+    expect(() => assertNoReadyTokenLeak(
+      { message: `prefix_${token}_suffix` },
+      { knownTokens: [token] },
+    )).toThrow();
+    expect(() => assertNoReadyTokenLeak(
+      { [`prefix_${token}_suffix`]: true },
+      { knownTokens: [token] },
+    )).toThrow();
   });
 });

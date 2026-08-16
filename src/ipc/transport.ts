@@ -3,7 +3,7 @@
 
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { RequestEnvelope, ResponseEnvelope } from "./protocol";
+import type { NotificationEnvelope, RequestEnvelope, ResponseEnvelope } from "./protocol";
 
 export const JA_TAURI_COMMANDS = {
   sendFrame: "ja_rpc_send_frame",
@@ -21,7 +21,7 @@ export type Unsubscribe = () => void | Promise<void>;
  * call raw Tauri invoke/listen APIs or depend on host-specific details.
  */
 export interface JaRpcTransport {
-  send(frame: RequestEnvelope | ResponseEnvelope): Promise<void>;
+  send(frame: RequestEnvelope | ResponseEnvelope | NotificationEnvelope): Promise<void>;
   subscribe(listener: FrameListener): Promise<Unsubscribe>;
 }
 
@@ -47,7 +47,7 @@ const defaultTauriBridge: TauriBridge = {
 export class TauriJaRpcTransport implements JaRpcTransport {
   constructor(private readonly bridge: TauriBridge = defaultTauriBridge) {}
 
-  async send(frame: RequestEnvelope | ResponseEnvelope): Promise<void> {
+  async send(frame: RequestEnvelope | ResponseEnvelope | NotificationEnvelope): Promise<void> {
     await this.bridge.invoke<void>(JA_TAURI_COMMANDS.sendFrame, { frame });
   }
 

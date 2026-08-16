@@ -17,10 +17,21 @@ import {
   type ThreadReadResult,
   type Turn,
 } from "@/ipc/protocol";
+import {
+  createHandshakeProjection,
+  type HandshakeProjection,
+} from "@/ipc/handshake";
+import { JA_ERROR_CODES } from "@/ipc/errors";
+import { fingerprintReadyToken, forEachReadyTokenCandidate } from "@/ipc/readyToken";
 
 export const EVENT_DEDUP_WINDOW = 1024;
 const MAX_ITEM_TEXT_BYTES = 1_048_576;
 const textEncoder = new TextEncoder();
+const MAX_REDUCER_SCAN_DEPTH = 64;
+const MAX_REDUCER_SCAN_NODES = 20_000;
+const MAX_REDUCER_SCAN_STRING_LENGTH = 4_194_304;
+const MAX_HANDSHAKE_FINGERPRINTS = 64;
+const FINGERPRINT_PATTERN = /^[0-9a-f]{32}$/;
 
 export type ResyncReason =
   | "server_instance_changed"
@@ -28,7 +39,9 @@ export type ResyncReason =
   | "late_event"
   | "missing_item"
   | "invalid_event"
-  | "snapshot_invalid";
+  | "snapshot_invalid"
+  | "handshake_required"
+  | "handshake_failed";
 
 export type ApplyOutcome =
   | "applied"
@@ -36,7 +49,8 @@ export type ApplyOutcome =
   | "late"
   | "gap"
   | "resync_required"
-  | "invalid";
+  | "invalid"
+  | "rejected";
 
 export interface RuntimeProjection {
   status: "starting" | "ready" | "degraded" | "shutting_down" | "stopped" | "crashed";
@@ -46,6 +60,7 @@ export interface RuntimeProjection {
 }
 
 export interface TimelineState {
+  handshake: HandshakeProjection;
   serverInstanceId: string | undefined;
   threads: Record<string, Thread>;
   turns: Record<string, Turn>;
@@ -61,12 +76,59 @@ export interface TimelineState {
   lastOutcome: ApplyOutcome | undefined;
 }
 
+interface ReducerHandshakeMetadata {
+  usedFingerprints: readonly string[];
+  projectionAccepted: boolean;
+  currentFingerprint: string;
+  currentGeneration: number;
+}
+const reducerHandshakeMetadata = new WeakMap<HandshakeProjection, ReducerHandshakeMetadata>();
+
+/** Reads reducer-private fingerprints without treating an unregistered copy as ready. */
+function reducerMetadataFor(state: HandshakeProjection): ReducerHandshakeMetadata {
+  return reducerHandshakeMetadata.get(state) ?? {
+    usedFingerprints: [],
+    projectionAccepted: false,
+    currentFingerprint: "",
+    currentGeneration: -1,
+  };
+}
+
+/** Distinguishes a live projection from a JSON/devtools copy with no proof metadata. */
+function hasReducerHandshakeMetadata(state: HandshakeProjection): boolean {
+  return reducerHandshakeMetadata.has(state);
+}
+
+/** Installs an immutable token-free projection and its private comparison metadata together. */
+function installReducerProjection(value: HandshakeProjection, metadata: ReducerHandshakeMetadata): HandshakeProjection {
+  const projection = Object.freeze({
+    phase: value.phase,
+    generation: value.generation,
+    ...(value.error === undefined ? {} : { error: Object.freeze({ ...value.error }) }),
+  });
+  reducerHandshakeMetadata.set(projection, {
+    usedFingerprints: Object.freeze([...metadata.usedFingerprints]),
+    projectionAccepted: metadata.projectionAccepted,
+    currentFingerprint: metadata.currentFingerprint,
+    currentGeneration: metadata.currentGeneration,
+  });
+  return projection;
+}
+
 /**
  * A fresh normalized state makes instance replacement and deterministic tests
  * explicit instead of retaining stale Java-owned entities across restarts.
  */
 export function createTimelineState(): TimelineState {
+  const handshake = createHandshakeProjection();
+  reducerHandshakeMetadata.set(handshake, {
+    usedFingerprints: [],
+    projectionAccepted: false,
+    currentFingerprint: "",
+    currentGeneration: -1,
+  });
   return {
+    handshake,
     serverInstanceId: undefined,
     threads: {},
     turns: {},
@@ -83,8 +145,124 @@ export function createTimelineState(): TimelineState {
   };
 }
 
+/**
+ * Drops entities from the previous sidecar generation because their sequence
+ * numbers cannot be replayed safely against a new server instance.
+ */
+function clearBusinessProjection(state: TimelineState): TimelineState {
+  return {
+    ...state,
+    serverInstanceId: undefined,
+    threads: {},
+    turns: {},
+    items: {},
+    itemThreadById: {},
+    itemUtf8BytesById: {},
+    itemIdsByThread: {},
+    lastSeqByThread: {},
+    seenEventIds: {},
+    seenEventOrderByScope: {},
+    resyncRequired: {},
+    runtime: undefined,
+  };
+}
+
 function outcome(state: TimelineState, lastOutcome: ApplyOutcome): TimelineState {
   return { ...state, lastOutcome };
+}
+
+/** Rejects copied/mutable projections so only the handshake owner can promote a store. */
+function isSafeHandshakeProjection(value: HandshakeProjection): boolean {
+  if (value === null || typeof value !== "object" || !Object.isFrozen(value)) {
+    return false;
+  }
+  const allowedPhases: readonly HandshakeProjection["phase"][] = [
+    "disconnected",
+    "awaiting_initialized",
+    "awaiting_ready",
+    "ready",
+    "reconnect_required",
+  ];
+  if (!allowedPhases.includes(value.phase) || !Number.isSafeInteger(value.generation) || value.generation < 0) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  if (keys.some((key) => key !== "phase" && key !== "generation" && key !== "error")) {
+    return false;
+  }
+  if (value.error === undefined) {
+    return true;
+  }
+  return Object.isFrozen(value.error) &&
+    Object.keys(value.error).every((key) => key === "code" || key === "jaCode" || key === "retryable") &&
+    value.error.code === JA_ERROR_CODES.HANDSHAKE_FAILED &&
+    value.error.jaCode === "HANDSHAKE_FAILED" &&
+    value.error.retryable === false;
+}
+
+/** Requires a bounded ordered history whose last entry proves the current generation. */
+function safeHandshakeFingerprints(value: readonly string[]): readonly string[] | undefined {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_HANDSHAKE_FINGERPRINTS) {
+    return undefined;
+  }
+  if (new Set(value).size !== value.length || value.some((fingerprint) => typeof fingerprint !== "string" || !FINGERPRINT_PATTERN.test(fingerprint))) {
+    return undefined;
+  }
+  return Object.freeze([...value]);
+}
+
+/**
+ * This is the only store promotion path: INT can pass a frozen token-free
+ * client projection plus opaque fingerprints, while business events remain
+ * rejected until the projection reaches `ready`.
+ */
+export function applyHandshakeProjection(
+  state: TimelineState,
+  projection: HandshakeProjection,
+  opaqueFingerprints: readonly string[],
+): TimelineState {
+  const fingerprints = safeHandshakeFingerprints(opaqueFingerprints);
+  if (!isSafeHandshakeProjection(projection) || fingerprints === undefined) {
+    return outcome(state, "rejected");
+  }
+  if ((projection.phase === "awaiting_ready" || projection.phase === "ready") && projection.generation === 0) {
+    // Generation zero has never admitted an initialized challenge, so a
+    // forged ready projection must not unlock business state.
+    return outcome(state, "rejected");
+  }
+  if (projection.generation < state.handshake.generation) {
+    return outcome(state, "rejected");
+  }
+  const previousMetadata = reducerMetadataFor(state.handshake);
+  const generationChanged = projection.generation !== state.handshake.generation;
+  const currentFingerprint = fingerprints.at(-1) as string;
+  if (
+    generationChanged &&
+    (projection.phase === "awaiting_ready" || projection.phase === "ready") &&
+    previousMetadata.currentFingerprint !== "" &&
+    currentFingerprint === previousMetadata.currentFingerprint
+  ) {
+    return outcome(state, "rejected");
+  }
+  if (
+    projection.phase === "ready" &&
+    projection.generation === state.handshake.generation &&
+    previousMetadata.currentGeneration === projection.generation &&
+    previousMetadata.currentFingerprint !== "" &&
+    !fingerprints.includes(previousMetadata.currentFingerprint)
+  ) {
+    return outcome(state, "rejected");
+  }
+  const handshake = installReducerProjection(projection, {
+    usedFingerprints: fingerprints,
+    projectionAccepted: true,
+    currentFingerprint,
+    currentGeneration: projection.generation,
+  });
+  const next = !generationChanged && projection.phase === "ready"
+    ? { ...state, handshake }
+    : clearBusinessProjection({ ...state, handshake });
+  return outcome(next, "applied");
 }
 
 /**
@@ -111,6 +289,75 @@ function eventKey(event: JaEvent): string {
   return "threadId" in event
     ? `${event.serverInstanceId}:${event.threadId}:${event.eventId}`
     : `${event.serverInstanceId}:runtime:${event.eventId}`;
+}
+
+/**
+ * Reducer callers can bypass the transport client in tests or recovery code,
+ * so the projection boundary repeats fingerprint-based token rejection and
+ * never stores a notice/reason containing a challenge.
+ */
+function containsTokenLeak(
+  value: unknown,
+  knownFingerprints: ReadonlySet<string>,
+  allowChallengePath: boolean,
+  path: readonly string[] = [],
+  seen = new WeakSet<object>(),
+  budget: { nodes: number } = { nodes: 0 },
+): boolean {
+  budget.nodes += 1;
+  if (budget.nodes > MAX_REDUCER_SCAN_NODES || path.length > MAX_REDUCER_SCAN_DEPTH) {
+    return true;
+  }
+  if (typeof value === "string") {
+    if (value.length > MAX_REDUCER_SCAN_STRING_LENGTH) {
+      return true;
+    }
+    const containsKnownToken = knownFingerprints.size === 0
+      ? false
+      : forEachReadyTokenCandidate(value, (candidate) => knownFingerprints.has(fingerprintReadyToken(candidate)));
+    if (!containsKnownToken) {
+      return false;
+    }
+    return !(allowChallengePath && path.length === 2 && path[0] === "params" && path[1] === "readyToken" && value.length === 32);
+  }
+  if (value === null || typeof value !== "object") {
+    return false;
+  }
+  if (seen.has(value)) {
+    return true;
+  }
+  seen.add(value);
+  for (const [key, child] of Object.entries(value)) {
+    const childPath = [...path, key];
+    const keyContainsKnownToken = forEachReadyTokenCandidate(
+      key,
+      (candidate) => knownFingerprints.has(fingerprintReadyToken(candidate)),
+    );
+    const illegalChallengeKey = key === "readyToken" && !(allowChallengePath && childPath.length === 2 && childPath[0] === "params");
+    if (keyContainsKnownToken || illegalChallengeKey || containsTokenLeak(child, knownFingerprints, allowChallengePath, childPath, seen, budget)) {
+      seen.delete(value);
+      return true;
+    }
+  }
+  seen.delete(value);
+  return false;
+}
+
+/** Converts scanner budget/cycle failures into a fail-closed reducer outcome. */
+function hasTokenLeak(value: unknown, state: TimelineState): boolean {
+  try {
+    const metadata = reducerHandshakeMetadata.get(state.handshake);
+    if (metadata === undefined) {
+      return true;
+    }
+    const root = value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;
+    const params = root?.["params"];
+    const paramsObject = params !== null && typeof params === "object" ? params as Record<string, unknown> : undefined;
+    const allowChallengePath = root?.["method"] === "runtime/statusChanged" && paramsObject?.["status"] === "ready";
+    return containsTokenLeak(value, new Set(metadata.usedFingerprints), allowChallengePath);
+  } catch {
+    return true;
+  }
 }
 
 function clearSeenScope(state: TimelineState, scope: string): TimelineState {
@@ -242,6 +489,23 @@ function hasValidSnapshotEvents(snapshot: ThreadReadResult): boolean {
  * instance; live events are never guessed into a possibly incomplete state.
  */
 export function applySnapshot(state: TimelineState, snapshot: ThreadReadResult): TimelineState {
+  if (!hasReducerHandshakeMetadata(state.handshake) || !reducerMetadataFor(state.handshake).projectionAccepted) {
+    return outcome(state, "rejected");
+  }
+  if (hasTokenLeak(snapshot, state)) {
+    const threadId = snapshot !== null && typeof snapshot === "object" &&
+      snapshot.thread !== null && typeof snapshot.thread === "object" &&
+      typeof snapshot.thread.threadId === "string"
+      ? snapshot.thread.threadId
+      : "runtime";
+    return resync(state, threadId, "snapshot_invalid", "rejected");
+  }
+  if (state.handshake.phase !== "ready") {
+    return resync(state, "runtime", "handshake_required", "rejected");
+  }
+  if (state.serverInstanceId !== undefined && state.serverInstanceId !== snapshot.serverInstanceId) {
+    return resync(state, "runtime", "handshake_required", "rejected");
+  }
   if (!hasValidSnapshotStructure(state, snapshot)) {
     return resync(state, snapshot.thread.threadId, "snapshot_invalid");
   }
@@ -342,6 +606,9 @@ function applyItem(state: TimelineState, item: Item, threadId: string): Timeline
  * an item, approval, or tool request appear in the wrong thread.
  */
 function applyThreadEvent(state: TimelineState, event: Extract<JaEvent, { threadId: string }>): TimelineState {
+  if (state.handshake.phase !== "ready") {
+    return resync(state, "runtime", "handshake_required", "rejected");
+  }
   const key = event.threadId;
   const existingLastSeq = state.lastSeqByThread[key] ?? 0;
   const fingerprint = eventKey(event);
@@ -469,6 +736,20 @@ function applyThreadEvent(state: TimelineState, event: Extract<JaEvent, { thread
  * malformed, late, or gapped input therefore remains recoverable by snapshot.
  */
 export function applyLiveEvent(state: TimelineState, event: JaEvent): TimelineState {
+  if (!hasReducerHandshakeMetadata(state.handshake) || !reducerMetadataFor(state.handshake).projectionAccepted) {
+    return outcome(state, "rejected");
+  }
+  if (event.method === "runtime/statusChanged" && event.params["status"] === "ready") {
+    // Readiness is owned by applyHandshakeProjection; this event is an
+    // informational frame and must never write phase, runtime, or reason.
+    return outcome(state, "rejected");
+  }
+  if (hasTokenLeak(event, state)) {
+    return resync(state, "runtime", "invalid_event", "rejected");
+  }
+  if (state.handshake.phase !== "ready" && event.method !== "runtime/statusChanged") {
+    return resync(state, "runtime", "handshake_required", "rejected");
+  }
   if ("threadId" in event) {
     return applyThreadEvent(state, event as Extract<JaEvent, { threadId: string }>);
   }
@@ -476,20 +757,19 @@ export function applyLiveEvent(state: TimelineState, event: JaEvent): TimelineSt
   if (state.seenEventIds[fingerprint] === true) {
     return outcome(state, "duplicate");
   }
-  if (state.serverInstanceId !== undefined && state.serverInstanceId !== event.serverInstanceId) {
-    return resync(state, "runtime", "server_instance_changed");
-  }
   if (event.method === "runtime/statusChanged") {
     const status = event.params["status"];
     if (
       status !== "starting" &&
-      status !== "ready" &&
       status !== "degraded" &&
       status !== "shutting_down" &&
       status !== "stopped" &&
       status !== "crashed"
     ) {
       return resync(state, "runtime", "invalid_event");
+    }
+    if (state.serverInstanceId !== undefined && state.serverInstanceId !== event.serverInstanceId) {
+      return resync(state, "runtime", "server_instance_changed");
     }
     const remembered = rememberEvent(state, "runtime", fingerprint);
     return {
@@ -499,18 +779,31 @@ export function applyLiveEvent(state: TimelineState, event: JaEvent): TimelineSt
       lastOutcome: "applied",
     };
   }
+  if (state.serverInstanceId !== undefined && state.serverInstanceId !== event.serverInstanceId) {
+    return resync(state, "runtime", "server_instance_changed");
+  }
   const remembered = rememberEvent(state, "runtime", fingerprint);
   return { ...remembered, serverInstanceId: state.serverInstanceId ?? event.serverInstanceId, lastOutcome: "applied" };
 }
 
 export type TimelineAction =
   | { type: "snapshot"; snapshot: ThreadReadResult }
-  | { type: "event"; event: JaEvent };
+  | { type: "event"; event: JaEvent }
+  | { type: "handshakeProjection"; projection: HandshakeProjection; opaqueFingerprints: readonly string[] };
 
 /**
  * Keeping the reducer pure makes sequence behavior testable without a Tauri
  * window and gives the Zustand adapter one deterministic state transition.
  */
 export function reduceTimeline(state: TimelineState, action: TimelineAction): TimelineState {
-  return action.type === "snapshot" ? applySnapshot(state, action.snapshot) : applyLiveEvent(state, action.event);
+  if (action.type === "snapshot") {
+    return applySnapshot(state, action.snapshot);
+  }
+  if (action.type === "event") {
+    return applyLiveEvent(state, action.event);
+  }
+  if (action.type === "handshakeProjection") {
+    return applyHandshakeProjection(state, action.projection, action.opaqueFingerprints);
+  }
+  return state;
 }

@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { z } from "zod";
+import {
+  containsTokenShapedText,
+  fingerprintReadyToken,
+  forEachReadyTokenCandidate,
+  READY_TOKEN_PATTERN,
+} from "./readyToken";
 
 /**
  * The first protocol revision is kept in one module so every transport and
@@ -42,6 +48,11 @@ export const SkillRevisionSchema = id("skill_", 104);
 export const McpRevisionSchema = id("mcp_", 102);
 export const ServerInstanceIdSchema = id("srv_", 101);
 export const DiagnosticIdSchema = id("diag_", 101);
+/**
+ * The UI accepts only the canonical lowercase spelling so a challenge has
+ * one wire representation across Rust, Java, logs, and fixture comparisons.
+ */
+export const ReadyTokenSchema = z.string().regex(READY_TOKEN_PATTERN);
 
 const timestampSchema = z.string().datetime({ offset: true }).max(64);
 const seqSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
@@ -328,6 +339,14 @@ export const RpcErrorSchema = z
   })
   .passthrough();
 
+/**
+ * `initialized` is a handshake control notification, so extensions are not
+ * allowed to hide another token beside the one exact challenge field.
+ */
+export const InitializedParamsSchema = z
+  .object({ readyToken: ReadyTokenSchema })
+  .strict();
+
 export const InitializeParamsSchema = z
   .object({
     protocolMajor: z.literal(JA_PROTOCOL_MAJOR),
@@ -433,6 +452,22 @@ export const NotificationEnvelopeSchema = z
   .passthrough()
   .refine((value) => hasNoEnvelopeKeys(value, notificationOnlyForbiddenKeys), {
     message: "notification envelope cannot contain id, response, or root event identity fields",
+  })
+  .superRefine((value, context) => {
+    if (value.method === "initialized" && !InitializedParamsSchema.safeParse(value.params).success) {
+      context.addIssue({ code: "custom", message: "initialized notification requires a strict readyToken params object" });
+    }
+  });
+
+export const InitializedNotificationSchema = z
+  .object({
+    jsonrpc: z.literal("2.0"),
+    method: z.literal("initialized"),
+    params: InitializedParamsSchema,
+  })
+  .passthrough()
+  .refine((value) => hasNoEnvelopeKeys(value, notificationOnlyForbiddenKeys), {
+    message: "initialized notification envelope contains request or response fields",
   });
 
 export const ThreadEventBaseSchema = z
@@ -479,7 +514,12 @@ export const RuntimeEventSchema = RuntimeEventBaseSchema.extend({
   message: "event envelope cannot contain id, result, or error",
 });
 
-export const EventEnvelopeSchema = z.union([ThreadEventSchema, RuntimeEventSchema, NotificationEnvelopeSchema]);
+export const EventEnvelopeSchema = z.union([
+  InitializedNotificationSchema,
+  ThreadEventSchema,
+  RuntimeEventSchema,
+  NotificationEnvelopeSchema,
+]);
 
 export const TurnEventParamsSchema = z.object({ turn: TurnSchema }).passthrough();
 export const TurnCompletedParamsSchema = z
@@ -518,10 +558,19 @@ export const ApprovalResolvedParamsSchema = z
 export const RuntimeStatusParamsSchema = z
   .object({
     status: z.enum(["starting", "ready", "degraded", "shutting_down", "stopped", "crashed"]),
+    readyToken: ReadyTokenSchema.optional(),
     reason: z.string().max(1024).optional(),
     health: z.record(z.string(), z.unknown()).optional(),
   })
-  .passthrough();
+  .passthrough()
+  .superRefine((params, context) => {
+    if (params.status === "ready" && params.readyToken === undefined) {
+      context.addIssue({ code: "custom", message: "ready status requires readyToken" });
+    }
+    if (params.status !== "ready" && params.readyToken !== undefined) {
+      context.addIssue({ code: "custom", message: "non-ready status cannot carry readyToken" });
+    }
+  });
 export const RuntimeNoticeParamsSchema = z
   .object({
     code: z.string().regex(/^[A-Z][A-Z0-9_]{2,63}$/),
@@ -575,6 +624,9 @@ export type McpTool = z.infer<typeof McpToolSchema>;
 export type Attachment = z.infer<typeof AttachmentSchema>;
 export type ApprovalSummary = z.infer<typeof ApprovalSummarySchema>;
 export type RpcError = z.infer<typeof RpcErrorSchema>;
+export type ReadyToken = z.infer<typeof ReadyTokenSchema>;
+export type InitializedParams = z.infer<typeof InitializedParamsSchema>;
+export type InitializedNotification = z.infer<typeof InitializedNotificationSchema>;
 export type InitializeParams = z.infer<typeof InitializeParamsSchema>;
 export type RequestEnvelope = z.infer<typeof RequestEnvelopeSchema>;
 export type ClientRequestEnvelope = z.infer<typeof ClientRequestEnvelopeSchema>;
@@ -586,6 +638,7 @@ export type RuntimeEventBase = z.infer<typeof RuntimeEventBaseSchema>;
 export type ThreadEvent = z.infer<typeof ThreadEventSchema>;
 export type RuntimeEvent = z.infer<typeof RuntimeEventSchema>;
 export type JaEvent = ThreadEvent | RuntimeEvent;
+export type JaNotification = InitializedNotification | JaEvent;
 export type ThreadReadResult = z.infer<typeof ThreadReadResultSchema>;
 
 /**
@@ -640,12 +693,21 @@ function parseRuntimeEventEnvelope(notification: NotificationEnvelope): RuntimeE
  * into feature state; reject those names before permissive minor-version
  * fields are preserved by the Zod schemas.
  */
-export function assertSafePayload(value: unknown, depth = 0, seen = new WeakSet<object>()): void {
+export function assertSafePayload(
+  value: unknown,
+  depth = 0,
+  seen = new WeakSet<object>(),
+  nodeBudget = { nodes: 0 },
+): void {
   if (depth > 64) {
     throw new Error("payload nesting too deep");
   }
   if (value === null || typeof value !== "object") {
     return;
+  }
+  nodeBudget.nodes += 1;
+  if (nodeBudget.nodes > 20_000) {
+    throw new Error("payload contains too many nodes");
   }
   if (seen.has(value)) {
     throw new Error("cyclic payload is not valid JSON");
@@ -655,9 +717,65 @@ export function assertSafePayload(value: unknown, depth = 0, seen = new WeakSet<
     if (key === "__proto__" || key === "constructor" || key === "prototype") {
       throw new Error("unsafe payload property");
     }
-    assertSafePayload(child, depth + 1, seen);
+    assertSafePayload(child, depth + 1, seen, nodeBudget);
   }
   seen.delete(value);
+}
+
+interface ReadyTokenLeakOptions {
+  /** The only path allowed to contain a challenge in the current frame. */
+  allowChallengePath?: readonly ["params", "readyToken"];
+  /** Raw values are accepted only at a short-lived protocol boundary. */
+  knownTokens?: readonly string[];
+  /** Callers that already discarded raw history can provide fingerprints only. */
+  knownTokenFingerprints?: readonly string[];
+  /** Private callers can compare by fingerprint without retaining old tokens. */
+  isKnownReadyToken?: (value: string) => boolean;
+}
+
+/**
+ * Scans the complete frame because permissive minor-version fields must never
+ * become a side channel for the current or a historical handshake challenge.
+ */
+export function assertNoReadyTokenLeak(value: unknown, options: ReadyTokenLeakOptions = {}): void {
+  assertSafePayload(value);
+  const knownFingerprints = new Set(options.knownTokenFingerprints ?? []);
+  for (const token of options.knownTokens ?? []) {
+    if (READY_TOKEN_PATTERN.test(token)) {
+      knownFingerprints.add(fingerprintReadyToken(token));
+    }
+  }
+  const isKnownToken = (candidate: string): boolean =>
+    knownFingerprints.has(fingerprintReadyToken(candidate)) || options.isKnownReadyToken?.(candidate) === true;
+  const containsKnownToken = (text: string): boolean =>
+    forEachReadyTokenCandidate(text, isKnownToken);
+  const isAllowedPath = (path: readonly string[]): boolean =>
+    options.allowChallengePath !== undefined &&
+    path.length === options.allowChallengePath.length &&
+    path.every((part, index) => part === options.allowChallengePath?.[index]);
+  const visit = (current: unknown, path: readonly string[]): void => {
+    if (
+      typeof current === "string" &&
+      containsKnownToken(current) &&
+      !(isAllowedPath(path) && isKnownToken(current) && current.length === 32)
+    ) {
+      throw new Error("readyToken challenge value leaked outside its handshake field");
+    }
+    if (current === null || typeof current !== "object") {
+      return;
+    }
+    for (const [key, child] of Object.entries(current)) {
+      const childPath = [...path, key];
+      if (containsKnownToken(key)) {
+        throw new Error("readyToken challenge key is not allowed in this frame");
+      }
+      if (key === "readyToken" && !isAllowedPath(childPath)) {
+        throw new Error("readyToken challenge key is not allowed in this frame");
+      }
+      visit(child, childPath);
+    }
+  };
+  visit(value, []);
 }
 
 /**
@@ -666,6 +784,7 @@ export function assertSafePayload(value: unknown, depth = 0, seen = new WeakSet<
  */
 export function parseRequest(value: unknown): RequestEnvelope {
   assertSafePayload(value);
+  assertNoReadyTokenLeak(value);
   return RequestEnvelopeSchema.parse(value);
 }
 
@@ -675,6 +794,7 @@ export function parseRequest(value: unknown): RequestEnvelope {
  */
 export function parseClientRequest(value: unknown): ClientRequestEnvelope {
   assertSafePayload(value);
+  assertNoReadyTokenLeak(value);
   return ClientRequestEnvelopeSchema.parse(value);
 }
 
@@ -684,6 +804,7 @@ export function parseClientRequest(value: unknown): ClientRequestEnvelope {
  */
 export function parseServerRequest(value: unknown): ServerRequestEnvelope {
   assertSafePayload(value);
+  assertNoReadyTokenLeak(value);
   return ServerRequestEnvelopeSchema.parse(value);
 }
 
@@ -693,6 +814,7 @@ export function parseServerRequest(value: unknown): ServerRequestEnvelope {
  */
 export function parseResponse(value: unknown): ResponseEnvelope {
   assertSafePayload(value);
+  assertNoReadyTokenLeak(value);
   return ResponseEnvelopeSchema.parse(value);
 }
 
@@ -700,9 +822,36 @@ export function parseResponse(value: unknown): ResponseEnvelope {
  * Runtime notifications do not carry thread sequence numbers, so they are
  * separated from ordered thread events before reaching the reducer.
  */
-export function parseEvent(value: unknown): JaEvent {
+export interface ReadyEventValidation {
+  expectedReadyToken?: string;
+  isKnownReadyToken?: (value: string) => boolean;
+}
+
+/**
+ * Parses a business/runtime event while keeping handshake token validation at
+ * the frame boundary; callers can additionally require an exact echo.
+ */
+export function parseEvent(value: unknown, validation: ReadyEventValidation = {}): JaEvent {
   assertSafePayload(value);
+  const root = value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;
+  const rootMethod = root?.["method"];
+  const params = root?.["params"];
+  const paramsObject = params !== null && typeof params === "object" ? params as Record<string, unknown> : undefined;
+  const status = paramsObject?.["status"];
+  assertNoReadyTokenLeak(value, {
+    allowChallengePath:
+      (rootMethod === "runtime/statusChanged" && status === "ready")
+        ? ["params", "readyToken"]
+        : undefined,
+    knownTokens: [
+      ...(validation.expectedReadyToken === undefined ? [] : [validation.expectedReadyToken]),
+    ],
+    isKnownReadyToken: validation.isKnownReadyToken,
+  });
   const notification = NotificationEnvelopeSchema.parse(value);
+  if (notification.method === "initialized") {
+    throw new Error("initialized is a handshake notification, not a timeline event");
+  }
   const method = notification.method;
   if (
     method === "runtime/statusChanged" ||
@@ -750,4 +899,57 @@ export function parseEvent(value: unknown): JaEvent {
       break;
   }
   return event;
+}
+
+/**
+ * Keeps initialized out of the timeline union while allowing one receive loop
+ * to validate every notification before dispatching it to the right owner.
+ */
+export function parseInitializedNotification(value: unknown): InitializedNotification {
+  assertStrictInitializedFrame(value);
+  return InitializedNotificationSchema.parse(value);
+}
+
+/**
+ * The challenge is not known before this parser succeeds, so shape-scanning
+ * the complete root is required; only the exact params.readyToken leaf may
+ * contain a canonical 32-character challenge.
+ */
+function assertStrictInitializedFrame(value: unknown): void {
+  assertSafePayload(value);
+  const visit = (current: unknown, path: readonly string[]): void => {
+    if (typeof current === "string") {
+      if (containsTokenShapedText(current)) {
+        const allowed = path.length === 2 && path[0] === "params" && path[1] === "readyToken" && READY_TOKEN_PATTERN.test(current);
+        if (!allowed) {
+          throw new Error("initialized challenge leaked outside params.readyToken");
+        }
+      }
+      return;
+    }
+    if (current === null || typeof current !== "object") {
+      return;
+    }
+    for (const [key, child] of Object.entries(current)) {
+      const childPath = [...path, key];
+      const allowedKey = childPath.length === 2 && childPath[0] === "params" && childPath[1] === "readyToken";
+      if (containsTokenShapedText(key) || (key === "readyToken" && !allowedKey)) {
+        throw new Error("initialized challenge key is not allowed outside params.readyToken");
+      }
+      visit(child, childPath);
+    }
+  };
+  visit(value, []);
+}
+
+/**
+ * Parses either the handshake challenge or an ordinary event without letting
+ * a caller bypass the notification envelope's mutually exclusive fields.
+ */
+export function parseNotification(value: unknown, validation: ReadyEventValidation = {}): JaNotification {
+  const root = value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;
+  if (root?.["method"] === "initialized") {
+    return parseInitializedNotification(value);
+  }
+  return parseEvent(value, validation);
 }

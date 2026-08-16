@@ -28,6 +28,7 @@ import {
   TurnIdSchema,
   WorkspaceIdSchema,
   WorkspaceSchema,
+  assertNoReadyTokenLeak,
 } from "./protocol";
 
 /**
@@ -305,6 +306,7 @@ export type ServerMethodResult<M extends ServerMethod> = MethodResult<M>;
  */
 export function parseMethodParams<M extends ClientMethod>(method: M, params: unknown): ClientMethodParams<M> {
   assertSafePayload(params);
+  assertNoReadyTokenLeak(params);
   return ClientParamsSchemaByMethod[method].parse(params) as ClientMethodParams<M>;
 }
 
@@ -314,6 +316,7 @@ export function parseMethodParams<M extends ClientMethod>(method: M, params: unk
  */
 export function parseServerMethodParams<M extends ServerMethod>(method: M, params: unknown): ServerMethodParams<M> {
   assertSafePayload(params);
+  assertNoReadyTokenLeak(params);
   return ServerParamsSchemaByMethod[method].parse(params) as ServerMethodParams<M>;
 }
 
@@ -323,6 +326,7 @@ export function parseServerMethodParams<M extends ServerMethod>(method: M, param
  */
 export function parseMethodResult<M extends JaMethod>(method: M, result: unknown): MethodResult<M> {
   assertSafePayload(result);
+  assertNoReadyTokenLeak(result);
   return ResultSchemaByMethod[method].parse(result) as MethodResult<M>;
 }
 

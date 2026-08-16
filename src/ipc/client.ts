@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { JaError, JA_ERROR_CODES, mapProtocolError, mapRpcError, mapTransportError, mapValidationError } from "./errors";
+import { handshakeFailedError, ReadyHandshake, type HandshakeProjection } from "./handshake";
 import {
   isServerMethod,
   parseMethodParams,
@@ -18,15 +19,19 @@ import {
   ClientRequestIdSchema,
   DEFAULT_LIMITS,
   parseEvent,
+  parseInitializedNotification,
   parseRequest,
   parseResponse,
   parseServerRequest,
   RequestIdSchema,
   type JaEvent,
+  type NotificationEnvelope,
   type RequestEnvelope,
   type ResponseEnvelope,
   type ServerRequestEnvelope,
+  type ReadyToken,
 } from "./protocol";
+import { containsTokenShapedText } from "./readyToken";
 import type { JaRpcTransport, Unsubscribe } from "./transport";
 
 export type ClientEventListener = (event: JaEvent) => void;
@@ -47,7 +52,8 @@ export type ProtocolFaultKind =
   | "malformed_frame"
   | "unknown_response"
   | "invalid_result"
-  | "invalid_server_request";
+  | "invalid_server_request"
+  | "handshake_failed";
 
 export interface ProtocolFault {
   kind: ProtocolFaultKind;
@@ -62,6 +68,13 @@ interface PendingRequest {
   reject: (reason: JaError) => void;
   timer: ReturnType<typeof setTimeout>;
 }
+
+interface ActiveSubscription {
+  generation: number;
+  unsubscribe: Unsubscribe;
+}
+
+const SERVER_REQUEST_TOMBSTONE_LIMIT = 1024;
 
 export interface JaRpcClientOptions {
   requestId?: () => string;
@@ -86,6 +99,44 @@ function extractRequestId(frame: unknown): string | undefined {
   }
   const candidate = (frame as Record<string, unknown>)["id"];
   return typeof candidate === "string" && RequestIdSchema.safeParse(candidate).success ? candidate : undefined;
+}
+
+/**
+ * Ready carries transport-only proof, so event listeners receive a fresh
+ * runtime object with that field removed before React or Zustand can retain it.
+ */
+function sanitizeEventForListener(event: JaEvent): JaEvent {
+  if (event.method !== "runtime/statusChanged" || !Object.prototype.hasOwnProperty.call(event.params, "readyToken")) {
+    return event;
+  }
+  const params = { ...event.params };
+  delete params["readyToken"];
+  return { ...event, params };
+}
+
+function serverRequestStateError(
+  message: string,
+  code: typeof JA_ERROR_CODES.DUPLICATE_REQUEST | typeof JA_ERROR_CODES.UNKNOWN_REQUEST_ID | typeof JA_ERROR_CODES.LATE_RESPONSE,
+  jaCode: "DUPLICATE_REQUEST" | "UNKNOWN_REQUEST_ID" | "LATE_RESPONSE",
+): JaError {
+  return new JaError(message, { code, jaCode, retryable: false });
+}
+
+/** Returns one stable rejection while lifecycle cleanup owns the transport. */
+function connectionClosedError(): JaError {
+  return new JaError("JA connection closed", { jaCode: "TRANSPORT_ERROR", retryable: true });
+}
+
+/** Keeps fault metadata useful while preventing malformed method/id text from becoming UI diagnostics. */
+function sanitizeFaultField(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const bounded = value.slice(0, 256);
+  if (containsTokenShapedText(bounded) || /(?:[A-Za-z]:[\\/]|\\\\|\/(?:Users|home|private|var|tmp)(?:\/|$))/i.test(bounded)) {
+    return undefined;
+  }
+  return bounded;
 }
 
 /**
@@ -123,12 +174,21 @@ export function parseValidatedServerRequest(value: unknown): AnyValidatedServerR
  */
 export class JaRpcClient {
   private readonly pending = new Map<string, PendingRequest>();
+  private readonly pendingServerRequests = new Map<string, AnyValidatedServerRequest>();
+  private readonly serverRequestTombstones = new Set<string>();
+  private readonly serverRequestTombstoneOrder: string[] = [];
   private readonly eventListeners = new Set<ClientEventListener>();
   private readonly serverRequestListeners = new Set<ServerRequestListener>();
   private readonly protocolFaultListeners = new Set<(fault: ProtocolFault) => void>();
-  private unsubscribe: Unsubscribe | undefined;
+  private readonly handshake = new ReadyHandshake();
+  private subscription: ActiveSubscription | undefined;
   private connectPromise: Promise<void> | undefined;
+  private disconnectPromise: Promise<void> | undefined;
+  private teardownPromise: Promise<void> | undefined;
+  private lifecycleGeneration = 0;
+  private activeGeneration = 0;
   private disconnectRequested = false;
+  private handshakeFaulted = false;
   private counter = 0;
   private readonly requestIdFactory: () => string;
   private pendingLimit: number;
@@ -151,31 +211,64 @@ export class JaRpcClient {
    * mounts effects twice in development to expose missing cleanup.
    */
   async connect(): Promise<void> {
-    if (this.unsubscribe !== undefined) {
+    if (this.disconnectPromise !== undefined) {
+      // Waiting for the old unsubscribe is the linearization point: a new
+      // listener cannot coexist with a slow old listener or a disconnected UI.
+      try {
+        await this.disconnectPromise;
+      } catch {
+        // Cleanup still reaches the disconnected phase; the next connect may retry.
+      }
+      return this.connect();
+    }
+    if (this.teardownPromise !== undefined) {
+      try {
+        await this.teardownPromise;
+      } catch {
+        // The stale listener is detached even if its cleanup reports a safe error.
+      }
+      return this.connect();
+    }
+    if (this.subscription !== undefined && !this.disconnectRequested) {
       return;
     }
     if (this.connectPromise !== undefined) {
-      if (!this.disconnectRequested) {
-        return this.connectPromise;
-      }
-      return this.connectPromise.then(() => {
-        this.disconnectRequested = false;
-        return this.connect();
-      });
+      return this.connectPromise;
     }
+
+    const generation = ++this.lifecycleGeneration;
+    this.activeGeneration = generation;
     this.disconnectRequested = false;
-    this.connectPromise = this.transport
-      .subscribe((frame) => this.receive(frame))
-      .then((unsubscribe) => {
-        if (this.disconnectRequested) {
-          return unsubscribe();
+    this.handshakeFaulted = false;
+    this.handshake.start();
+    const setup: Promise<void> = Promise.resolve()
+      .then(() => this.transport.subscribe((frame) => this.receive(frame, generation)))
+      .then(async (unsubscribe) => {
+        if (generation !== this.activeGeneration || this.disconnectRequested) {
+          // A synchronous delivery can fail the handshake before subscribe
+          // returns its disposer; release it now and reject this stale setup.
+          try {
+            await unsubscribe();
+          } catch (error) {
+            throw mapTransportError(error);
+          }
+          throw this.disconnectRequested ? handshakeFailedError() : connectionClosedError();
         }
-        this.unsubscribe = unsubscribe;
+        this.subscription = { generation, unsubscribe };
+      })
+      .catch((error) => {
+        if (generation === this.activeGeneration && !this.disconnectRequested) {
+          this.failHandshake(error, generation);
+        }
+        throw error instanceof JaError ? error : mapTransportError(error);
       })
       .finally(() => {
-        this.connectPromise = undefined;
+        if (this.connectPromise === setup) {
+          this.connectPromise = undefined;
+        }
       });
-    return this.connectPromise;
+    this.connectPromise = setup;
+    return setup;
   }
 
   /**
@@ -183,18 +276,104 @@ export class JaRpcClient {
    * sidecar cannot leave promises or deadline callbacks retained in memory.
    */
   async disconnect(): Promise<void> {
-    this.disconnectRequested = true;
-    const unsubscribe = this.unsubscribe;
-    this.unsubscribe = undefined;
-    if (unsubscribe !== undefined) {
-      await unsubscribe();
+    if (this.disconnectPromise !== undefined) {
+      return this.disconnectPromise;
     }
-    const error = new JaError("JA connection closed", {
+
+    // Close all business gates before awaiting user/transport cleanup. This
+    // prevents a slow unsubscribe from accepting a response or new send.
+    this.disconnectRequested = true;
+    this.activeGeneration = ++this.lifecycleGeneration;
+    const setup = this.connectPromise;
+    const activeSubscription = this.subscription;
+    const teardown = this.teardownPromise;
+    this.subscription = undefined;
+    const closed = new JaError("JA connection closed", {
       jaCode: "TRANSPORT_ERROR",
       retryable: true,
     });
     for (const id of [...this.pending.keys()]) {
-      this.rejectPending(id, error);
+      this.rejectPending(id, closed);
+    }
+    this.clearServerRequests();
+    this.handshake.disconnect();
+
+    const cleanup: Promise<void> = (async () => {
+      let failure: JaError | undefined;
+      if (setup !== undefined) {
+        try {
+          await setup;
+        } catch (error) {
+          if (!(this.disconnectRequested && error instanceof JaError && error.jaCode === "HANDSHAKE_FAILED")) {
+            failure = error instanceof JaError ? error : mapTransportError(error);
+          }
+        }
+      }
+      if (teardown !== undefined) {
+        try {
+          await teardown;
+        } catch (error) {
+          failure = error instanceof JaError ? error : mapTransportError(error);
+        }
+      }
+      if (activeSubscription !== undefined) {
+        try {
+          await activeSubscription.unsubscribe();
+        } catch (error) {
+          failure = mapTransportError(error);
+        }
+      }
+      // Re-assert the terminal phase after slow cleanup and release fault state
+      // so a subsequent connect starts a clean generation.
+      this.handshake.disconnect();
+      this.handshakeFaulted = false;
+      if (failure !== undefined) {
+        throw failure;
+      }
+    })();
+    const settled: Promise<void> = cleanup.finally(() => {
+      if (this.disconnectPromise === settled) {
+        this.disconnectPromise = undefined;
+      }
+    });
+    this.disconnectPromise = settled;
+    return settled;
+  }
+
+  /**
+   * Sends the Rust-owned challenge as a typed notification and records only
+   * private comparison material before the frame enters the transport.
+   */
+  async sendInitialized(readyToken: ReadyToken): Promise<void> {
+    if (!this.isGenerationOpen()) {
+      throw connectionClosedError();
+    }
+    const generation = this.activeGeneration;
+    const frame: NotificationEnvelope = {
+      jsonrpc: "2.0",
+      method: "initialized",
+      params: { readyToken },
+    };
+    try {
+      const parsed = parseInitializedNotification(frame);
+      this.handshake.acceptInitialized(parsed.params.readyToken);
+    } catch (cause) {
+      this.failHandshake(cause);
+      throw handshakeFailedError();
+    }
+    try {
+      if (!this.isGenerationOpen(generation)) {
+        throw connectionClosedError();
+      }
+      await this.transport.send(frame);
+    } catch (error) {
+      if (this.isGenerationOpen(generation)) {
+        this.failHandshake(error, generation);
+      }
+      if (error instanceof JaError) {
+        throw error;
+      }
+      throw mapTransportError(error);
     }
   }
 
@@ -206,8 +385,25 @@ export class JaRpcClient {
   respond(...args: ServerResponseArgs): Promise<void>;
   async respond(...args: ServerResponseArgs): Promise<void> {
     const [request, result] = args;
+    const generation = this.activeGeneration;
     if (!isServerMethod(request.method)) {
       throw mapProtocolError("request", request.method);
+    }
+    const pending = this.pendingServerRequests.get(request.id);
+    if (pending === undefined) {
+      if (this.serverRequestTombstones.has(request.id)) {
+        throw serverRequestStateError("Server request was already completed", JA_ERROR_CODES.LATE_RESPONSE, "LATE_RESPONSE");
+      }
+      throw serverRequestStateError("Server request is not pending", JA_ERROR_CODES.UNKNOWN_REQUEST_ID, "UNKNOWN_REQUEST_ID");
+    }
+    if (!this.isGenerationOpen(generation)) {
+      throw connectionClosedError();
+    }
+    if (!this.handshake.isReady) {
+      throw handshakeFailedError();
+    }
+    if (pending !== request || pending.method !== request.method) {
+      throw serverRequestStateError("Server request identity does not match", JA_ERROR_CODES.DUPLICATE_REQUEST, "DUPLICATE_REQUEST");
     }
     try {
       parseServerMethodParams(request.method, request["params"]);
@@ -220,8 +416,29 @@ export class JaRpcClient {
       id: request.id,
       result,
     };
-    parseResponse(frame);
-    await this.transport.send(frame);
+    try {
+      parseResponse(frame);
+      this.handshake.assertFrameSafe(frame);
+    } catch (error) {
+      this.failHandshake(error);
+      throw handshakeFailedError();
+    }
+    this.pendingServerRequests.delete(request.id);
+    this.rememberServerRequestTombstone(request.id);
+    try {
+      if (!this.isGenerationOpen(generation)) {
+        throw connectionClosedError();
+      }
+      await this.transport.send(frame);
+    } catch (error) {
+      if (this.isGenerationOpen(generation)) {
+        this.failHandshake(error, generation);
+      }
+      if (error instanceof JaError) {
+        throw error;
+      }
+      throw mapTransportError(error);
+    }
   }
 
   /**
@@ -233,6 +450,9 @@ export class JaRpcClient {
     params: MethodParams<M>,
     options: JaRpcRequestOptions = {},
   ): Promise<MethodResult<M>> {
+    if (this.disconnectRequested || this.disconnectPromise !== undefined || this.teardownPromise !== undefined) {
+      throw connectionClosedError();
+    }
     let parsedParams: MethodParams<M>;
     try {
       parsedParams = parseMethodParams(method, params);
@@ -244,8 +464,12 @@ export class JaRpcClient {
     } catch (error) {
       throw mapTransportError(error);
     }
-    if (this.disconnectRequested) {
-      throw new JaError("JA connection closed", { jaCode: "TRANSPORT_ERROR", retryable: true });
+    if (!this.isGenerationOpen()) {
+      throw connectionClosedError();
+    }
+    const generation = this.activeGeneration;
+    if (method !== "initialize" && !this.handshake.isReady) {
+      throw handshakeFailedError();
     }
     if (this.pending.size >= this.pendingLimit) {
       throw new JaError("JA pending request limit reached", {
@@ -272,6 +496,12 @@ export class JaRpcClient {
       params: parsedParams as Record<string, unknown>,
     };
     parseRequest(frame);
+    try {
+      this.handshake.assertFrameSafe(frame);
+    } catch (error) {
+      this.failHandshake(error);
+      throw handshakeFailedError();
+    }
     const deadlineMs = boundedPositive(options.deadlineMs, this.defaultRequestDeadlineMs, 3_600_000);
     return new Promise<MethodResult<M>>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -282,8 +512,17 @@ export class JaRpcClient {
         }));
       }, deadlineMs);
       this.pending.set(id, { method, resolve: resolve as (value: unknown) => void, reject, timer });
-      void Promise.resolve().then(() => this.transport.send(frame)).catch((error: unknown) => {
+      void Promise.resolve().then(() => {
+        if (!this.isGenerationOpen(generation)) {
+          this.rejectPending(id, connectionClosedError());
+          return;
+        }
+        return this.transport.send(frame);
+      }).catch((error: unknown) => {
         this.rejectPending(id, mapTransportError(error));
+        if (this.isGenerationOpen(generation)) {
+          this.failHandshake(error, generation);
+        }
       });
     });
   }
@@ -321,6 +560,16 @@ export class JaRpcClient {
     };
   }
 
+  /** Exposes only the token-free handshake projection for boot/reconnect UI. */
+  get handshakeState(): HandshakeProjection {
+    return this.handshake.state;
+  }
+
+  /** Subscribes to reconnect state without giving callers challenge material. */
+  onHandshakeState(listener: (state: HandshakeProjection, opaqueFingerprints: readonly string[]) => void): Unsubscribe {
+    return this.handshake.onChange(listener);
+  }
+
   get pendingCount(): number {
     return this.pending.size;
   }
@@ -329,16 +578,59 @@ export class JaRpcClient {
     return this.pendingLimit;
   }
 
-  private receive(frame: unknown): void {
+  private receive(frame: unknown, generation: number): void {
+    if (!this.isGenerationOpen(generation)) {
+      return;
+    }
+    try {
+      this.handshake.assertFrameSafe(frame);
+    } catch (cause) {
+      this.failHandshake(cause, generation);
+      return;
+    }
     const response = this.tryParseResponse(frame);
     if (response !== undefined) {
+      if (!this.handshake.isReady && !this.isPendingInitialize(response.id)) {
+        this.failHandshake(undefined, generation);
+        return;
+      }
       this.resolveResponse(response);
+      return;
+    }
+    const method = frame !== null && typeof frame === "object" && "method" in frame
+      ? (frame as Record<string, unknown>)["method"]
+      : undefined;
+    if (method === "initialized") {
+      this.failHandshake(undefined, generation);
       return;
     }
     try {
       const event = parseEvent(frame);
+      if (event.method === "runtime/statusChanged") {
+        const status = event.params["status"];
+        const token = typeof event.params["readyToken"] === "string" ? event.params["readyToken"] : undefined;
+        if (status === "starting" || status === "ready" || status === "degraded" || status === "shutting_down" || status === "stopped" || status === "crashed") {
+          this.handshake.acceptRuntimeStatus(status, token);
+          if (this.handshakeState.phase === "reconnect_required") {
+            this.failHandshake(undefined, generation);
+            return;
+          }
+        }
+      } else if (!this.handshake.isReady) {
+        this.failHandshake(undefined, generation);
+        return;
+      }
+      if (!this.handshake.isReady && event.method !== "runtime/statusChanged") {
+        this.failHandshake(undefined, generation);
+        return;
+      }
+      const safeEvent = sanitizeEventForListener(event);
       for (const listener of this.eventListeners) {
-        listener(event);
+        try {
+          listener(safeEvent);
+        } catch {
+          // A view observer must not turn a valid transport frame into a raw host error.
+        }
       }
       return;
     } catch {
@@ -346,6 +638,10 @@ export class JaRpcClient {
     }
     try {
       const request = parseServerRequest(frame);
+      if (!this.handshake.isReady) {
+        this.failHandshake(undefined, generation);
+        return;
+      }
       if (!isServerMethod(request.method)) {
         const error = mapProtocolError("request", request.method);
         this.emitProtocolFault({ kind: "invalid_server_request", requestId: request.id, method: request.method, error });
@@ -353,8 +649,27 @@ export class JaRpcClient {
       }
       try {
         const validated = validateServerRequestEnvelope(request);
+        if (this.pendingServerRequests.has(validated.id) || this.serverRequestTombstones.has(validated.id)) {
+          const error = serverRequestStateError("Duplicate server request id", JA_ERROR_CODES.DUPLICATE_REQUEST, "DUPLICATE_REQUEST");
+          this.emitProtocolFault({ kind: "invalid_server_request", requestId: validated.id, method: validated.method, error });
+          return;
+        }
+        if (this.pendingServerRequests.size >= this.pendingLimit) {
+          const error = new JaError("JA server request limit reached", {
+            code: JA_ERROR_CODES.PENDING_LIMIT,
+            jaCode: "PENDING_LIMIT",
+            retryable: true,
+          });
+          this.emitProtocolFault({ kind: "invalid_server_request", requestId: validated.id, method: validated.method, error });
+          return;
+        }
+        this.pendingServerRequests.set(validated.id, validated);
         for (const listener of this.serverRequestListeners) {
-          listener(validated);
+          try {
+            listener(validated);
+          } catch {
+            // A UI handler must not break the pending registry or receive loop.
+          }
         }
       } catch (cause) {
         const error = mapProtocolError("request", request.method, cause);
@@ -363,6 +678,20 @@ export class JaRpcClient {
       }
       return;
     } catch {
+      if (method === "runtime/statusChanged") {
+        const params = frame !== null && typeof frame === "object" && "params" in frame
+          ? (frame as Record<string, unknown>)["params"]
+          : undefined;
+        const status = params !== null && typeof params === "object" ? (params as Record<string, unknown>)["status"] : undefined;
+        if (status === "ready") {
+          this.failHandshake(undefined, generation);
+          return;
+        }
+      }
+      if (!this.handshake.isReady) {
+        this.failHandshake(undefined, generation);
+        return;
+      }
       const requestId = extractRequestId(frame);
       const error = mapProtocolError("frame");
       if (requestId !== undefined && this.pending.has(requestId)) {
@@ -428,14 +757,101 @@ export class JaRpcClient {
     return pending;
   }
 
+  private isPendingInitialize(id: string): boolean {
+    return this.pending.get(id)?.method === "initialize";
+  }
+
+  /** Bounded tombstones make duplicate and late server responses deterministic. */
+  private rememberServerRequestTombstone(id: string): void {
+    if (this.serverRequestTombstones.has(id)) {
+      return;
+    }
+    this.serverRequestTombstones.add(id);
+    this.serverRequestTombstoneOrder.push(id);
+    while (this.serverRequestTombstoneOrder.length > SERVER_REQUEST_TOMBSTONE_LIMIT) {
+      const expired = this.serverRequestTombstoneOrder.shift();
+      if (expired !== undefined) {
+        this.serverRequestTombstones.delete(expired);
+      }
+    }
+  }
+
+  /** Disconnects invalidate every unresolved server request before reconnect. */
+  private clearServerRequests(): void {
+    for (const id of this.pendingServerRequests.keys()) {
+      this.rememberServerRequestTombstone(id);
+    }
+    this.pendingServerRequests.clear();
+  }
+
   private rejectPending(id: string, error: JaError): void {
     const pending = this.clearPending(id);
     pending?.reject(error);
   }
 
   private emitProtocolFault(fault: ProtocolFault): void {
+    const safeFault: ProtocolFault = {
+      ...fault,
+      requestId: sanitizeFaultField(fault.requestId),
+      method: sanitizeFaultField(fault.method),
+    };
     for (const listener of this.protocolFaultListeners) {
-      listener(fault);
+      try {
+        listener(safeFault);
+      } catch {
+        // Fault observers are advisory; cleanup and safe state transitions remain authoritative.
+      }
     }
+  }
+
+  /**
+   * Fails closed, rejects pending work, and detaches the old generation so a
+   * caller can explicitly reconnect without accepting stale notifications.
+   */
+  private failHandshake(cause?: unknown, generation = this.activeGeneration): void {
+    void cause;
+    if (this.handshakeFaulted || !this.isGenerationOpen(generation)) {
+      return;
+    }
+    this.handshakeFaulted = true;
+    if (this.handshakeState.phase !== "reconnect_required") {
+      this.handshake.failHandshake();
+    }
+    const error = handshakeFailedError();
+    this.emitProtocolFault({ kind: "handshake_failed", error });
+    this.disconnectRequested = true;
+    this.activeGeneration = ++this.lifecycleGeneration;
+    this.detachSubscription();
+    for (const id of [...this.pending.keys()]) {
+      this.rejectPending(id, error);
+    }
+    this.clearServerRequests();
+  }
+
+  /**
+   * Detaches a failed generation without allowing an unsubscribe rejection to
+   * become an unhandled raw host error on the UI event loop.
+   */
+  private detachSubscription(): void {
+    const activeSubscription = this.subscription;
+    this.subscription = undefined;
+    if (activeSubscription !== undefined) {
+      const teardown: Promise<void> = Promise.resolve()
+        .then(() => activeSubscription.unsubscribe())
+        .catch((error) => {
+          throw mapTransportError(error);
+        })
+        .finally(() => {
+          if (this.teardownPromise === teardown) {
+            this.teardownPromise = undefined;
+          }
+        });
+      this.teardownPromise = teardown;
+    }
+  }
+
+  /** Treats disconnect and stale generations as a hard no-send boundary. */
+  private isGenerationOpen(generation = this.activeGeneration): boolean {
+    return !this.disconnectRequested && this.disconnectPromise === undefined && generation === this.activeGeneration;
   }
 }

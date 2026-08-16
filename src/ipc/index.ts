@@ -3,6 +3,7 @@
 
 export * from "./client";
 export * from "./errors";
+export * from "./handshake";
 export * from "./methods";
 export * from "./protocol";
 export * from "./transport";
