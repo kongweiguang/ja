@@ -270,18 +270,12 @@ pub(super) fn terminate_group(
     validate_captured_identity(captured, deadline)?;
     let group_signal = signal_group_captured(captured, deadline)?;
     if group_signal == ProcessState::Empty {
-        // The group disappearing before the direct signal is a PID-reuse
-        // boundary: never send a signal to a new process that inherited the
-        // old numeric PID after the validated group vanished.
-        return match pid_state_until(
-            i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?,
-            deadline,
-        )? {
-            ProcessState::Empty => Ok(()),
-            ProcessState::PermissionDenied => Err("marker-eperm"),
-            ProcessState::Present => Err("marker-identity-lost"),
-            ProcessState::Other(_) => Err("marker-process-probe-failed"),
-        };
+        // The group may disappear before the direct child supervisor reaps
+        // its zombie.  Keep the same identity-checked wait used after a
+        // successful group signal; never send a stale PID signal after the
+        // group has already vanished.
+        let mut probe = RealPostSignalProbe { captured, deadline };
+        return wait_after_empty_group_signal(group_signal, &mut probe, deadline);
     }
     let direct = pid_state_until(
         i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?,
@@ -303,7 +297,13 @@ pub(super) fn terminate_group(
             // unqueryable or potentially reused direct PID.
             return wait_after_group_signal(captured, deadline);
         }
-        (ProcessState::Present, ProcessState::Empty) => return Err("marker-identity-lost"),
+        (ProcessState::Present, ProcessState::Empty) => {
+            // Darwin can report the killed group as empty before the direct
+            // child supervisor has reaped a just-created zombie.  Recheck
+            // every identity field before waiting; a PID that moved groups,
+            // was reused, or cannot be queried remains a hard identity loss.
+            return wait_after_group_signal(captured, deadline);
+        }
         (ProcessState::Present, ProcessState::Present) => {}
     }
     // The group signal may have raced with exit/reuse.  A fresh full identity
@@ -427,24 +427,112 @@ fn wait_after_group_signal(
     captured: &ProcessIdentity,
     deadline: Instant,
 ) -> Result<(), &'static str> {
-    loop {
+    let mut probe = RealPostSignalProbe { captured, deadline };
+    wait_after_group_signal_backend(&mut probe, deadline)
+}
+
+/// Keep the production PID/PGID probe and identity query behind one narrow
+/// seam so the signal-ESRCH branch exercises the exact same fail-closed wait
+/// state machine as the native fixture fault tests.
+trait PostSignalProbe {
+    fn states(&mut self) -> Result<(ProcessState, ProcessState), &'static str>;
+
+    fn validate_identity(&mut self) -> Result<(), &'static str>;
+}
+
+struct RealPostSignalProbe<'a> {
+    captured: &'a ProcessIdentity,
+    deadline: Instant,
+}
+
+impl PostSignalProbe for RealPostSignalProbe<'_> {
+    fn states(&mut self) -> Result<(ProcessState, ProcessState), &'static str> {
         let direct = pid_state_until(
-            i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?,
-            deadline,
+            i32::try_from(self.captured.pid).map_err(|_| "marker-owner-mismatch")?,
+            self.deadline,
         )?;
-        let group = group_state_until(captured.pgid, deadline)?;
-        match (direct, group) {
-            (ProcessState::Empty, ProcessState::Empty) => return Ok(()),
-            (ProcessState::PermissionDenied, _) | (_, ProcessState::PermissionDenied) => {
-                return Err("marker-eperm");
+        let group = group_state_until(self.captured.pgid, self.deadline)?;
+        Ok((direct, group))
+    }
+
+    fn validate_identity(&mut self) -> Result<(), &'static str> {
+        validate_captured_identity(self.captured, self.deadline)
+    }
+}
+
+/// Drive the post-signal state machine only when the kernel reported an empty
+/// group.  Keeping this guard explicit prevents a future caller from treating
+/// an unvalidated signal result as permission to reap or delete evidence.
+fn wait_after_empty_group_signal<B: PostSignalProbe>(
+    group_signal: ProcessState,
+    probe: &mut B,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    if group_signal != ProcessState::Empty {
+        return Err("marker-process-probe-failed");
+    }
+    wait_after_group_signal_backend(probe, deadline)
+}
+
+/// Apply the bounded post-signal state machine using the production probe or
+/// a deterministic fault seam; all non-gone states remain fail-closed.
+fn wait_after_group_signal_backend<B: PostSignalProbe>(
+    probe: &mut B,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    loop {
+        let (direct, group) = probe.states()?;
+        match classify_post_group_state(direct, group) {
+            PostGroupState::Gone => return Ok(()),
+            PostGroupState::PermissionDenied => return Err("marker-eperm"),
+            PostGroupState::ProbeFailed => return Err("marker-process-probe-failed"),
+            PostGroupState::RevalidateDirect => {
+                // A direct PID may briefly outlive its process group while its
+                // owner reaps it.  Waiting is safe only after a fresh UID,
+                // PGID, command and start-identity match; otherwise fail
+                // closed as a possible PID reuse or group escape.
+                match probe.validate_identity() {
+                    Ok(()) => {}
+                    Err("marker-residual") => return Err("marker-residual"),
+                    Err(_) => return Err("marker-identity-lost"),
+                }
+                if Instant::now() >= deadline {
+                    return Err("marker-residual");
+                }
+                thread::sleep(Duration::from_millis(10));
             }
-            (ProcessState::Other(_), _) | (_, ProcessState::Other(_)) => {
-                return Err("marker-process-probe-failed");
+            PostGroupState::Wait => {
+                if Instant::now() >= deadline {
+                    return Err("marker-residual");
+                }
+                thread::sleep(Duration::from_millis(50));
             }
-            (ProcessState::Present, ProcessState::Empty) => return Err("marker-identity-lost"),
-            _ if Instant::now() >= deadline => return Err("marker-residual"),
-            _ => thread::sleep(Duration::from_millis(50)),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PostGroupState {
+    Gone,
+    RevalidateDirect,
+    Wait,
+    PermissionDenied,
+    ProbeFailed,
+}
+
+/// Keep the transient Darwin post-kill state explicit so a direct PID that
+/// briefly outlives its group is revalidated, while EPERM/other probe errors
+/// and identity changes remain fail-closed.  The pure classification is also
+/// regression-tested without ever sending a signal to a test PID.
+fn classify_post_group_state(direct: ProcessState, group: ProcessState) -> PostGroupState {
+    match (direct, group) {
+        (ProcessState::Empty, ProcessState::Empty) => PostGroupState::Gone,
+        (ProcessState::Present, ProcessState::Empty) => PostGroupState::RevalidateDirect,
+        (ProcessState::PermissionDenied, _) | (_, ProcessState::PermissionDenied) => {
+            PostGroupState::PermissionDenied
+        }
+        (ProcessState::Other(_), _) | (_, ProcessState::Other(_)) => PostGroupState::ProbeFailed,
+        _ => PostGroupState::Wait,
     }
 }
 
@@ -964,6 +1052,23 @@ mod tests {
         }
     }
 
+    struct FakePostSignalProbe {
+        states: VecDeque<Result<(ProcessState, ProcessState), &'static str>>,
+        validations: VecDeque<Result<(), &'static str>>,
+    }
+
+    impl PostSignalProbe for FakePostSignalProbe {
+        fn states(&mut self) -> Result<(ProcessState, ProcessState), &'static str> {
+            self.states.pop_front().unwrap_or(Err("marker-residual"))
+        }
+
+        fn validate_identity(&mut self) -> Result<(), &'static str> {
+            self.validations
+                .pop_front()
+                .unwrap_or(Err("marker-identity-lost"))
+        }
+    }
+
     /// Prove all group terminal faults use fixed categories while the genuine
     /// empty state remains successful; this table drives fixture early exits.
     #[test]
@@ -1018,6 +1123,90 @@ mod tests {
             );
             assert!(backend.signalled);
         }
+    }
+
+    /// Prove a direct-PID/group disagreement takes the identity revalidation
+    /// path instead of being mistaken for a gone process or an EPERM success.
+    #[test]
+    fn post_group_probe_keeps_identity_loss_fail_closed() {
+        assert_eq!(
+            classify_post_group_state(ProcessState::Empty, ProcessState::Empty),
+            PostGroupState::Gone
+        );
+        assert_eq!(
+            classify_post_group_state(ProcessState::Present, ProcessState::Empty),
+            PostGroupState::RevalidateDirect
+        );
+        assert_eq!(
+            classify_post_group_state(ProcessState::PermissionDenied, ProcessState::Empty),
+            PostGroupState::PermissionDenied
+        );
+        assert_eq!(
+            classify_post_group_state(ProcessState::Other(5), ProcessState::Empty),
+            PostGroupState::ProbeFailed
+        );
+        assert_eq!(
+            classify_post_group_state(ProcessState::Present, ProcessState::Present),
+            PostGroupState::Wait
+        );
+    }
+
+    /// Drive the real signal-ESRCH seam with query failure, identity mismatch,
+    /// timeout and successful reap outcomes; no case may skip revalidation or
+    /// convert an unknown direct PID into a successful cleanup.
+    #[test]
+    fn empty_group_signal_seam_is_bounded_and_fail_closed() {
+        let cases = [
+            (
+                vec![Ok((ProcessState::Present, ProcessState::Empty))],
+                vec![Err("marker-identity-lost")],
+                Err("marker-identity-lost"),
+            ),
+            (
+                vec![Ok((ProcessState::Present, ProcessState::Empty))],
+                vec![Err("marker-owner-mismatch")],
+                Err("marker-identity-lost"),
+            ),
+            (
+                vec![Err("marker-residual")],
+                Vec::new(),
+                Err("marker-residual"),
+            ),
+            (
+                vec![
+                    Ok((ProcessState::Present, ProcessState::Empty)),
+                    Ok((ProcessState::Empty, ProcessState::Empty)),
+                ],
+                vec![Ok(())],
+                Ok(()),
+            ),
+        ];
+        for (states, validations, expected) in cases {
+            let mut probe = FakePostSignalProbe {
+                states: VecDeque::from(states),
+                validations: VecDeque::from(validations),
+            };
+            assert_eq!(
+                wait_after_empty_group_signal(
+                    ProcessState::Empty,
+                    &mut probe,
+                    Instant::now() + Duration::from_secs(1),
+                ),
+                expected
+            );
+        }
+        let mut probe = FakePostSignalProbe {
+            states: VecDeque::from([Ok((ProcessState::Empty, ProcessState::Empty))]),
+            validations: VecDeque::new(),
+        };
+        assert_eq!(
+            wait_after_empty_group_signal(
+                ProcessState::Present,
+                &mut probe,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err("marker-process-probe-failed")
+        );
     }
 
     /// Prove the production adapter keeps a real child owned until the
