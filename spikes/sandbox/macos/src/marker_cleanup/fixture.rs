@@ -486,9 +486,12 @@ fn reap_fixture_child_after_group_signal(
         }
     };
     emit_cleanup_diagnostic_line("post-signal-identity", "ok");
-    if let Err(error) = proof.consume_for(&observed) {
-        emit_cleanup_diagnostic_line("post-signal-proof", error);
-        return Err(error);
+    if consume_post_signal_proof_with_diagnostic(proof, &observed, |stage, code| {
+        emit_cleanup_diagnostic_line(stage, code);
+    })
+    .is_err()
+    {
+        return Err("fixture-helper-identity");
     }
 
     // The proof-bound observation is intentionally frozen before reaping.  A
@@ -514,6 +517,55 @@ fn reap_fixture_child_after_group_signal(
         Err(_) => {
             emit_cleanup_diagnostic_line("post-signal-pgid", "fixture-helper-pgid");
             Err("fixture-helper-pgid")
+        }
+    }
+}
+
+/// Classify proof/observation differences without exposing identity values;
+/// the field-level code distinguishes a signal-transition artifact from a
+/// genuine PID/PGID/UID or start-identity replacement while staying fail-closed.
+fn proof_identity_mismatch_code(
+    expected: &ProcessIdentity,
+    observed: &ProcessIdentity,
+) -> &'static str {
+    let mismatches = [
+        expected.pid != observed.pid,
+        expected.pgid != observed.pgid,
+        expected.uid != observed.uid,
+        expected.comm != observed.comm,
+        expected.start_identity != observed.start_identity,
+    ];
+    match mismatches.iter().filter(|mismatch| **mismatch).count() {
+        0 => "fixture-helper-identity",
+        1 if mismatches[0] => "fixture-helper-pid",
+        1 if mismatches[1] => "fixture-helper-pgid",
+        1 if mismatches[2] => "fixture-helper-uid",
+        1 if mismatches[3] => "fixture-helper-comm",
+        1 if mismatches[4] => "fixture-helper-start",
+        _ => "fixture-helper-identity-multiple",
+    }
+}
+
+/// Consume the proof before classifying any mismatch; a prior consumed state
+/// is itself an error, and only that error path may expose a field category.
+fn consume_post_signal_proof_with_diagnostic<F>(
+    proof: &mut PostSignalProof,
+    observed: &ProcessIdentity,
+    mut emit: F,
+) -> Result<(), &'static str>
+where
+    F: FnMut(&'static str, &'static str),
+{
+    match proof.consume_for(observed) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let code = if proof.identity != *observed {
+                proof_identity_mismatch_code(&proof.identity, observed)
+            } else {
+                error
+            };
+            emit("post-signal-proof", code);
+            Err(error)
         }
     }
 }
@@ -2649,10 +2701,11 @@ mod tests {
         FIXTURE_DIAGNOSTIC_BYTES, FIXTURE_DIAGNOSTIC_DRAIN_BUDGET, FixtureAckProof,
         FixtureControlEvent, FixtureDiagnosticBuffer, FixtureEvidenceFault, FixtureFailureContext,
         GroupSignalRelease, PostSignalProof, ProcessIdentity, accept_launcher_identity,
-        classify_fixture_control, complete_fixture_reap_handshake, control_setup_state,
-        decode_post_signal_proof, drain_fixture_diagnostics, finish_fixture_failure_with,
-        fixture_cleanup_failure_category, fixture_group_failure_reason, fixture_paths,
-        forward_fixture_diagnostics_with, is_fixture_reap_ack, persist_fixture_failure_pair_until,
+        classify_fixture_control, complete_fixture_reap_handshake,
+        consume_post_signal_proof_with_diagnostic, control_setup_state, decode_post_signal_proof,
+        drain_fixture_diagnostics, finish_fixture_failure_with, fixture_cleanup_failure_category,
+        fixture_group_failure_reason, fixture_paths, forward_fixture_diagnostics_with,
+        is_fixture_reap_ack, persist_fixture_failure_pair_until, proof_identity_mismatch_code,
         read_fixture_post_signal_proof, reap_fixture_child_after_group_signal,
         wait_child_exit_until, wait_fixture_reap_ack_with_diagnostics,
         write_fixture_failure_evidence_until, write_fixture_failure_evidence_with_fault,
@@ -3070,6 +3123,122 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
         reused
             .consume_for(&target)
             .expect("wrong proof must not consume capability");
+    }
+
+    /// Keep proof mismatch diagnostics field-specific but path-free so native
+    /// runs reveal whether a signal transition changed a row field without
+    /// turning any mismatch into a successful cleanup authorization.
+    #[test]
+    fn post_signal_proof_mismatch_categories_are_closed() {
+        let target = ProcessIdentity {
+            pid: 42,
+            pgid: 42,
+            uid: current_uid(),
+            comm: "target".to_owned(),
+            start_identity: "start".to_owned(),
+        };
+        let cases = [
+            (
+                ProcessIdentity {
+                    pid: 43,
+                    ..target.clone()
+                },
+                "fixture-helper-pid",
+            ),
+            (
+                ProcessIdentity {
+                    pgid: 43,
+                    ..target.clone()
+                },
+                "fixture-helper-pgid",
+            ),
+            (
+                ProcessIdentity {
+                    uid: target.uid.saturating_add(1),
+                    ..target.clone()
+                },
+                "fixture-helper-uid",
+            ),
+            (
+                ProcessIdentity {
+                    comm: "zombie".to_owned(),
+                    ..target.clone()
+                },
+                "fixture-helper-comm",
+            ),
+            (
+                ProcessIdentity {
+                    start_identity: "reused".to_owned(),
+                    ..target.clone()
+                },
+                "fixture-helper-start",
+            ),
+            (
+                ProcessIdentity {
+                    comm: "zombie".to_owned(),
+                    start_identity: "reused".to_owned(),
+                    ..target.clone()
+                },
+                "fixture-helper-identity-multiple",
+            ),
+        ];
+        for (observed, expected) in cases {
+            assert_eq!(proof_identity_mismatch_code(&target, &observed), expected);
+        }
+        assert_eq!(
+            proof_identity_mismatch_code(&target, &target),
+            "fixture-helper-identity"
+        );
+    }
+
+    /// Exercise the production consume/error seam: an already-consumed proof
+    /// with the same identity is generic, while a changed identity is only
+    /// field-classified after `consume_for` has rejected it.
+    #[test]
+    fn post_signal_proof_consume_errors_are_ordered() {
+        let target = ProcessIdentity {
+            pid: 42,
+            pgid: 42,
+            uid: current_uid(),
+            comm: "target".to_owned(),
+            start_identity: "start".to_owned(),
+        };
+        let changed = ProcessIdentity {
+            start_identity: "reused".to_owned(),
+            ..target.clone()
+        };
+
+        let mut same_proof = PostSignalProof::issue_from_production_hook(&target);
+        same_proof.consume_for(&target).expect("consume proof once");
+        let mut same_diagnostics = Vec::new();
+        assert_eq!(
+            consume_post_signal_proof_with_diagnostic(&mut same_proof, &target, |stage, code| {
+                same_diagnostics.push((stage, code))
+            },),
+            Err("fixture-helper-identity")
+        );
+        assert_eq!(
+            same_diagnostics,
+            [("post-signal-proof", "fixture-helper-identity")]
+        );
+
+        let mut changed_proof = PostSignalProof::issue_from_production_hook(&target);
+        changed_proof
+            .consume_for(&target)
+            .expect("consume changed proof once");
+        let mut changed_diagnostics = Vec::new();
+        assert_eq!(
+            consume_post_signal_proof_with_diagnostic(
+                &mut changed_proof,
+                &changed,
+                |stage, code| changed_diagnostics.push((stage, code)),
+            ),
+            Err("fixture-helper-identity")
+        );
+        assert_eq!(
+            changed_diagnostics,
+            [("post-signal-proof", "fixture-helper-start")]
+        );
     }
 
     /// Drive the bounded control reader itself so a missing proof, trailing
