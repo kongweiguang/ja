@@ -39,6 +39,13 @@ struct PipeWriter {
     sender: Sender<Vec<u8>>,
 }
 
+struct LateWatchdogReader {
+    inner: PipeReader,
+    frame_read: Sender<()>,
+    release: Arc<AtomicBool>,
+    first_read: bool,
+}
+
 /// 构造一对不会自动关闭的内存管道，让测试能独立控制 EOF 时机。
 fn pipe_pair() -> (PipeReader, PipeWriter) {
     let (sender, receiver) = mpsc::channel();
@@ -67,6 +74,25 @@ impl Read for PipeReader {
             *slot = self.buffer.pop_front().expect("buffer length checked");
         }
         Ok(count)
+    }
+}
+
+impl Read for LateWatchdogReader {
+    /// Let the ready frame reach the production dispatcher before holding EOF,
+    /// proving the reader is waiting on the barrier rather than missing input.
+    fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+        if self.first_read {
+            self.first_read = false;
+            let count = self.inner.read(target)?;
+            self.frame_read
+                .send(())
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "frame ack closed"))?;
+            return Ok(count);
+        }
+        while !self.release.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        Ok(0)
     }
 }
 
@@ -168,6 +194,156 @@ impl Write for GateWriter {
         self.completed
             .send(())
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "completion closed"))?;
+        Ok(())
+    }
+}
+
+struct ImmediateReadyWriter {
+    ready_sender: Sender<Vec<u8>>,
+    ready_payload: Option<Vec<u8>>,
+    ready_sent: Sender<()>,
+    release_flush: Receiver<()>,
+    flush_done: Sender<()>,
+}
+
+struct ReadyBeforeWriteReturnWriter {
+    ready_sender: Sender<Vec<u8>>,
+    ready_payload: Option<Vec<u8>>,
+    ready_sent: Sender<()>,
+    release_write: Receiver<()>,
+    write_done: Sender<()>,
+    flush_done: Sender<()>,
+}
+
+impl Write for ReadyBeforeWriteReturnWriter {
+    /// Send ready before write returns so the reader must wait on the shared
+    /// barrier instead of observing an intermediate atomic publication.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Some(ready) = self.ready_payload.take() {
+            self.ready_sender
+                .send(ready)
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ready pipe closed"))?;
+            self.ready_sent
+                .send(())
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ready ack closed"))?;
+            self.release_write
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write release timeout"))?;
+        }
+        self.write_done
+            .send(())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "write ack closed"))?;
+        Ok(bytes.len())
+    }
+
+    /// Keep the success path explicit so the barrier is committed only after
+    /// the complete write plus flush operation has returned.
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_done
+            .send(())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "flush ack closed"))?;
+        Ok(())
+    }
+}
+
+struct FlushFailureWriter {
+    ready_sender: Sender<Vec<u8>>,
+    ready_payload: Option<Vec<u8>>,
+    ready_sent: Sender<()>,
+    release_flush: Receiver<()>,
+    flush_done: Sender<()>,
+}
+
+struct LateWatchdogReadyWriter {
+    ready_sender: Sender<Vec<u8>>,
+    ready_payload: Option<Vec<u8>>,
+    ready_sent: Sender<()>,
+    release_write: Arc<AtomicBool>,
+    write_done: Sender<()>,
+}
+
+impl Write for LateWatchdogReadyWriter {
+    /// Publish ready, then finish write only after the watchdog has closed the
+    /// session, reproducing a late OS write completion without a second writer.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Some(ready) = self.ready_payload.take() {
+            self.ready_sender
+                .send(ready)
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ready pipe closed"))?;
+            self.ready_sent
+                .send(())
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ready ack closed"))?;
+            while !self.release_write.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+        }
+        self.write_done
+            .send(())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "write ack closed"))?;
+        Ok(bytes.len())
+    }
+
+    /// The late completion fixture reaches flush only after watchdog release.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Write for FlushFailureWriter {
+    /// Complete write successfully, leaving flush as the only failure point
+    /// so the test proves the barrier never remains Confirmed after flush.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        Ok(bytes.len())
+    }
+
+    /// Race a ready reply with a blocked flush, then fail closed after release.
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(ready) = self.ready_payload.take() {
+            self.ready_sender
+                .send(ready)
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ready pipe closed"))?;
+            self.ready_sent
+                .send(())
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ready ack closed"))?;
+            self.release_flush
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "flush release timeout"))?;
+        }
+        self.flush_done
+            .send(())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "flush ack closed"))?;
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "flush fixture failure",
+        ))
+    }
+}
+
+impl Write for ImmediateReadyWriter {
+    /// Publish ready from flush while the writer actor is still inside the
+    /// operation, reproducing a child that replies as soon as initialized is
+    /// observable without using sleeps or a second protocol implementation.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        Ok(bytes.len())
+    }
+
+    /// Hold the writer after publishing ready so the test proves the barrier
+    /// is visible before flush returns and before lifecycle promotion runs.
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(ready) = self.ready_payload.take() {
+            self.ready_sender
+                .send(ready)
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ready pipe closed"))?;
+            self.ready_sent
+                .send(())
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ready ack closed"))?;
+            self.release_flush
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "flush release timeout"))?;
+        }
+        self.flush_done
+            .send(())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "flush ack closed"))?;
         Ok(())
     }
 }
@@ -374,6 +550,116 @@ fn ready_token_codec_rejects_missing_malformed_and_nested_markers() {
     );
 }
 
+/// 用相同的 hostile corpus 覆盖所有 envelope 分支，防止大小写变体绕过出入站 guard。
+#[test]
+fn token_marker_policy_is_case_insensitive_and_table_driven() {
+    let token_variants = [
+        "0123456789abcdef0123456789abcdef",
+        "0123456789ABCDEF0123456789ABCDEF",
+        "0123456789aBcDeF0123456789aBcDeF",
+    ];
+    for token in token_variants {
+        let nested = json!({"outer":[{"inner":{"value":token}}]});
+        assert!(
+            RpcFrame::notification("future/method", nested.clone()).is_err(),
+            "notification must reject {token:?}"
+        );
+        assert!(
+            RpcFrame::client_request("c:token", "future/method", nested.clone()).is_err(),
+            "request must reject {token:?}"
+        );
+        assert!(
+            RpcFrame::response_result("c:token", nested.clone()).is_err(),
+            "result must reject {token:?}"
+        );
+
+        let inbound = serde_json::json!({
+            "jsonrpc":"2.0",
+            "method":"future/method",
+            "params":nested
+        });
+        let mut inbound_bytes = serde_json::to_vec(&inbound).expect("serialize fixture");
+        inbound_bytes.push(b'\n');
+        assert_eq!(
+            codec::decode_frame(&inbound_bytes, 4096),
+            Err(CodecError::InvalidEnvelope),
+            "inbound notification must reject {token:?}"
+        );
+
+        let error = serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":"c:token",
+            "error":{
+                "code":-32020,
+                "message":"shutting down",
+                "data":{
+                    "jaCode":"SHUTTING_DOWN",
+                    "retryable":true,
+                    "details":{"deep":[{"value":token}]}
+                }
+            }
+        });
+        let mut error_bytes = serde_json::to_vec(&error).expect("serialize error fixture");
+        error_bytes.push(b'\n');
+        assert_eq!(
+            codec::decode_frame(&error_bytes, 4096),
+            Err(CodecError::InvalidEnvelope),
+            "error projection must not erase {token:?}"
+        );
+        assert!(
+            RpcFrame::response_error("c:token", -32020, token, "SHUTTING_DOWN", true).is_err(),
+            "error message must reject {token:?}"
+        );
+    }
+
+    for key in ["readyToken", "READYTOKEN", "readyTOKEN"] {
+        let mut object = serde_json::Map::new();
+        object.insert(key.to_owned(), json!("ordinary value"));
+        let payload = json!({"outer":[serde_json::Value::Object(object)]});
+        assert!(
+            RpcFrame::notification("future/method", payload.clone()).is_err(),
+            "marker key variant must reject {key:?}"
+        );
+        let inbound = serde_json::json!({
+            "jsonrpc":"2.0",
+            "method":"future/method",
+            "params":payload
+        });
+        let mut inbound_bytes = serde_json::to_vec(&inbound).expect("serialize key fixture");
+        inbound_bytes.push(b'\n');
+        assert_eq!(
+            codec::decode_frame(&inbound_bytes, 4096),
+            Err(CodecError::InvalidEnvelope),
+            "inbound marker key variant must reject {key:?}"
+        );
+    }
+
+    for safe in [
+        "0123456789abcdef0123456789abcde",
+        "0123456789abcdef0123456789abcdef0",
+        "普通中文描述，不是 token",
+    ] {
+        let frame = RpcFrame::notification("future/method", json!({"value":safe}))
+            .expect("non-token-shaped text remains valid");
+        let encoded = frame.encode(4096).expect("safe outbound frame");
+        assert!(codec::decode_frame(&encoded, 4096).is_ok());
+    }
+
+    let escaped_value = br#"{"jsonrpc":"2.0","method":"future/method","params":{"value":"0123456789abcdef0123456789abcde\u0046"}}
+"#;
+    assert_eq!(
+        codec::decode_frame(escaped_value, 4096),
+        Err(CodecError::InvalidEnvelope)
+    );
+    let escaped_key =
+        br#"{"jsonrpc":"2.0","method":"future/method","params":{"\u0052EADYTOKEN":"safe"}}
+"#;
+    assert_eq!(
+        codec::decode_frame(escaped_key, 4096),
+        Err(CodecError::InvalidEnvelope)
+    );
+}
+
 #[test]
 fn inbound_error_data_is_rebuilt_as_safe_projection() {
     let frame = codec::decode_frame(
@@ -391,6 +677,16 @@ fn inbound_error_data_is_rebuilt_as_safe_projection() {
     assert!(!debug.contains("api-key"));
     assert!(!debug.contains("prompt.txt"));
     assert!(!debug.contains("bearer"));
+
+    // Projection must not be allowed to erase a raw challenge marker before
+    // the codec audits the complete error object.  This is the regression that
+    // protects error.detail from becoming a token exfiltration side channel.
+    let nested_ready_token = br#"{"jsonrpc":"2.0","id":"c:error-token","error":{"code":-32020,"message":"shutting down","data":{"jaCode":"SHUTTING_DOWN","retryable":true,"details":{"readyToken":"0123456789abcdef0123456789abcdef"}}}}
+"#;
+    assert_eq!(
+        codec::decode_frame(nested_ready_token, 4096),
+        Err(CodecError::InvalidEnvelope)
+    );
 }
 
 /// 构造已 flush initialized 的 session，让 terminal/ready promotion race 可以
@@ -586,7 +882,7 @@ fn prequeued_ready_is_rejected_by_ready_token_barrier() {
 }
 
 #[test]
-fn ready_before_initialized_flush_is_rejected_as_handshake_failure() {
+fn ready_during_initialized_write_waits_for_successful_barrier() {
     let (server_reader, server_writer) = pipe_pair();
     let token = "fedcba9876543210fedcba9876543210";
     let ready = RpcFrame::notification(
@@ -630,15 +926,22 @@ fn ready_before_initialized_flush_is_rejected_as_handshake_failure() {
         .sender
         .send(ready.encode(Limits::default().max_frame_bytes).unwrap())
         .unwrap();
-    assert!(matches!(
-        pump.next_event(Duration::from_secs(1)),
-        Some(SessionEvent::HandshakeFailed)
-    ));
+    assert!(pump.next_event(Duration::from_millis(50)).is_none());
     release_sender.send(()).unwrap();
     completed_receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("initialized flush completed");
+    let SessionEvent::Notification(frame) = pump
+        .next_event(Duration::from_secs(1))
+        .expect("ready after initialized barrier")
+    else {
+        panic!("expected ready notification after successful barrier");
+    };
+    assert!(session.ready_after_initialized_barrier(&frame));
     session.close();
+    session
+        .join_writer_until(Instant::now() + Duration::from_secs(1))
+        .unwrap();
 }
 
 #[test]
@@ -691,6 +994,219 @@ fn immediate_ready_after_initialized_flush_accepts_once_and_duplicate_fails() {
         Some(SessionEvent::HandshakeFailed)
     ));
     session.close();
+}
+
+/// Run one writer-barrier round with explicit cleanup so a failed assertion
+/// cannot leave the blocked writer actor detached from the test process.
+fn run_immediate_ready_barrier_round(round: u64) -> Result<(), String> {
+    let (server_reader, server_writer) = pipe_pair();
+    let token = if round.is_multiple_of(2) {
+        "fedcba9876543210fedcba9876543210"
+    } else {
+        "0123456789abcdef0123456789abcdef"
+    };
+    let ready = RpcFrame::notification(
+        "runtime/statusChanged",
+        json!({
+            "serverInstanceId":"srv_fixture",
+            "eventId":format!("evt_barrier_{round}"),
+            "occurredAt":"2099-01-01T00:00:00Z",
+            "status":"ready",
+            "readyToken":token
+        }),
+    )
+    .map_err(|error| format!("ready frame construction: {error}"))?
+    .encode(Limits::default().max_frame_bytes)
+    .map_err(|error| format!("ready frame encoding: {error}"))?;
+    let (ready_sent_sender, ready_sent_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let (flush_done_sender, flush_done_receiver) = mpsc::channel();
+    let writer = ImmediateReadyWriter {
+        ready_sender: server_writer.sender.clone(),
+        ready_payload: Some(ready),
+        ready_sent: ready_sent_sender,
+        release_flush: release_receiver,
+        flush_done: flush_done_sender,
+    };
+    let session = Session::from_io(
+        server_reader,
+        writer,
+        EmptyReader,
+        round + 100,
+        Limits::default(),
+    )
+    .map_err(|error| format!("session construction: {error}"))?;
+    session
+        .install_ready_token_challenge(token.to_owned())
+        .map_err(|error| format!("challenge install: {error}"))?;
+    let mut pump = session
+        .take_event_pump()
+        .map_err(|error| format!("event pump: {error}"))?;
+    let notify_result = session.notify("initialized", json!({"readyToken":token}));
+    let ready_sent_result = ready_sent_receiver.recv_timeout(Duration::from_secs(1));
+    let release_result = release_sender.send(());
+    let flush_result = flush_done_receiver.recv_timeout(Duration::from_secs(1));
+    let event = pump.next_event(Duration::from_secs(1));
+    let promotion_result = match &event {
+        Some(SessionEvent::Notification(frame)) => session
+            .with_ready_promotion(frame, || Ok(()))
+            .map_err(|error| format!("ready promotion: {error}")),
+        _ => Err("immediate ready was rejected before barrier publication".to_owned()),
+    };
+
+    // Release the writer before close so even a failed event assertion owns a
+    // bounded path to join; this is the same cleanup boundary as production.
+    session.close();
+    let join_result = session.join_writer_until(Instant::now() + Duration::from_secs(1));
+
+    notify_result.map_err(|error| format!("initialized notify: {error}"))?;
+    ready_sent_result.map_err(|error| format!("ready publication: {error}"))?;
+    release_result.map_err(|error| format!("flush release: {error}"))?;
+    flush_result.map_err(|error| format!("flush completion: {error}"))?;
+    join_result.map_err(|error| format!("writer join: {error}"))?;
+    promotion_result
+}
+
+/// Repeat the production Session reader/writer barrier path without sleeps so
+/// the immediate child reply race remains covered across scheduler interleavings.
+#[test]
+fn immediate_ready_writer_barrier_is_stable_for_100_rounds() {
+    for round in 0..100 {
+        run_immediate_ready_barrier_round(round)
+            .unwrap_or_else(|error| panic!("writer barrier round {round} failed: {error}"));
+    }
+}
+
+/// 证明 ready 在 write 返回前到达时会等待同一把门，成功 flush 后才能进入事件队列。
+#[test]
+fn ready_before_write_return_waits_then_promotes() {
+    let (server_reader, server_writer) = pipe_pair();
+    let token = "0123456789abcdef0123456789abcdef";
+    let ready = RpcFrame::notification(
+        "runtime/statusChanged",
+        json!({
+            "serverInstanceId":"srv_fixture",
+            "eventId":"evt_write_window",
+            "occurredAt":"2099-01-01T00:00:00Z",
+            "status":"ready",
+            "readyToken":token
+        }),
+    )
+    .unwrap()
+    .encode(Limits::default().max_frame_bytes)
+    .unwrap();
+    let (ready_sent_sender, ready_sent_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let (write_done_sender, write_done_receiver) = mpsc::channel();
+    let (flush_done_sender, flush_done_receiver) = mpsc::channel();
+    let session = Session::from_io(
+        server_reader,
+        ReadyBeforeWriteReturnWriter {
+            ready_sender: server_writer.sender.clone(),
+            ready_payload: Some(ready),
+            ready_sent: ready_sent_sender,
+            release_write: release_receiver,
+            write_done: write_done_sender,
+            flush_done: flush_done_sender,
+        },
+        EmptyReader,
+        140,
+        Limits::default(),
+    )
+    .unwrap();
+    session
+        .install_ready_token_challenge(token.to_owned())
+        .unwrap();
+    let mut pump = session.take_event_pump().unwrap();
+    session
+        .notify("initialized", json!({"readyToken":token}))
+        .unwrap();
+    ready_sent_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("ready sent before write returned");
+    assert!(pump.next_event(Duration::from_millis(50)).is_none());
+    release_sender.send(()).unwrap();
+    write_done_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("write returned");
+    flush_done_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("flush completed");
+    assert!(session.wait_initialized_confirmation(Duration::from_secs(1)));
+    let SessionEvent::Notification(frame) = pump
+        .next_event(Duration::from_secs(1))
+        .expect("ready after write barrier")
+    else {
+        panic!("expected ready notification after write barrier");
+    };
+    assert!(session.ready_after_initialized_barrier(&frame));
+    session.close();
+    session
+        .join_writer_until(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+/// 证明 flush 失败会把共享门置为 Failed，ready 既不能晋级也不能留下 confirmation。
+#[test]
+fn ready_during_flush_failure_fails_closed_without_confirmation() {
+    let (server_reader, server_writer) = pipe_pair();
+    let token = "fedcba9876543210fedcba9876543210";
+    let ready_frame = RpcFrame::notification(
+        "runtime/statusChanged",
+        json!({
+            "serverInstanceId":"srv_fixture",
+            "eventId":"evt_flush_failure",
+            "occurredAt":"2099-01-01T00:00:00Z",
+            "status":"ready",
+            "readyToken":token
+        }),
+    )
+    .unwrap();
+    let ready = ready_frame
+        .encode(Limits::default().max_frame_bytes)
+        .unwrap();
+    let (ready_sent_sender, ready_sent_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let (flush_done_sender, flush_done_receiver) = mpsc::channel();
+    let session = Session::from_io(
+        server_reader,
+        FlushFailureWriter {
+            ready_sender: server_writer.sender.clone(),
+            ready_payload: Some(ready),
+            ready_sent: ready_sent_sender,
+            release_flush: release_receiver,
+            flush_done: flush_done_sender,
+        },
+        EmptyReader,
+        141,
+        Limits::default(),
+    )
+    .unwrap();
+    session
+        .install_ready_token_challenge(token.to_owned())
+        .unwrap();
+    let mut pump = session.take_event_pump().unwrap();
+    session
+        .notify("initialized", json!({"readyToken":token}))
+        .unwrap();
+    ready_sent_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("ready sent during blocked flush");
+    assert!(pump.next_event(Duration::from_millis(50)).is_none());
+    release_sender.send(()).unwrap();
+    flush_done_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("flush failed after release");
+    assert!(matches!(
+        pump.next_event(Duration::from_secs(1)),
+        Some(SessionEvent::HandshakeFailed)
+    ));
+    assert!(!session.wait_initialized_confirmation(Duration::from_millis(50)));
+    assert!(!session.ready_after_initialized_barrier(&ready_frame));
+    session.close();
+    session
+        .join_writer_until(Instant::now() + Duration::from_secs(1))
+        .unwrap();
 }
 
 /// 锁定错误 token 会直接终止当前 generation，而不是拖到 ready deadline。
@@ -820,6 +1336,110 @@ fn blocked_writer_watchdog_fails_closed_and_unblocks_operation() {
     session
         .join_writer_until(Instant::now() + Duration::from_secs(1))
         .expect("fake writer actor must be joined after callback cancellation");
+}
+
+/// A watchdog timeout remains terminal even when write completes afterward;
+/// ready must stay behind the failed barrier and cleanup must still join.
+#[test]
+fn late_write_after_watchdog_timeout_cannot_promote_ready() {
+    let reader_release = Arc::new(AtomicBool::new(false));
+    let writer_release = Arc::new(AtomicBool::new(false));
+    let (server_reader, server_writer) = pipe_pair();
+    let token = "0123456789abcdef0123456789abcdef";
+    let ready_frame = RpcFrame::notification(
+        "runtime/statusChanged",
+        json!({
+            "serverInstanceId":"srv_fixture",
+            "eventId":"evt_late_watchdog",
+            "occurredAt":"2099-01-01T00:00:00Z",
+            "status":"ready",
+            "readyToken":token
+        }),
+    )
+    .unwrap();
+    let ready = ready_frame
+        .encode(Limits::default().max_frame_bytes)
+        .unwrap();
+    let (ready_sent_sender, ready_sent_receiver) = mpsc::channel();
+    let (frame_read_sender, frame_read_receiver) = mpsc::channel();
+    let (write_done_sender, write_done_receiver) = mpsc::channel();
+    let (terminal_sender, terminal_receiver) = mpsc::channel();
+    let writer_release_for_callback = Arc::clone(&writer_release);
+    let reader_release_for_callback = Arc::clone(&reader_release);
+    let callback: TerminalCallback = Arc::new(move |reason: TerminalReason| {
+        writer_release_for_callback.store(true, Ordering::Release);
+        reader_release_for_callback.store(true, Ordering::Release);
+        let _ = terminal_sender.send(reason);
+    });
+    let session = Session::from_io_with_terminal_watchdog(
+        LateWatchdogReader {
+            inner: server_reader,
+            frame_read: frame_read_sender,
+            release: Arc::clone(&reader_release),
+            first_read: true,
+        },
+        LateWatchdogReadyWriter {
+            ready_sender: server_writer.sender.clone(),
+            ready_payload: Some(ready),
+            ready_sent: ready_sent_sender,
+            release_write: Arc::clone(&writer_release),
+            write_done: write_done_sender,
+        },
+        EmptyReader,
+        142,
+        Limits::default(),
+        Some(callback),
+        Duration::from_millis(40),
+    )
+    .unwrap();
+    session
+        .install_ready_token_challenge(token.to_owned())
+        .unwrap();
+    let mut pump = session.take_event_pump().unwrap();
+    session
+        .notify("initialized", json!({"readyToken":token}))
+        .unwrap();
+    ready_sent_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("ready sent before late write completion");
+    frame_read_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("ready frame read before watchdog timeout");
+    assert_eq!(
+        terminal_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("watchdog terminal callback"),
+        TerminalReason::Fault
+    );
+    write_done_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("late write completed after timeout");
+    assert!(!session.wait_initialized_confirmation(Duration::from_millis(50)));
+    assert!(!session.ready_after_initialized_barrier(&ready_frame));
+
+    let mut saw_writer_timeout = false;
+    for _ in 0..3 {
+        match pump.next_event(Duration::from_secs(1)) {
+            Some(SessionEvent::Notification(_)) => {
+                panic!("ready notification must not pass a timed-out barrier")
+            }
+            Some(SessionEvent::HandshakeFailed) => {
+                // A closed queue may retain this terminal classification;
+                // either way the ready notification must never be delivered.
+            }
+            Some(SessionEvent::WriterTimedOut) => saw_writer_timeout = true,
+            Some(SessionEvent::ProtocolFault(_)) | Some(SessionEvent::Eof) => {}
+            Some(_) | None => break,
+        }
+    }
+    assert!(
+        saw_writer_timeout,
+        "watchdog timeout must remain observable as DeadlineExceeded"
+    );
+    session.close();
+    session
+        .join_writer_until(Instant::now() + Duration::from_secs(1))
+        .expect("late writer must be joined after watchdog timeout");
 }
 
 #[test]

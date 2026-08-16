@@ -20,6 +20,8 @@ pub const MIN_MAX_FRAME_BYTES: usize = 1024;
 pub const MAX_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_REQUEST_ID_BYTES: usize = 98;
 pub const MAX_METHOD_BYTES: usize = 128;
+const READY_TOKEN_FIELD: &str = "readyToken";
+const READY_TOKEN_HEX_BYTES: usize = 32;
 
 /// 协商后的有界资源，使用协议默认值保持 Java 与 Rust 首次握手一致。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,8 +400,19 @@ impl RpcFrame {
             error_object.insert("data".to_owned(), error.data.clone());
             object.insert("error".to_owned(), Value::Object(error_object));
         }
-        let mut encoded =
-            serde_json::to_vec(&Value::Object(object)).map_err(|_| CodecError::InvalidJson)?;
+        let value = Value::Object(object);
+        let allow_ready_token_path = self.method.as_deref() == Some("initialized")
+            || (self.method.as_deref() == Some("runtime/statusChanged")
+                && self
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("ready"));
+        // Re-run the raw guard after reconstructing the wire object so future
+        // fields added to RpcFrame cannot bypass the outbound redaction gate.
+        reject_raw_token_markers(&value, allow_ready_token_path)?;
+        let mut encoded = serde_json::to_vec(&value).map_err(|_| CodecError::InvalidJson)?;
         if encoded.len() > max_frame_bytes {
             return Err(CodecError::FrameTooLarge {
                 actual: encoded.len(),
@@ -431,11 +444,15 @@ impl RpcFrame {
         if let Some(error) = &self.error {
             validate_error(error)?;
         }
-        if self.result.value().is_some_and(|value| {
-            contains_ready_token_key(value) || contains_token_shaped_string(value)
-        }) || self.error.as_ref().is_some_and(|error| {
-            contains_ready_token_key(&error.data) || contains_token_shaped_string(&error.data)
-        }) {
+        if self
+            .result
+            .value()
+            .is_some_and(contains_token_shaped_marker)
+            || self
+                .error
+                .as_ref()
+                .is_some_and(|error| contains_token_shaped_marker(&error.data))
+        {
             return Err(CodecError::InvalidEnvelope);
         }
         let response = self.method.is_none()
@@ -532,6 +549,8 @@ pub fn decode_frame(frame: &[u8], max_frame_bytes: usize) -> Result<RpcFrame, Co
             .and_then(|params| params.get("status"))
             .and_then(Value::as_str)
             == Some("ready");
+    let initialized_frame = object.get("method").and_then(Value::as_str) == Some("initialized");
+    reject_raw_token_markers(&value, initialized_frame || ready_frame)?;
     reject_unknown_root_token_metadata(object, ready_frame)?;
     if object.get("jsonrpc") != Some(&Value::String("2.0".to_owned())) {
         return Err(CodecError::InvalidEnvelope);
@@ -575,6 +594,49 @@ pub fn decode_frame(frame: &[u8], max_frame_bytes: usize) -> Result<RpcFrame, Co
     Ok(frame)
 }
 
+/// 在错误投影和未知字段丢弃之前审计整帧，防止 ready challenge 藏入 error.detail。
+///
+/// `RpcError` 只保留稳定 catalog 字段，因此必须在构造受限 projection 之前递归检查
+/// 原始 JSON；否则 `error.data.details.readyToken` 会在 parse_error 后永久丢失。
+fn reject_raw_token_markers(value: &Value, allow_ready_token_path: bool) -> Result<(), CodecError> {
+    fn visit(value: &Value, path: &mut Vec<String>, allow_ready_token_path: bool) -> bool {
+        match value {
+            Value::Object(object) => object.iter().any(|(key, child)| {
+                path.push(key.clone());
+                let legal_ready_path = allow_ready_token_path
+                    && path.len() == 2
+                    && path[0] == "params"
+                    && key == "readyToken";
+                let forbidden_key =
+                    (is_ready_token_key(key) || is_token_shaped(key)) && !legal_ready_path;
+                let forbidden_value =
+                    child.as_str().is_some_and(is_token_shaped) && !legal_ready_path;
+                let nested = !legal_ready_path && visit(child, path, allow_ready_token_path);
+                path.pop();
+                forbidden_key || forbidden_value || nested
+            }),
+            Value::Array(values) => values.iter().enumerate().any(|(index, child)| {
+                path.push(format!("[{index}]"));
+                let nested = visit(child, path, allow_ready_token_path);
+                path.pop();
+                nested
+            }),
+            Value::String(text) => is_token_shaped(text),
+            Value::Null | Value::Bool(_) | Value::Number(_) => false,
+        }
+    }
+
+    let mut path = Vec::new();
+    if visit(value, &mut path, allow_ready_token_path) {
+        return Err(if allow_ready_token_path {
+            CodecError::HandshakeFailed
+        } else {
+            CodecError::InvalidEnvelope
+        });
+    }
+    Ok(())
+}
+
 /// 只允许握手的两个精确 params 位置携带 readyToken，防止未知 root 扩展绕过脱敏边界。
 fn validate_ready_token_fields(method: &str, params: &Value) -> Result<(), CodecError> {
     let object = params.as_object().ok_or(CodecError::InvalidEnvelope)?;
@@ -582,7 +644,7 @@ fn validate_ready_token_fields(method: &str, params: &Value) -> Result<(), Codec
         "initialized"
             if object.len() != 1
                 || !object
-                    .get("readyToken")
+                    .get(READY_TOKEN_FIELD)
                     .and_then(Value::as_str)
                     .is_some_and(valid_ready_token) =>
         {
@@ -593,35 +655,26 @@ fn validate_ready_token_fields(method: &str, params: &Value) -> Result<(), Codec
             if object.get("status").and_then(Value::as_str) == Some("ready") =>
         {
             if !object
-                .get("readyToken")
+                .get(READY_TOKEN_FIELD)
                 .and_then(Value::as_str)
                 .is_some_and(valid_ready_token)
             {
                 return Err(CodecError::HandshakeFailed);
             }
             for (key, value) in object {
-                if key != "readyToken"
-                    && (valid_ready_token(key) || contains_token_shaped_marker(value))
+                if key != READY_TOKEN_FIELD
+                    && (is_ready_token_key(key)
+                        || is_token_shaped(key)
+                        || contains_token_shaped_marker(value))
                 {
                     return Err(CodecError::HandshakeFailed);
                 }
             }
         }
-        _ if contains_ready_token_key(params) => return Err(CodecError::InvalidEnvelope),
+        _ if contains_token_shaped_marker(params) => return Err(CodecError::InvalidEnvelope),
         _ => {}
     }
     Ok(())
-}
-
-/// 递归发现 readyToken 字段，避免 nested extension 将 challenge 伪装成普通数据。
-fn contains_ready_token_key(value: &Value) -> bool {
-    match value {
-        Value::Object(object) => object
-            .iter()
-            .any(|(key, child)| key == "readyToken" || contains_ready_token_key(child)),
-        Value::Array(values) => values.iter().any(contains_ready_token_key),
-        _ => false,
-    }
 }
 
 /// 未知 root 字段不会进入 RpcFrame，先检查其 token 标记，避免丢弃后无法做安全审计。
@@ -634,7 +687,7 @@ fn reject_unknown_root_token_metadata(
         if KNOWN.contains(&key.as_str()) {
             continue;
         }
-        if key == "readyToken" || valid_ready_token(key) || contains_token_shaped_marker(value) {
+        if is_ready_token_key(key) || is_token_shaped(key) || contains_token_shaped_marker(value) {
             return Err(if ready_frame {
                 CodecError::HandshakeFailed
             } else {
@@ -645,40 +698,40 @@ fn reject_unknown_root_token_metadata(
     Ok(())
 }
 
-/// 未知 root 扩展的 challenge 值会在 decode 后丢失，因此对固定形状值保守拒绝。
-fn contains_token_shaped_string(value: &Value) -> bool {
-    match value {
-        Value::String(text) => valid_ready_token(text),
-        Value::Object(object) => object.values().any(contains_token_shaped_string),
-        Value::Array(values) => values.iter().any(contains_token_shaped_string),
-        _ => false,
-    }
-}
-
 /// 递归拒绝 ready frame 中任意 token-shaped key/value，避免 challenge 藏入扩展字段。
 pub(super) fn contains_token_shaped_marker(value: &Value) -> bool {
     match value {
         Value::Object(object) => object.iter().any(|(key, child)| {
-            key == "readyToken" || valid_ready_token(key) || contains_token_shaped_marker(child)
+            is_ready_token_key(key) || is_token_shaped(key) || contains_token_shaped_marker(child)
         }),
         Value::Array(values) => values.iter().any(contains_token_shaped_marker),
-        Value::String(text) => valid_ready_token(text),
+        Value::String(text) => is_token_shaped(text),
         _ => false,
     }
 }
 
-/// 校验 v1 challenge 的固定 128-bit 十六进制形状，不接受短值或 Unicode 字符。
+/// 校验 v1 challenge 的固定小写十六进制文本，不接受短值、Unicode 或大小写变体。
 pub fn valid_ready_token(value: &str) -> bool {
-    value.len() == 32
+    value.len() == READY_TOKEN_HEX_BYTES
         && value
             .as_bytes()
             .iter()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// 识别 token 的固定长度 ASCII hex 形状，大小写不敏感但不接受 Unicode hex。
+pub(super) fn is_token_shaped(value: &str) -> bool {
+    value.len() == READY_TOKEN_HEX_BYTES && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
+/// 识别 readyToken 字段的 ASCII 大小写变体，只有精确字段名才能走握手例外。
+pub(super) fn is_ready_token_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case(READY_TOKEN_FIELD)
+}
+
 /// Redact an exact challenge-shaped text without retaining the original in a debug buffer.
 fn redact_debug_text(value: &str) -> String {
-    if valid_ready_token(value) {
+    if is_token_shaped(value) {
         "<redacted>".to_owned()
     } else {
         value.to_owned()
@@ -692,7 +745,7 @@ fn redact_debug_value(value: &Value) -> Value {
             object
                 .iter()
                 .map(|(key, child)| {
-                    let safe_key = if key == "readyToken" || valid_ready_token(key) {
+                    let safe_key = if is_ready_token_key(key) || is_token_shaped(key) {
                         "<redacted>".to_owned()
                     } else {
                         key.to_owned()

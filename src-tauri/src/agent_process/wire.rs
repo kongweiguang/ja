@@ -221,21 +221,24 @@ pub(super) fn writer_loop<W: Write + Send + 'static>(
             .and_then(|frame| frame.method().map(str::to_owned))
             .as_deref()
             == Some("initialized");
-        let written = write_frame_with_watchdog(writer, frame, inner.write_timeout, &inner);
-        let Ok(next_writer) = written else {
-            inner.events.push(
-                SessionEvent::ProtocolFault(codec::CodecError::Io),
-                EventPriority::Control,
-                QueueKind::Control,
-            );
-            fail_closed(&inner);
-            break;
+        let written =
+            write_frame_with_watchdog(writer, frame, inner.write_timeout, &inner, is_initialized);
+        let next_writer = match written {
+            Ok(next_writer) => next_writer,
+            Err(error) => {
+                let event = if matches!(error, AgentProcessError::DeadlineExceeded) {
+                    SessionEvent::WriterTimedOut
+                } else {
+                    SessionEvent::ProtocolFault(codec::CodecError::Io)
+                };
+                inner
+                    .events
+                    .push(event, EventPriority::Control, QueueKind::Control);
+                fail_closed(&inner);
+                break;
+            }
         };
         writer = next_writer;
-        if is_initialized {
-            inner.initialized_confirmed.store(true, Ordering::Release);
-            inner.initialized_wake.notify_all();
-        }
         observed_sequence = wake.snapshot();
     }
     if !closed.load(Ordering::Acquire) {
@@ -251,12 +254,20 @@ fn write_frame_with_watchdog<W: Write>(
     frame: Vec<u8>,
     timeout: Duration,
     inner: &Arc<SessionInner>,
+    is_initialized: bool,
 ) -> Result<W, AgentProcessError> {
+    // Hold the same gate used by reader ready-claiming across both I/O calls;
+    // this makes the handshake linearization independent of pipe timing.
+    let initialized_guard = if is_initialized {
+        Some(inner.initialized_barrier.begin_send()?)
+    } else {
+        None
+    };
     let (cancel_sender, cancel_receiver) = mpsc::sync_channel(1);
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watchdog_timed_out = Arc::clone(&timed_out);
     let watchdog_inner = Arc::clone(inner);
-    let watchdog = thread::Builder::new()
+    let watchdog = match thread::Builder::new()
         .name("ja-sidecar-write-watchdog".to_owned())
         .spawn(move || {
             match cancel_receiver.recv_timeout(timeout) {
@@ -270,11 +281,32 @@ fn write_frame_with_watchdog<W: Write>(
                     true
                 }
             }
-        })
-        .map_err(|_| AgentProcessError::Spawn)?;
-    let result = writer.write_all(&frame).and_then(|_| writer.flush());
+        }) {
+        Ok(watchdog) => watchdog,
+        Err(_) => {
+            if let Some(guard) = initialized_guard {
+                guard.complete(false);
+            }
+            return Err(AgentProcessError::Spawn);
+        }
+    };
+    let write_result = writer.write_all(&frame);
+    let result = write_result.and_then(|_| writer.flush());
     let _ = cancel_sender.send(());
-    let watchdog_fired = watchdog.join().map_err(|_| AgentProcessError::Spawn)?;
+    let watchdog_fired = match watchdog.join() {
+        Ok(fired) => fired || timed_out.load(Ordering::Acquire),
+        Err(_) => {
+            if let Some(guard) = initialized_guard {
+                guard.complete(false);
+            }
+            return Err(AgentProcessError::Spawn);
+        }
+    };
+    // Do not publish Confirmed until the watchdog has joined; a late write
+    // completion after timeout must remain fail-closed for any waiting ready.
+    if let Some(guard) = initialized_guard {
+        guard.complete(result.is_ok() && !watchdog_fired && !inner.closed.load(Ordering::Acquire));
+    }
     if watchdog_fired || timed_out.load(Ordering::Acquire) {
         return Err(AgentProcessError::DeadlineExceeded);
     }
@@ -523,7 +555,8 @@ fn frame_payload_is_safe(frame: &RpcFrame, inner: &Arc<SessionInner>, ready: boo
             value.as_str() == Some(expected.as_str()) && codec::valid_ready_token(&expected)
         } else {
             !forbidden.contains(key)
-                && !codec::valid_ready_token(key)
+                && !codec::is_ready_token_key(key)
+                && !codec::is_token_shaped(key)
                 && !codec::contains_token_shaped_marker(value)
                 && !contains_forbidden_token(value, &forbidden)
         }
@@ -537,7 +570,8 @@ fn contains_forbidden_token(
 ) -> bool {
     match value {
         serde_json::Value::Object(object) => object.iter().any(|(key, child)| {
-            key == "readyToken"
+            codec::is_ready_token_key(key)
+                || codec::is_token_shaped(key)
                 || forbidden.contains(key)
                 || contains_forbidden_token(child, forbidden)
         }),
@@ -711,6 +745,7 @@ pub(super) fn is_terminal_event(event: &SessionEvent) -> bool {
     matches!(
         event,
         SessionEvent::ProtocolFault(_)
+            | SessionEvent::WriterTimedOut
             | SessionEvent::HandshakeFailed
             | SessionEvent::Eof
             | SessionEvent::QueueFatalOverflow(_)

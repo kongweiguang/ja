@@ -182,13 +182,9 @@ pub(super) fn is_runtime_ready_notification(frame: &RpcFrame) -> bool {
             == Some("ready")
 }
 
-/// 只接受 128-bit challenge 的固定十六进制文本，避免短 token 或 Unicode 伪造握手。
+/// 只接受 codec 定义的固定小写 hex challenge，避免大小写变体伪造握手。
 pub(super) fn valid_ready_token(value: &str) -> bool {
-    value.len() == READY_TOKEN_HEX_BYTES
-        && value
-            .as_bytes()
-            .iter()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    codec::valid_ready_token(value)
 }
 
 /// 从操作系统 CSPRNG 生成每个 generation 一次的新 challenge；失败必须让握手失败。

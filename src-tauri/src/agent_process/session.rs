@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,11 +44,16 @@ pub enum SessionEvent {
     StderrTruncated,
     ResponseRejected(ResolveDisposition),
     ProtocolFault(codec::CodecError),
+    /// writer watchdog 到期；supervisor 将其映射为可恢复的 DeadlineExceeded。
+    WriterTimedOut,
     HandshakeFailed,
     Eof,
     QueueOverflow(QueueKind),
     QueueFatalOverflow(QueueKind),
-    ProcessExited { generation: u64, code: Option<i32> },
+    ProcessExited {
+        generation: u64,
+        code: Option<i32>,
+    },
 }
 
 #[path = "events.rs"]
@@ -155,6 +160,139 @@ impl WriterJoinState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitializedBarrierState {
+    NotSent,
+    Sending,
+    Confirmed,
+    Failed,
+}
+
+/// initialized 的唯一发送/接收线性化门；reader 只能在 writer 完成 write+flush 后观察 Confirmed。
+struct InitializedBarrier {
+    state: Mutex<InitializedBarrierState>,
+    wake: Condvar,
+}
+
+/// writer 持有此 guard 覆盖整个 initialized write+flush，避免 ready 在中间窗口越过握手门。
+struct InitializedSendGuard<'a> {
+    barrier: &'a InitializedBarrier,
+    state: Option<MutexGuard<'a, InitializedBarrierState>>,
+}
+
+impl InitializedBarrier {
+    /// 创建尚未发送 initialized 的握手门，避免 ready 在任何写入前被误判为有效。
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(InitializedBarrierState::NotSent),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// 新 generation 重新打开握手门；调用方保证旧 writer 已经停止使用该 generation。
+    fn reset(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = InitializedBarrierState::NotSent;
+        self.wake.notify_all();
+    }
+
+    /// 在 writer 开始 I/O 前占住门，后续 guard 生命周期覆盖 write_all 与 flush。
+    fn begin_send(&self) -> Result<InitializedSendGuard<'_>, AgentProcessError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *state != InitializedBarrierState::NotSent {
+            return Err(AgentProcessError::HandshakeFailed);
+        }
+        *state = InitializedBarrierState::Sending;
+        Ok(InitializedSendGuard {
+            barrier: self,
+            state: Some(state),
+        })
+    }
+
+    /// 只有成功完成发送的 initialized 才能使 ready 观察到 Confirmed。
+    fn is_confirmed(&self) -> bool {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == InitializedBarrierState::Confirmed
+    }
+
+    /// 等待 writer 完成握手 I/O，失败态立即返回且不会留下可晋级标记。
+    fn wait_confirmation(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            match *state {
+                InitializedBarrierState::Confirmed => return true,
+                InitializedBarrierState::Failed => return false,
+                InitializedBarrierState::NotSent | InitializedBarrierState::Sending => {}
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, wait) = self
+                .wake
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if wait.timed_out() {
+                return *state == InitializedBarrierState::Confirmed;
+            }
+        }
+    }
+
+    /// ready 必须等待同一把门；因此 Sending 期间会短暂阻塞，Failed 期间永远拒绝。
+    fn claim_ready(&self, claimed: &AtomicBool, closed: &AtomicBool) -> bool {
+        let _state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if closed.load(Ordering::Acquire) || *_state != InitializedBarrierState::Confirmed {
+            return false;
+        }
+        claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+impl InitializedSendGuard<'_> {
+    /// 提交成功或失败的最终态后释放门并唤醒等待 ready 的 reader。
+    fn complete(mut self, confirmed: bool) {
+        if let Some(mut state) = self.state.take() {
+            *state = if confirmed {
+                InitializedBarrierState::Confirmed
+            } else {
+                InitializedBarrierState::Failed
+            };
+            self.barrier.wake.notify_all();
+        }
+    }
+}
+
+impl Drop for InitializedSendGuard<'_> {
+    /// 任意未正常提交的异常路径都 fail-closed，避免门永远停留在 Sending。
+    fn drop(&mut self) {
+        if let Some(mut state) = self.state.take() {
+            *state = InitializedBarrierState::Failed;
+            self.barrier.wake.notify_all();
+        }
+    }
+}
+
 struct SessionInner {
     generation: u64,
     limits: Limits,
@@ -170,10 +308,8 @@ struct SessionInner {
     ready_terminal_gate: Mutex<()>,
     event_pump_claimed: AtomicBool,
     terminal_callback: Mutex<Option<TerminalCallback>>,
-    /// 只有 writer 成功 flush initialized 后才置位，防止预排队 ready 晋级。
-    initialized_confirmed: AtomicBool,
-    initialized_lock: Mutex<()>,
-    initialized_wake: Condvar,
+    /// writer 与 reader 共用的 initialized 线性化门，避免 write/flush 中间的 ready 竞态。
+    initialized_barrier: InitializedBarrier,
     /// 当前 generation 的一次性 challenge；token 只存在内存中且不进入诊断。
     ready_token_challenge: Mutex<Option<String>>,
     /// 当前 generation 的 token 只用于递归拒绝重放，不对外暴露原值。
@@ -202,11 +338,8 @@ struct OutboundRequestLedger {
 impl SessionInner {
     /// Reader 先占用唯一 ready 槽位，防止多个 ready 在 lifecycle owner 处理前排队。
     fn claim_ready_notification(&self) -> bool {
-        self.initialized_confirmed.load(Ordering::Acquire)
-            && self
-                .ready_notification_claimed
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+        self.initialized_barrier
+            .claim_ready(&self.ready_notification_claimed, &self.closed)
     }
 }
 
@@ -398,9 +531,7 @@ impl Session {
             ready_terminal_gate: Mutex::new(()),
             event_pump_claimed: AtomicBool::new(false),
             terminal_callback: Mutex::new(terminal_callback),
-            initialized_confirmed: AtomicBool::new(false),
-            initialized_lock: Mutex::new(()),
-            initialized_wake: Condvar::new(),
+            initialized_barrier: InitializedBarrier::new(),
             ready_token_challenge: Mutex::new(None),
             forbidden_ready_tokens: Mutex::new(HashSet::new()),
             initialized_sent: AtomicBool::new(false),
@@ -661,9 +792,6 @@ impl Session {
                 return Err(AgentProcessError::HandshakeFailed);
             }
             self.inner
-                .initialized_confirmed
-                .store(false, Ordering::Release);
-            self.inner
                 .ready_token_consumed
                 .store(false, Ordering::Release);
         } else if contains_forbidden_ready_token(&params, &self.inner.forbidden_ready_tokens) {
@@ -736,35 +864,11 @@ impl Session {
         Ok(serde_json::json!({"readyToken": token}))
     }
 
-    /// 等待 writer 发布 initialized flush 事实，避免测试或 handshake 依赖时间猜测。
+    /// 等待 writer 发布 initialized 写入事实，避免测试或 handshake 依赖时间猜测。
     pub fn wait_initialized_confirmation(&self, timeout: Duration) -> bool {
-        if self.inner.initialized_confirmed.load(Ordering::Acquire) {
-            return true;
-        }
-        let deadline = Instant::now()
-            .checked_add(timeout.min(MAX_OPERATION_TIMEOUT))
-            .unwrap_or_else(Instant::now);
-        let mut lock = self
-            .inner
-            .initialized_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !self.inner.initialized_confirmed.load(Ordering::Acquire) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
-            let (next, wait) = self
-                .inner
-                .initialized_wake
-                .wait_timeout(lock, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            lock = next;
-            if wait.timed_out() {
-                return self.inner.initialized_confirmed.load(Ordering::Acquire);
-            }
-        }
-        true
+        self.inner
+            .initialized_barrier
+            .wait_confirmation(timeout.min(MAX_OPERATION_TIMEOUT))
     }
 
     /// 安装当前 generation 的 challenge；ready 接受只比较当前 session 的精确 token。
@@ -787,9 +891,7 @@ impl Session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
         self.inner.initialized_sent.store(false, Ordering::Release);
-        self.inner
-            .initialized_confirmed
-            .store(false, Ordering::Release);
+        self.inner.initialized_barrier.reset();
         self.inner
             .ready_notification_claimed
             .store(false, Ordering::Release);
@@ -799,7 +901,7 @@ impl Session {
         Ok(())
     }
 
-    /// 只有 initialized 已 flush 且 ready 原样回显当前 token 时才可晋级。
+    /// 只有 initialized 已写入且 ready 原样回显当前 token 时才可晋级。
     pub fn ready_after_initialized_barrier(&self, frame: &RpcFrame) -> bool {
         let _gate = self
             .inner
@@ -839,7 +941,7 @@ impl Session {
             return false;
         };
         if self.inner.closed.load(Ordering::Acquire)
-            || !self.inner.initialized_confirmed.load(Ordering::Acquire)
+            || !self.inner.initialized_barrier.is_confirmed()
         {
             return false;
         }
@@ -1018,18 +1120,17 @@ fn contains_forbidden_ready_token(value: &Value, forbidden: &Mutex<HashSet<Strin
 
 /// 在已持有当前 token 集合时递归执行 marker 检查，不返回原始 token 诊断。
 fn contains_forbidden_ready_token_with_set(value: &Value, forbidden: &HashSet<String>) -> bool {
-    match value {
-        Value::Object(object) => object.iter().any(|(key, child)| {
-            key == "readyToken"
-                || forbidden.contains(key)
-                || contains_forbidden_ready_token_with_set(child, forbidden)
-        }),
-        Value::Array(values) => values
-            .iter()
-            .any(|child| contains_forbidden_ready_token_with_set(child, forbidden)),
-        Value::String(text) => forbidden.contains(text),
-        _ => false,
-    }
+    codec::contains_token_shaped_marker(value)
+        || match value {
+            Value::Object(object) => object.iter().any(|(key, child)| {
+                forbidden.contains(key) || contains_forbidden_ready_token_with_set(child, forbidden)
+            }),
+            Value::Array(values) => values
+                .iter()
+                .any(|child| contains_forbidden_ready_token_with_set(child, forbidden)),
+            Value::String(text) => forbidden.contains(text),
+            _ => false,
+        }
 }
 
 /// 验证 ready 的单个 token 例外，同时拒绝其余位置的嵌套 marker/value。
@@ -1049,7 +1150,8 @@ fn ready_params_are_safe(
             child.as_str() == Some(expected) && valid_ready_token(expected)
         } else {
             !forbidden.contains(key)
-                && !valid_ready_token(key)
+                && !codec::is_ready_token_key(key)
+                && !codec::is_token_shaped(key)
                 && !codec::contains_token_shaped_marker(child)
                 && !contains_forbidden_ready_token_with_set(child, &forbidden)
         }
