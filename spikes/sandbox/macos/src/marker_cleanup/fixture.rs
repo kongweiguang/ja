@@ -15,6 +15,7 @@ use super::{
     MARKER_MODE, O_CLOEXEC_FLAG, O_NOFOLLOW_FLAG, cleanup_diagnostic_code,
     cleanup_diagnostic_stage, cleanup_markers_until,
     cleanup_markers_until_with_group_signal_hook_and_diagnostics, emit_cleanup_diagnostic_line,
+    marker_remove_diagnostic_code,
 };
 use crate::spawn_grouped;
 use std::fs::{self, File, OpenOptions};
@@ -1435,14 +1436,22 @@ where
                 | "post-signal-identity"
                 | "post-signal-reap"
                 | "post-signal-pgid"
+                | "marker-remove"
                 | "ack-write"
         ) {
             continue;
         }
-        sink(
-            cleanup_diagnostic_stage(stage),
-            cleanup_diagnostic_code(code),
-        );
+        if stage == "marker-remove" {
+            let Some(code) = marker_remove_diagnostic_code(code) else {
+                continue;
+            };
+            sink("marker-remove", code);
+        } else {
+            sink(
+                cleanup_diagnostic_stage(stage),
+                cleanup_diagnostic_code(code),
+            );
+        }
     }
 }
 
@@ -2737,6 +2746,7 @@ fn remove_fixture_root(root: PathBuf) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::format_cleanup_diagnostic_line;
     use super::{
         FIXTURE_DIAGNOSTIC_BYTES, FIXTURE_DIAGNOSTIC_DRAIN_BUDGET, FixtureAckProof,
         FixtureControlEvent, FixtureDiagnosticBuffer, FixtureEvidenceFault, FixtureFailureContext,
@@ -3065,6 +3075,9 @@ SANDBOX-MARKER-QUERY: stage=supervisor-status code=ok\n\
 SANDBOX-MARKER-QUERY: stage=post-signal-snapshot code=fixture-helper-comm\n\
 SANDBOX-MARKER-QUERY: stage=post-signal-pgid code=secret=/private/path\n\
 SANDBOX-MARKER-QUERY: stage=post-signal-reap code=fixture-helper-reap\n\
+SANDBOX-MARKER-QUERY: stage=marker-remove code=unlink\n\
+SANDBOX-MARKER-QUERY: stage=marker-remove code=begin\n\
+SANDBOX-MARKER-QUERY: stage=marker-remove code=/private/path\n\
 SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
         let mut seen = Vec::new();
         forward_fixture_diagnostics_with(input, |stage, code| {
@@ -3083,6 +3096,7 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
                     "post-signal-reap".to_owned(),
                     "fixture-helper-reap".to_owned()
                 ),
+                ("marker-remove".to_owned(), "unlink".to_owned()),
             ]
         );
 
@@ -3094,6 +3108,31 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
             invalid_seen.push((stage.to_owned(), code.to_owned()));
         });
         assert!(invalid_seen.is_empty());
+    }
+
+    /// Drive the producer formatter through the same bounded diagnostic
+    /// buffer and forwarder used by the fixture, proving valid marker removal
+    /// stages survive while malformed values produce no stderr record.
+    #[test]
+    fn marker_remove_producer_to_forwarder_preserves_closed_code() {
+        let line = format_cleanup_diagnostic_line("marker-remove", "unlink")
+            .expect("valid marker removal diagnostic");
+        let mut producer_output = line.into_bytes();
+        producer_output.push(b'\n');
+        let mut producer_reader = Cursor::new(producer_output);
+        let mut bounded_output = FixtureDiagnosticBuffer::default();
+        assert!(drain_fixture_diagnostics(
+            &mut producer_reader,
+            &mut bounded_output
+        ));
+
+        let mut seen = Vec::new();
+        forward_fixture_diagnostics_with(bounded_output.bytes(), |stage, code| {
+            seen.push((stage.to_owned(), code.to_owned()));
+        });
+        assert_eq!(seen, [("marker-remove".to_owned(), "unlink".to_owned())]);
+        assert!(format_cleanup_diagnostic_line("marker-remove", "/private/path").is_none());
+        assert!(format_cleanup_diagnostic_line("marker-remove", "identity=42").is_none());
     }
 
     /// Prove the production proof slot is single-use and rejects a second
