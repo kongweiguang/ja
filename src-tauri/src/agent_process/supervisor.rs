@@ -249,6 +249,10 @@ impl SidecarSupervisor {
                     self.fail_generation(generation);
                     return Err(AgentProcessError::HandshakeFailed);
                 }
+                Some(SessionEvent::WriterTimedOut) => {
+                    self.fail_generation(generation);
+                    return Err(AgentProcessError::DeadlineExceeded);
+                }
                 Some(
                     SessionEvent::ProtocolFault(_)
                     | SessionEvent::QueueFatalOverflow(_)

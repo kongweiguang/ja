@@ -51,6 +51,7 @@ fn event_size(event: &SessionEvent, max_frame_bytes: usize) -> usize {
             .unwrap_or(max_frame_bytes.saturating_add(1)),
         SessionEvent::StderrLine(line) => line.len(),
         SessionEvent::ProtocolFault(_) => 128,
+        SessionEvent::WriterTimedOut => 64,
         SessionEvent::HandshakeFailed => 64,
         SessionEvent::ResponseRejected(_) => 64,
         SessionEvent::StderrTruncated
