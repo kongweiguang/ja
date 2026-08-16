@@ -3,6 +3,11 @@
 
 //! Native-only integration gate.  A non-macOS build has no passing fallback.
 
+// Keep the cleanup hook/evidence seam executable on the Windows host; the
+// native acceptance test below remains macOS-only because it needs Seatbelt.
+#[path = "../src/marker_cleanup/hook_seam.rs"]
+mod portable_hook_seam;
+
 #[cfg(target_os = "macos")]
 mod macos_acceptance {
     use ja_macos_sandbox_spike::run_bounded_command;

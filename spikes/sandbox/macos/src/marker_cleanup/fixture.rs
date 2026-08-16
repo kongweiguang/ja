@@ -6,10 +6,10 @@
 use super::fd;
 use super::marker::write_fixture_marker;
 use super::process::{
-    EPERM, ProcessIdentity, abort_unreaped_query, classify_errno, current_pgid, current_uid,
-    probe_pid_group_until, query_identity_until, reap_child_bounded, reap_child_group_bounded,
-    reap_child_without_group_until, require_group_empty, set_nonblocking,
-    terminate_group_with_identity_fallback,
+    EPERM, GroupSignalRelease, ProcessIdentity, ProcessIdentityKey, abort_unreaped_query,
+    classify_errno, current_pgid, current_uid, probe_pid_group_until, query_identity_until,
+    reap_child_bounded, reap_child_group_bounded, reap_child_without_group_until,
+    require_group_empty, set_nonblocking, terminate_group_with_identity_fallback,
 };
 use super::{
     MARKER_MODE, O_CLOEXEC_FLAG, O_NOFOLLOW_FLAG, cleanup_markers_until,
@@ -268,6 +268,39 @@ where
     Ok(())
 }
 
+/// Hold one supervisor ACK proof for exactly one captured target. A later
+/// marker group or callback invocation deliberately falls back to normal
+/// identity validation instead of reusing the first target's proof.
+#[derive(Default)]
+struct FixtureAckProof {
+    key: Option<ProcessIdentityKey>,
+}
+
+impl FixtureAckProof {
+    /// Issue the proof once and bind it to all PID-reuse dimensions of the
+    /// current capture; repeated or cross-group calls cannot select Reaped.
+    fn issue_once(&mut self, captured: &ProcessIdentity) -> GroupSignalRelease {
+        if self.key.is_some() {
+            return GroupSignalRelease::Continue;
+        }
+        let key = ProcessIdentityKey::from_identity(captured);
+        self.key = Some(key.clone());
+        GroupSignalRelease::Reaped(key)
+    }
+
+    /// Route every production hook invocation through the one-shot proof
+    /// state machine, so a later marker group can never inherit the first
+    /// group's acknowledgement.
+    fn release_for(&mut self, captured: &ProcessIdentity) -> GroupSignalRelease {
+        self.issue_once(captured)
+    }
+
+    /// Report whether this one-shot protocol has already consumed its proof.
+    fn issued(&self) -> bool {
+        self.key.is_some()
+    }
+}
+
 /// Spawn a real descendant group, write a fixture marker, then let production
 /// cleanup signal and verify both direct PID and group reach exact ESRCH.
 fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
@@ -498,12 +531,19 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             "fixture-marker-write",
         );
     }
-    let mut handshake_ok = false;
+    // This flag only selects the supervisor's final bounded reap path after
+    // marker cleanup; it is deliberately not an authorization proof for any
+    // target group. The proof itself is carried by FixtureAckProof below.
+    let mut ack_handshake_succeeded = false;
     let result = {
         let mut handshake_error = None;
-        let mut signal_hook = || {
-            if handshake_ok {
-                return Ok(());
+        let mut ack_proof = FixtureAckProof::default();
+        let mut signal_hook = |captured: &ProcessIdentity| {
+            if ack_proof.issued() {
+                // The one-shot proof cannot authorize another marker group or
+                // a repeated callback; Continue forces the normal identity
+                // revalidation path instead of reusing the first ACK.
+                return Ok(GroupSignalRelease::Continue);
             }
             if let Some(error) = handshake_error {
                 return Err(error);
@@ -515,8 +555,8 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             .map_err(|_| "marker-query-unreaped");
             match result {
                 Ok(()) => {
-                    handshake_ok = true;
-                    Ok(())
+                    ack_handshake_succeeded = true;
+                    Ok(ack_proof.release_for(captured))
                 }
                 Err(error) => {
                     handshake_error = Some(error);
@@ -541,7 +581,7 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
         launcher_group,
         &identity,
         fixture_deadline,
-        handshake_ok,
+        ack_handshake_succeeded,
     );
     if result.is_err() {
         // Preserve only the production report's fixed category so a native
@@ -557,7 +597,7 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             category,
         );
     }
-    if !handshake_ok {
+    if !ack_handshake_succeeded {
         return finish_descendant_failure(
             &root,
             launcher_identity.as_ref(),
@@ -2008,15 +2048,15 @@ fn remove_fixture_root(root: PathBuf) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FixtureControlEvent, FixtureEvidenceFault, FixtureFailureContext, ProcessIdentity,
-        accept_launcher_identity, classify_fixture_control, complete_fixture_reap_handshake,
-        control_setup_state, finish_fixture_failure_with, fixture_cleanup_failure_category,
-        fixture_group_failure_reason, fixture_paths, is_fixture_reap_ack,
-        persist_fixture_failure_pair_until, wait_child_exit_until,
+        FixtureAckProof, FixtureControlEvent, FixtureEvidenceFault, FixtureFailureContext,
+        GroupSignalRelease, ProcessIdentity, accept_launcher_identity, classify_fixture_control,
+        complete_fixture_reap_handshake, control_setup_state, finish_fixture_failure_with,
+        fixture_cleanup_failure_category, fixture_group_failure_reason, fixture_paths,
+        is_fixture_reap_ack, persist_fixture_failure_pair_until, wait_child_exit_until,
         write_fixture_failure_evidence_until, write_fixture_failure_evidence_with_fault,
     };
     use crate::marker_cleanup::process::{
-        ProcessState, group_state, reap_child_group_bounded, set_nonblocking,
+        ProcessState, current_uid, group_state, reap_child_group_bounded, set_nonblocking,
     };
     use crate::spawn_grouped;
     use std::fs;
@@ -2094,6 +2134,32 @@ mod tests {
         ] {
             assert_eq!(is_fixture_reap_ack(line), line == "target-reaped=true\n");
         }
+    }
+
+    /// Prove the production proof slot is single-use and rejects a second
+    /// marker group, including PID reuse with a changed start/comm/PGID.
+    #[test]
+    fn fixture_ack_proof_is_single_use_and_target_bound() {
+        let target = ProcessIdentity {
+            pid: 42,
+            pgid: 43,
+            uid: current_uid(),
+            comm: "target".to_owned(),
+            start_identity: "start".to_owned(),
+        };
+        let mut proof = FixtureAckProof::default();
+        match proof.release_for(&target) {
+            GroupSignalRelease::Reaped(key) => assert!(key.matches(&target)),
+            GroupSignalRelease::Continue => panic!("first proof was not issued"),
+        }
+        assert_eq!(proof.release_for(&target), GroupSignalRelease::Continue);
+        let reused = ProcessIdentity {
+            pgid: 44,
+            comm: "other".to_owned(),
+            start_identity: "reused".to_owned(),
+            ..target
+        };
+        assert_eq!(proof.release_for(&reused), GroupSignalRelease::Continue);
     }
 
     /// Exercise the acknowledgement reader against real nonblocking pipes so

@@ -4,6 +4,7 @@
 //! Native marker cleanup shared by the workflow and its fixture tests.
 
 mod fd;
+mod hook_seam;
 mod marker;
 mod process;
 mod process_scan;
@@ -17,8 +18,9 @@ use marker::{
     MarkerRecord, PendingMarker, parse_cleaned_record_from_file, scan_root_from_directory,
 };
 use process::{
-    ProcessIdentity, ProcessState, current_pgid, probe_pid_group_until, query_identity_until,
-    terminate_group_with_identity_fallback, terminate_group_with_identity_fallback_hook,
+    GroupSignalRelease, ProcessIdentity, ProcessIdentityKey, ProcessState, current_pgid,
+    probe_pid_group_until, query_identity_until, terminate_group_with_identity_fallback,
+    terminate_group_with_identity_fallback_hook,
 };
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -83,6 +85,8 @@ const O_CLOEXEC_FLAG: i32 = 0x0100_0000;
 const O_NOFOLLOW_FLAG: i32 = 0x0000_0100;
 
 type MarkerCleanupKey = (u32, u128, u32, i32, u64, u64, u64, u32, u32, u8);
+type GroupSignalHook<'a> =
+    dyn FnMut(&ProcessIdentity) -> Result<GroupSignalRelease, &'static str> + 'a;
 
 /// Build a complete marker identity for deduplication.  Owner/nonce alone is
 /// insufficient because suffixes, PGIDs, or inode replacements can represent
@@ -145,7 +149,7 @@ pub(super) fn cleanup_markers_until_with_group_signal_hook(
     report: &Path,
     allow_fixture: bool,
     cleanup_deadline: Instant,
-    on_group_signal: &mut dyn FnMut() -> Result<(), &'static str>,
+    on_group_signal: &mut GroupSignalHook<'_>,
 ) -> Result<(), &'static str> {
     cleanup_markers_until_impl(
         root,
@@ -163,7 +167,7 @@ fn cleanup_markers_until_impl(
     report: &Path,
     allow_fixture: bool,
     cleanup_deadline: Instant,
-    mut on_group_signal: Option<&mut dyn FnMut() -> Result<(), &'static str>>,
+    mut on_group_signal: Option<&mut GroupSignalHook<'_>>,
 ) -> Result<(), &'static str> {
     let own_pgid = current_pgid();
     if own_pgid <= 1 {
@@ -249,37 +253,60 @@ fn cleanup_markers_until_impl(
         if !group_valid || identities.is_empty() {
             continue;
         }
-        let termination = match on_group_signal.as_deref_mut() {
-            Some(hook) => terminate_group_with_identity_fallback_hook(
-                &identities[0],
-                &identities,
-                cleanup_deadline,
-                hook,
-            ),
-            None => terminate_group_with_identity_fallback(
-                &identities[0],
-                &identities,
-                cleanup_deadline,
-            ),
-        };
-        match termination {
-            Ok(()) => {
-                if remove_identity_markers(
-                    root,
-                    &root_directory,
-                    root_identity,
-                    &group_records,
-                    &mut report_categories,
-                    cleanup_deadline,
-                )
-                .is_err()
-                {
-                    report_categories.insert("marker-remove-failed");
+        match on_group_signal.as_deref_mut() {
+            Some(hook) => {
+                let mut observed_release = GroupSignalRelease::Continue;
+                let termination = {
+                    let mut capturing_hook = |captured: &ProcessIdentity| {
+                        let release = hook(captured)?;
+                        observed_release = release.clone();
+                        Ok(release)
+                    };
+                    terminate_group_with_identity_fallback_hook(
+                        &identities[0],
+                        &identities,
+                        cleanup_deadline,
+                        &mut capturing_hook,
+                    )
+                };
+                let hook_result = {
+                    let mut context = HookedGroupContext {
+                        root,
+                        root_directory: &root_directory,
+                        root_identity,
+                        records: &group_records,
+                        categories: &mut report_categories,
+                        deadline: cleanup_deadline,
+                    };
+                    finish_hooked_group(&mut context, &identities[0], observed_release, termination)
+                };
+                if let Err(category) = hook_result {
+                    report_categories.insert(category);
                 }
             }
-            Err(category) => {
-                report_categories.insert(category);
-            }
+            None => match terminate_group_with_identity_fallback(
+                &identities[0],
+                &identities,
+                cleanup_deadline,
+            ) {
+                Ok(()) => {
+                    if remove_identity_markers(
+                        root,
+                        &root_directory,
+                        root_identity,
+                        &group_records,
+                        &mut report_categories,
+                        cleanup_deadline,
+                    )
+                    .is_err()
+                    {
+                        report_categories.insert("marker-remove-failed");
+                    }
+                }
+                Err(category) => {
+                    report_categories.insert(category);
+                }
+            },
         }
     }
 
@@ -614,6 +641,69 @@ fn remove_identity_markers(
         drop(file);
     }
     result
+}
+
+/// Finish one production hook group through the portable residual/evidence
+/// state machine.  The real termination already ran before this function;
+/// retaining its release in the seam makes the same ordering testable with a
+/// controlled backend without duplicating the marker cleanup policy.
+struct HookedGroupContext<'a> {
+    root: &'a Path,
+    root_directory: &'a File,
+    root_identity: RootDirectoryIdentity,
+    records: &'a [&'a MarkerRecord],
+    categories: &'a mut BTreeSet<&'static str>,
+    deadline: Instant,
+}
+
+fn finish_hooked_group(
+    context: &mut HookedGroupContext<'_>,
+    identity: &ProcessIdentity,
+    observed_release: GroupSignalRelease,
+    termination: Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let HookedGroupContext {
+        root,
+        root_directory,
+        root_identity,
+        records,
+        categories,
+        deadline,
+    } = context;
+    let groups = [identity.clone()];
+    let mut hook = |_identity: &ProcessIdentity| Ok(observed_release.clone());
+    let mut residual = |_identity: &ProcessIdentity| termination;
+    let mut close = |_identity: &ProcessIdentity| {
+        remove_identity_markers(
+            root,
+            root_directory,
+            *root_identity,
+            records,
+            categories,
+            *deadline,
+        )
+        .map_err(|_| "marker-remove-failed")
+    };
+    let mut key_of = ProcessIdentityKey::from_identity;
+    let mut is_bound =
+        |release: &GroupSignalRelease, current: &ProcessIdentity| release.is_reaped_for(current);
+    let observation = hook_seam::drive_group_cleanup_sequence(
+        &groups,
+        &mut hook,
+        &mut residual,
+        &mut close,
+        &mut key_of,
+        &mut is_bound,
+    )
+    .into_iter()
+    .next()
+    .ok_or("marker-process-probe-failed")?;
+    match observation.disposition {
+        hook_seam::GroupEvidenceDisposition::Closed => Ok(()),
+        hook_seam::GroupEvidenceDisposition::Retained => {
+            Err(observation.failure.unwrap_or("marker-remove-failed"))
+        }
+    }
 }
 
 /// Re-open each marker through the held root fd with no-follow and fstatat

@@ -29,6 +29,30 @@ pub(super) enum ProcessState {
     Other(i32),
 }
 
+/// Describe what the post-group-signal owner has proved.  A normal hook only
+/// releases the cleanup state machine to revalidate the captured identity;
+/// the fixture acknowledgement additionally proves that the supervisor has
+/// reaped that exact target, so a transient direct-PID observation must be
+/// treated as liveness/residual state rather than a new identity query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GroupSignalRelease {
+    Continue,
+    Reaped(ProcessIdentityKey),
+}
+
+/// Immutable, path-free identity used to bind an acknowledgement to the
+/// exact process that was captured before signalling. Every field that can
+/// distinguish PID reuse is retained; no caller may authorize another target
+/// from a boolean acknowledgement alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessIdentityKey {
+    pid: u32,
+    pgid: i32,
+    uid: u32,
+    comm: String,
+    start_identity: String,
+}
+
 /// Capture both kernel liveness probes under one caller-owned deadline so a
 /// cleaned marker is garbage-collected only after PID and PGID both report
 /// the exact ESRCH state.
@@ -52,12 +76,40 @@ pub(super) fn probe_pid_group_until(
 
 /// Minimal identity data used to prevent PID reuse before a group signal.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(super) struct ProcessIdentity {
+pub(crate) struct ProcessIdentity {
     pub(super) pid: u32,
     pub(super) pgid: i32,
     pub(super) uid: u32,
     pub(super) comm: String,
     pub(super) start_identity: String,
+}
+
+impl ProcessIdentityKey {
+    /// Capture the stable identity tuple without copying any path or command
+    /// arguments into the acknowledgement protocol.
+    pub(crate) fn from_identity(identity: &ProcessIdentity) -> Self {
+        Self {
+            pid: identity.pid,
+            pgid: identity.pgid,
+            uid: identity.uid,
+            comm: identity.comm.clone(),
+            start_identity: identity.start_identity.clone(),
+        }
+    }
+
+    /// Require every captured field to match before an ACK can release the
+    /// liveness-only post-signal path.
+    pub(crate) fn matches(&self, identity: &ProcessIdentity) -> bool {
+        self == &Self::from_identity(identity)
+    }
+}
+
+impl GroupSignalRelease {
+    /// Only a proof carrying the current identity may select the no-requery
+    /// post-signal path; a stale or cross-target proof remains Continue.
+    pub(crate) fn is_reaped_for(&self, identity: &ProcessIdentity) -> bool {
+        matches!(self, Self::Reaped(key) if key.matches(identity))
+    }
 }
 
 /// Expose exact errno classification to the in-crate fixture and regression
@@ -267,7 +319,7 @@ pub(super) fn terminate_group(
     captured: &ProcessIdentity,
     deadline: Instant,
 ) -> Result<(), &'static str> {
-    let mut no_hook = || Ok(());
+    let mut no_hook = |_: &ProcessIdentity| Ok(GroupSignalRelease::Continue);
     terminate_group_with_hook(captured, deadline, &mut no_hook)
 }
 
@@ -277,11 +329,22 @@ pub(super) fn terminate_group(
 fn terminate_group_with_hook(
     captured: &ProcessIdentity,
     deadline: Instant,
-    on_group_signal: &mut dyn FnMut() -> Result<(), &'static str>,
+    on_group_signal: &mut dyn FnMut(&ProcessIdentity) -> Result<GroupSignalRelease, &'static str>,
 ) -> Result<(), &'static str> {
     validate_captured_identity(captured, deadline)?;
-    let group_signal =
-        notify_after_group_signal(signal_group_captured(captured, deadline)?, on_group_signal)?;
+    let (group_signal, release) = notify_after_group_signal(
+        captured,
+        signal_group_captured(captured, deadline)?,
+        on_group_signal,
+    )?;
+    if release.is_reaped_for(captured) {
+        // The acknowledgement is a stronger happens-before edge than a fresh
+        // ps identity query: the supervisor has already reaped this captured
+        // target. Poll only direct/group disappearance so a transient Darwin
+        // observation cannot turn an expected gone state into PID-reuse loss.
+        let mut probe = RealPostSignalProbe { captured, deadline };
+        return wait_after_acknowledged_group_signal(&mut probe, deadline);
+    }
     if group_signal == ProcessState::Empty {
         // The group may disappear before the direct child supervisor reaps
         // its zombie.  Keep the same identity-checked wait used after a
@@ -348,11 +411,12 @@ fn terminate_group_with_hook(
 /// Preserve the signal result while forcing the supervisor-release handshake
 /// to occur before any direct PID/group wait can block on a zombie child.
 fn notify_after_group_signal(
+    captured: &ProcessIdentity,
     group_signal: ProcessState,
-    on_group_signal: &mut dyn FnMut() -> Result<(), &'static str>,
-) -> Result<ProcessState, &'static str> {
-    on_group_signal()?;
-    Ok(group_signal)
+    on_group_signal: &mut dyn FnMut(&ProcessIdentity) -> Result<GroupSignalRelease, &'static str>,
+) -> Result<(ProcessState, GroupSignalRelease), &'static str> {
+    let release = on_group_signal(captured)?;
+    Ok((group_signal, release))
 }
 
 /// Recover a group-signal `EPERM` only with a complete, caller-supplied set of
@@ -365,7 +429,7 @@ pub(super) fn terminate_group_with_identity_fallback(
     peers: &[ProcessIdentity],
     deadline: Instant,
 ) -> Result<(), &'static str> {
-    let mut no_hook = || Ok(());
+    let mut no_hook = |_: &ProcessIdentity| Ok(GroupSignalRelease::Continue);
     match terminate_group(captured, deadline) {
         Ok(()) => Ok(()),
         Err("marker-eperm") => terminate_group_after_eperm(captured, peers, deadline, &mut no_hook),
@@ -379,7 +443,7 @@ pub(super) fn terminate_group_with_identity_fallback_hook(
     captured: &ProcessIdentity,
     peers: &[ProcessIdentity],
     deadline: Instant,
-    on_group_signal: &mut dyn FnMut() -> Result<(), &'static str>,
+    on_group_signal: &mut dyn FnMut(&ProcessIdentity) -> Result<GroupSignalRelease, &'static str>,
 ) -> Result<(), &'static str> {
     match terminate_group_with_hook(captured, deadline, on_group_signal) {
         Ok(()) => Ok(()),
@@ -397,7 +461,7 @@ fn terminate_group_after_eperm(
     captured: &ProcessIdentity,
     peers: &[ProcessIdentity],
     deadline: Instant,
-    on_group_signal: &mut dyn FnMut() -> Result<(), &'static str>,
+    on_group_signal: &mut dyn FnMut(&ProcessIdentity) -> Result<GroupSignalRelease, &'static str>,
 ) -> Result<(), &'static str> {
     let mut targets: Vec<&ProcessIdentity> = Vec::with_capacity(peers.len());
     for peer in peers {
@@ -436,7 +500,7 @@ fn terminate_group_after_eperm(
             }
         }
     }
-    on_group_signal()?;
+    let _release = on_group_signal(captured)?;
     wait_after_identity_group(&targets, captured.pgid, deadline)
 }
 
@@ -481,6 +545,30 @@ fn wait_after_group_signal(
 ) -> Result<(), &'static str> {
     let mut probe = RealPostSignalProbe { captured, deadline };
     wait_after_group_signal_backend(&mut probe, deadline)
+}
+
+/// Wait for direct PID and PGID disappearance after a supervisor acknowledgement
+/// without re-querying the already captured identity.  The acknowledgement
+/// proves ownership and target reap; only a still-present process is pending
+/// residual cleanup, while any permission/probe fault remains fail-closed.
+fn wait_after_acknowledged_group_signal<B: PostSignalProbe>(
+    probe: &mut B,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    loop {
+        let (direct, group) = probe.states()?;
+        match classify_post_group_state(direct, group) {
+            PostGroupState::Gone => return Ok(()),
+            PostGroupState::PermissionDenied => return Err("marker-eperm"),
+            PostGroupState::ProbeFailed => return Err("marker-process-probe-failed"),
+            PostGroupState::RevalidateDirect | PostGroupState::Wait => {
+                if Instant::now() >= deadline {
+                    return Err("marker-residual");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 /// Keep the production PID/PGID probe and identity query behind one narrow
@@ -1184,20 +1272,91 @@ mod tests {
     /// already-empty group, while a lost control pipe remains fail-closed.
     #[test]
     fn group_signal_handshake_is_bounded_and_ordered() {
+        let captured = ProcessIdentity {
+            pid: 42,
+            pgid: 43,
+            uid: current_uid(),
+            comm: "target".to_owned(),
+            start_identity: "start".to_owned(),
+        };
         for state in [ProcessState::Present, ProcessState::Empty] {
             let mut calls = 0;
-            let mut hook = || {
+            let mut hook = |_: &ProcessIdentity| {
                 calls += 1;
-                Ok(())
+                Ok(GroupSignalRelease::Continue)
             };
-            assert_eq!(notify_after_group_signal(state, &mut hook), Ok(state));
+            assert_eq!(
+                notify_after_group_signal(&captured, state, &mut hook),
+                Ok((state, GroupSignalRelease::Continue))
+            );
             assert_eq!(calls, 1);
         }
-        let mut hook = || Err("marker-query-unreaped");
+        let mut hook = |_: &ProcessIdentity| Err("marker-query-unreaped");
         assert_eq!(
-            notify_after_group_signal(ProcessState::Present, &mut hook),
+            notify_after_group_signal(&captured, ProcessState::Present, &mut hook),
             Err("marker-query-unreaped")
         );
+    }
+
+    /// Prove ACK release keys reject every PID-reuse dimension and that a
+    /// release cannot be synthesized for a different process group.
+    #[test]
+    fn group_signal_release_is_bound_to_full_identity() {
+        let captured = ProcessIdentity {
+            pid: 42,
+            pgid: 43,
+            uid: current_uid(),
+            comm: "target".to_owned(),
+            start_identity: "start".to_owned(),
+        };
+        let release = GroupSignalRelease::Reaped(ProcessIdentityKey::from_identity(&captured));
+        assert!(release.is_reaped_for(&captured));
+        for changed in [
+            ProcessIdentity {
+                pid: 41,
+                ..captured.clone()
+            },
+            ProcessIdentity {
+                pgid: 44,
+                ..captured.clone()
+            },
+            ProcessIdentity {
+                uid: captured.uid.saturating_add(1),
+                ..captured.clone()
+            },
+            ProcessIdentity {
+                comm: "other".to_owned(),
+                ..captured.clone()
+            },
+            ProcessIdentity {
+                start_identity: "reused".to_owned(),
+                ..captured.clone()
+            },
+        ] {
+            assert!(!release.is_reaped_for(&changed));
+        }
+    }
+
+    /// Prove a successful supervisor acknowledgement never performs a second
+    /// identity query when Darwin briefly reports the captured PID as present.
+    /// The liveness-only path still requires both direct PID and PGID absence.
+    #[test]
+    fn acknowledged_group_signal_waits_without_identity_requery() {
+        let mut probe = FakePostSignalProbe {
+            states: VecDeque::from([
+                Ok((ProcessState::Present, ProcessState::Empty)),
+                Ok((ProcessState::Empty, ProcessState::Empty)),
+            ]),
+            validations: VecDeque::from([Err("marker-identity-lost")]),
+        };
+        assert_eq!(
+            wait_after_acknowledged_group_signal(
+                &mut probe,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Ok(())
+        );
+        assert_eq!(probe.validations.len(), 1);
     }
 
     /// Prove a direct-PID/group disagreement takes the identity revalidation

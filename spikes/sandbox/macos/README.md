@@ -131,6 +131,13 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   supervisor terminal/EOF，chunked 合法行才接受，任何第二行、尾随字节、超量输出或
   nonzero status 都失败。父端随后只等待/reap supervisor 并再次独立复核
   target/supervisor，绝不会在 ack 被消费前直接杀 supervisor。
+  ACK 成功后，生产状态机继续使用已捕获的 target identity 只做 PID/PGID
+  disappearance 复核；即使 Darwin 短暂把 direct PID 报为 present，也等待其
+  gone/residual 结果而不对预期已 reap 的 PID 重新执行 `ps` identity query。
+  ACK proof 本身携带当次 captured target 的 PID/PGID/UID/comm/start identity，
+  并且在 fixture 协议中只消费一次；重复回调或后续不同 marker group 只能回到
+  正常 identity revalidation，绝不会复用第一个 target 的全局布尔状态。相同 PID
+  但 start/comm/UID/PGID 任一变化也不匹配 proof。
   这样被
   signal 的 target 不会因 launcher 同时死亡而留下未回收 zombie；控制 EOF、非 `q`、
   读错或 nonblocking 设置失败也会先收口 target，再以固定非零/abort 结束，绝不当作
