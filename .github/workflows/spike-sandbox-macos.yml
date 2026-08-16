@@ -43,6 +43,14 @@ jobs:
             mkdir -m 700 "$private_root"
           fi
           [[ "$(stat -f '%Lp' "$private_root")" == "700" ]]
+          report_dir="$RUNNER_TEMP/ja-sandbox-report"
+          if [[ -e "$report_dir" ]]; then
+            [[ -d "$report_dir" ]]
+          else
+            mkdir -m 700 "$report_dir"
+          fi
+          [[ "$(stat -f '%Lp' "$report_dir")" == "700" ]]
+          printf 'JA_SANDBOX_PRIVATE_ROOT=%s\n' "$private_root" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         shell: bash

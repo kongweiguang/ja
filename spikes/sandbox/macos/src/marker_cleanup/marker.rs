@@ -341,13 +341,14 @@ fn is_pending_name(name: &str) -> bool {
 /// process identity, but reserved owner values must still fail closed.
 fn parse_pending_name(name: &str) -> Option<(u32, u128)> {
     let body = name.strip_prefix(".ja-sandbox-log-helper-")?;
-    let (ids, suffix) = body.rsplit_once('.')?;
-    if !matches!(
-        suffix,
-        "marker.pending" | "fallback.pending" | "emergency.pending"
-    ) {
-        return None;
+    let mut ids = None;
+    for suffix in [".marker.pending", ".fallback.pending", ".emergency.pending"] {
+        if let Some(value) = body.strip_suffix(suffix) {
+            ids = Some(value);
+            break;
+        }
     }
+    let ids = ids?;
     let (owner, nonce) = ids.split_once('-')?;
     Some((
         owner.parse::<u32>().ok().filter(|value| *value > 1)?,
@@ -357,7 +358,7 @@ fn parse_pending_name(name: &str) -> Option<(u32, u128)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_positive_i32, parse_positive_u32};
+    use super::{parse_pending_name, parse_positive_i32, parse_positive_u32};
 
     /// Marker parsing rejects all reserved PID/PGID values before cleanup can
     /// derive a direct or negative process-group signal target.
@@ -367,5 +368,21 @@ mod tests {
             assert!(parse_positive_u32(value).is_none());
             assert!(parse_positive_i32(value).is_none());
         }
+    }
+
+    /// Pending activation suffixes contain two dots; parsing the complete
+    /// suffix prevents valid pending evidence from being misclassified as an
+    /// owner mismatch before cleanup can remove it.
+    #[test]
+    fn pending_name_grammar_is_complete() {
+        assert_eq!(
+            parse_pending_name(".ja-sandbox-log-helper-42-12.marker.pending"),
+            Some((42, 12))
+        );
+        assert_eq!(
+            parse_pending_name(".ja-sandbox-log-helper-42-12.fallback.pending"),
+            Some((42, 12))
+        );
+        assert!(parse_pending_name(".ja-sandbox-log-helper-42-12.marker").is_none());
     }
 }
