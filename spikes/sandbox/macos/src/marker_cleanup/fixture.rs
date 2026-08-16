@@ -137,7 +137,18 @@ pub(super) fn run_fixture_launcher() -> ! {
         Ok(child) => child,
         Err(_) => std::process::exit(71),
     };
-    println!("{}", child.id());
+    let target_snapshot = match FixtureTargetSnapshot::capture(&child) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            emit_cleanup_diagnostic_line("supervisor-status", error);
+            terminate_fixture_child(&mut child, "fixture-helper-snapshot");
+            abort_unreaped_query(error);
+        }
+    };
+    // Publishing the PID is the readiness edge.  The snapshot must already be
+    // complete, so a parent signal proof can be matched without querying the
+    // target after it becomes a Darwin zombie.
+    println!("{}", target_snapshot.identity.pid);
     let _ = std::io::stdout().flush();
     let mut control = std::io::stdin();
     if control_setup_state(set_nonblocking(&control).map_err(|error| error.kind()))
@@ -163,6 +174,7 @@ pub(super) fn run_fixture_launcher() -> ! {
                         let reap_result = reap_fixture_child_after_group_signal(
                             &mut child,
                             &mut proof,
+                            &target_snapshot,
                             proof_deadline,
                         );
                         match reap_result {
@@ -230,6 +242,46 @@ enum FixtureControlEvent {
     Invalid,
     Error,
     SetupFailed,
+}
+
+/// Freeze the complete target identity before readiness is published.  The
+/// supervisor keeps this snapshot next to the owned Child handle so the q
+/// proof can be checked after SIGKILL without querying an unstable zombie row.
+struct FixtureTargetSnapshot {
+    identity: ProcessIdentity,
+}
+
+impl FixtureTargetSnapshot {
+    /// Capture and bind the target identity before the parent can signal it;
+    /// any query, ownership, PGID, or Child mismatch prevents readiness.
+    fn capture(child: &std::process::Child) -> Result<Self, &'static str> {
+        let pid = child.id();
+        let process_group = i32::try_from(pid).map_err(|_| "fixture-helper-snapshot")?;
+        if pid <= 1 || process_group <= 1 || process_group == current_pgid() {
+            return Err("fixture-helper-snapshot");
+        }
+        let identity = query_identity_until(pid, Instant::now() + Duration::from_secs(2))?;
+        if identity.pid != pid
+            || identity.pgid != process_group
+            || identity.uid != current_uid()
+            || identity.comm.is_empty()
+            || identity.start_identity.is_empty()
+        {
+            return Err("fixture-helper-snapshot");
+        }
+        Ok(Self { identity })
+    }
+
+    /// Require the frozen identity to remain attached to the same Child
+    /// handle; no live full-identity query is permitted after group signal.
+    fn matches_child(&self, child: &std::process::Child) -> bool {
+        child.id() == self.identity.pid
+            && self.identity.pid > 1
+            && self.identity.pgid > 1
+            && u32::try_from(self.identity.pgid).ok() == Some(self.identity.pid)
+            && self.identity.uid == current_uid()
+            && self.identity.pgid != current_pgid()
+    }
 }
 
 /// Carry the production hook's completed group-signal proof across the
@@ -454,53 +506,39 @@ fn terminate_fixture_child(child: &mut std::process::Child, reason: &'static str
 
 /// Finish a target after a real production group signal.  The typed proof is
 /// the only authority that allows the already-signalled direct-reap path; it
-/// binds Child PID/PGID/UID/comm/start identity and is consumed once before
-/// requiring the complete target PGID to disappear.
+/// must match the supervisor's pre-signal snapshot and owned Child before
+/// bounded reap and complete target PGID disappearance are attempted.
 fn reap_fixture_child_after_group_signal(
     child: &mut std::process::Child,
     proof: &mut PostSignalProof,
+    snapshot: &FixtureTargetSnapshot,
     deadline: Instant,
 ) -> Result<(), &'static str> {
-    let child_pid = child.id();
-    let process_group = proof.identity.pgid;
-    let expected_pid = proof.identity.pid;
-    if expected_pid <= 1
-        || process_group <= 1
-        || child_pid != expected_pid
-        || i32::try_from(child_pid).ok() != Some(process_group)
-        || process_group == current_pgid()
-        || proof.identity.uid != current_uid()
-    {
-        emit_cleanup_diagnostic_line("post-signal-identity", "fixture-helper-identity");
+    let process_group = snapshot.identity.pgid;
+    emit_cleanup_diagnostic_line("post-signal-snapshot", "begin");
+    if !snapshot.matches_child(child) {
+        emit_cleanup_diagnostic_line("post-signal-snapshot", "fixture-helper-identity");
         return Err("fixture-helper-identity");
     }
-
-    // Query the complete identity before consuming the proof.  This check is
-    // what prevents a reused numeric Child PID from inheriting the q shortcut.
-    emit_cleanup_diagnostic_line("post-signal-identity", "begin");
-    let observed = match query_identity_until(expected_pid, deadline) {
-        Ok(identity) => identity,
-        Err(error) => {
-            emit_cleanup_diagnostic_line("post-signal-identity", error);
-            return Err("fixture-helper-identity");
-        }
-    };
-    emit_cleanup_diagnostic_line("post-signal-identity", "ok");
-    if consume_post_signal_proof_with_diagnostic(proof, &observed, |stage, code| {
-        emit_cleanup_diagnostic_line(stage, code);
-    })
+    if consume_post_signal_proof_with_diagnostic(
+        proof,
+        &snapshot.identity,
+        "post-signal-snapshot",
+        |stage, code| {
+            emit_cleanup_diagnostic_line(stage, code);
+        },
+    )
     .is_err()
     {
         return Err("fixture-helper-identity");
     }
+    emit_cleanup_diagnostic_line("post-signal-snapshot", "ok");
 
-    // The proof-bound observation is intentionally frozen before reaping.  A
-    // Darwin target can change its `ps` row while becoming a zombie, so a
-    // second numeric identity query would reject the exact child we already
-    // validated.  The owned Child handle and PID equality remain the guard
-    // against reuse; after this point only direct reap and PGID emptiness are
-    // accepted.
-    if !reap_fixture_direct_after_proof(child, &observed, deadline) {
+    // The frozen pre-signal snapshot is intentionally reused for the direct
+    // reap.  A Darwin target can change its `ps` row while becoming a zombie,
+    // but the owned Child handle and pre-signal proof already bind this exact
+    // process; only reap and PGID disappearance remain observable now.
+    if !reap_fixture_direct_after_proof(child, &snapshot.identity, deadline) {
         emit_cleanup_diagnostic_line("post-signal-reap", "fixture-helper-reap");
         return Err("fixture-helper-reap");
     }
@@ -551,6 +589,7 @@ fn proof_identity_mismatch_code(
 fn consume_post_signal_proof_with_diagnostic<F>(
     proof: &mut PostSignalProof,
     observed: &ProcessIdentity,
+    stage: &'static str,
     mut emit: F,
 ) -> Result<(), &'static str>
 where
@@ -564,7 +603,7 @@ where
             } else {
                 error
             };
-            emit("post-signal-proof", code);
+            emit(stage, code);
             Err(error)
         }
     }
@@ -1392,6 +1431,7 @@ where
         if !matches!(
             stage,
             "post-signal-proof"
+                | "post-signal-snapshot"
                 | "post-signal-identity"
                 | "post-signal-reap"
                 | "post-signal-pgid"
@@ -2700,8 +2740,8 @@ mod tests {
     use super::{
         FIXTURE_DIAGNOSTIC_BYTES, FIXTURE_DIAGNOSTIC_DRAIN_BUDGET, FixtureAckProof,
         FixtureControlEvent, FixtureDiagnosticBuffer, FixtureEvidenceFault, FixtureFailureContext,
-        GroupSignalRelease, PostSignalProof, ProcessIdentity, accept_launcher_identity,
-        classify_fixture_control, complete_fixture_reap_handshake,
+        FixtureTargetSnapshot, GroupSignalRelease, PostSignalProof, ProcessIdentity,
+        accept_launcher_identity, classify_fixture_control, complete_fixture_reap_handshake,
         consume_post_signal_proof_with_diagnostic, control_setup_state, decode_post_signal_proof,
         drain_fixture_diagnostics, finish_fixture_failure_with, fixture_cleanup_failure_category,
         fixture_group_failure_reason, fixture_paths, forward_fixture_diagnostics_with,
@@ -3022,6 +3062,7 @@ mod tests {
     fn fixture_diagnostic_forwarding_is_redacted_and_subsetted() {
         let input = b"SANDBOX-MARKER-QUERY: stage=post-signal-proof code=begin\n\
 SANDBOX-MARKER-QUERY: stage=supervisor-status code=ok\n\
+SANDBOX-MARKER-QUERY: stage=post-signal-snapshot code=fixture-helper-comm\n\
 SANDBOX-MARKER-QUERY: stage=post-signal-pgid code=secret=/private/path\n\
 SANDBOX-MARKER-QUERY: stage=post-signal-reap code=fixture-helper-reap\n\
 SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
@@ -3033,6 +3074,10 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
             seen,
             [
                 ("post-signal-proof".to_owned(), "begin".to_owned()),
+                (
+                    "post-signal-snapshot".to_owned(),
+                    "fixture-helper-comm".to_owned(),
+                ),
                 ("post-signal-pgid".to_owned(), "unknown".to_owned()),
                 (
                     "post-signal-reap".to_owned(),
@@ -3191,6 +3236,60 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
         );
     }
 
+    /// Bind the production proof to the supervisor's frozen pre-signal
+    /// snapshot.  A changed comm/start value is rejected before any direct
+    /// reap, even though those fields may later be unstable on a zombie.
+    #[test]
+    fn pre_signal_snapshot_rejects_exec_and_comm_drift() {
+        let snapshot = FixtureTargetSnapshot {
+            identity: ProcessIdentity {
+                pid: 42,
+                pgid: 42,
+                uid: current_uid(),
+                comm: "target".to_owned(),
+                start_identity: "start".to_owned(),
+            },
+        };
+        let changed_cases = [
+            (
+                ProcessIdentity {
+                    comm: "replacement".to_owned(),
+                    ..snapshot.identity.clone()
+                },
+                "fixture-helper-comm",
+            ),
+            (
+                ProcessIdentity {
+                    start_identity: "reused-start".to_owned(),
+                    ..snapshot.identity.clone()
+                },
+                "fixture-helper-start",
+            ),
+        ];
+        for (changed, expected) in changed_cases {
+            let mut proof = PostSignalProof::issue_from_production_hook(&changed);
+            let mut diagnostics = Vec::new();
+            assert_eq!(
+                consume_post_signal_proof_with_diagnostic(
+                    &mut proof,
+                    &snapshot.identity,
+                    "post-signal-snapshot",
+                    |stage, code| diagnostics.push((stage, code)),
+                ),
+                Err("fixture-helper-identity")
+            );
+            assert_eq!(diagnostics, [("post-signal-snapshot", expected)]);
+        }
+        let mut valid_proof = PostSignalProof::issue_from_production_hook(&snapshot.identity);
+        consume_post_signal_proof_with_diagnostic(
+            &mut valid_proof,
+            &snapshot.identity,
+            "post-signal-snapshot",
+            |_, _| panic!("matching pre-signal snapshot emitted a mismatch"),
+        )
+        .expect("matching pre-signal snapshot proof");
+    }
+
     /// Exercise the production consume/error seam: an already-consumed proof
     /// with the same identity is generic, while a changed identity is only
     /// field-classified after `consume_for` has rejected it.
@@ -3212,9 +3311,12 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
         same_proof.consume_for(&target).expect("consume proof once");
         let mut same_diagnostics = Vec::new();
         assert_eq!(
-            consume_post_signal_proof_with_diagnostic(&mut same_proof, &target, |stage, code| {
-                same_diagnostics.push((stage, code))
-            },),
+            consume_post_signal_proof_with_diagnostic(
+                &mut same_proof,
+                &target,
+                "post-signal-proof",
+                |stage, code| same_diagnostics.push((stage, code)),
+            ),
             Err("fixture-helper-identity")
         );
         assert_eq!(
@@ -3231,6 +3333,7 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
             consume_post_signal_proof_with_diagnostic(
                 &mut changed_proof,
                 &changed,
+                "post-signal-proof",
                 |stage, code| changed_diagnostics.push((stage, code)),
             ),
             Err("fixture-helper-identity")
@@ -3369,18 +3472,19 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut child = spawn_grouped(&mut command).expect("spawn pre-signalled child");
+        let snapshot =
+            FixtureTargetSnapshot::capture(&child).expect("capture pre-signalled target snapshot");
         let process_group = i32::try_from(child.id())
             .ok()
             .filter(|value| *value > 1)
             .expect("pre-signalled process group");
-        let identity =
-            super::query_identity_until(child.id(), Instant::now() + Duration::from_secs(2))
-                .expect("pre-signalled target identity");
+        let identity = snapshot.identity.clone();
         let mut proof = PostSignalProof::issue_from_production_hook(&identity);
         crate::safe_signal_group(process_group, 9).expect("signal target group");
         reap_fixture_child_after_group_signal(
             &mut child,
             &mut proof,
+            &snapshot,
             Instant::now() + Duration::from_secs(2),
         )
         .expect("reap pre-signalled target");
@@ -3399,13 +3503,13 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut child = spawn_grouped(&mut command).expect("spawn proof rejection target");
+        let snapshot = FixtureTargetSnapshot::capture(&child)
+            .expect("capture proof rejection target snapshot");
         let process_group = i32::try_from(child.id())
             .ok()
             .filter(|value| *value > 1)
             .expect("proof rejection process group");
-        let identity =
-            super::query_identity_until(child.id(), Instant::now() + Duration::from_secs(2))
-                .expect("proof rejection identity");
+        let identity = snapshot.identity.clone();
         let wrong_identity = ProcessIdentity {
             start_identity: "reused-start".to_owned(),
             ..identity.clone()
@@ -3415,6 +3519,7 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
             reap_fixture_child_after_group_signal(
                 &mut child,
                 &mut proof,
+                &snapshot,
                 Instant::now() + Duration::from_secs(1),
             ),
             Err("fixture-helper-identity")

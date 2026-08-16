@@ -132,10 +132,13 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   nonzero status 都失败。父端随后只等待/reap supervisor 并再次独立复核
   target/supervisor，绝不会在 ack 被消费前直接杀 supervisor。
   supervisor 收到 `q` 时 target group 可能已经被 production 的 group signal 清空；
-  production hook 会把一次性 `PostSignalProof` 连同 q 发送，proof 绑定 target 的
-  PID/PGID/UID/comm/start identity。supervisor 只有在重新查询并匹配这组完整 identity、
-  且 proof 尚未消费时，才能用仍持有的 direct `Child` 做 bounded reap，再独立要求
-  target PGID `ESRCH`；不会把第二次 group signal 的预期 `ESRCH` 误报成 ACK 失败。
+  supervisor 在发布 target PID 作为 readiness 之前，先捕获并冻结 target 的完整
+  PID/PGID/UID/comm/start identity，并把它绑定到仍持有的 direct `Child`。production
+  hook 会把一次性 `PostSignalProof` 连同 q 发送；supervisor 只有在 proof 与这份冻结的
+  pre-signal snapshot 逐字段匹配、且 `Child` PID/PGID 仍一致时，才能做 bounded reap，
+  再独立要求 target PGID `ESRCH`。group signal 后不再对预期 zombie 做全量 `ps` identity
+  query，避免 Darwin 的 zombie comm 行漂移把已绑定的 Child 误判为 PID reuse；不会把第二次
+  group signal 的预期 `ESRCH` 误报成 ACK 失败。
   proof 缺失、格式错误、重复、PID reuse 或 PGID 仍有未授权 descendant 时，回到严格
   group cleanup 或直接 fail-closed，绝不写 ACK。EOF、非 q、读错和 setup fault 从不调用
   proof-bound helper。

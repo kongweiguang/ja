@@ -109,6 +109,7 @@ fn cleanup_diagnostic_stage(stage: &str) -> &'static str {
         "launcher-output",
         "ack-read",
         "post-signal-proof",
+        "post-signal-snapshot",
         "post-signal-reap",
         "post-signal-pgid",
         "ack-write",
