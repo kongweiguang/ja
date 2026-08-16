@@ -238,13 +238,21 @@ pub(super) fn terminate_group(
         (ProcessState::Other(_), _) | (_, ProcessState::Other(_)) => {
             return Err("marker-process-probe-failed");
         }
-        (ProcessState::Empty, ProcessState::Present) => return Err("marker-identity-lost"),
+        (ProcessState::Empty, ProcessState::Present) => {
+            // The validated group signal already covers the descendant tree;
+            // a direct target can become a zombie before its parent reaps it.
+            // Wait for the group to disappear without ever signalling an
+            // unqueryable or potentially reused direct PID.
+            return wait_after_group_signal(captured, deadline);
+        }
         (ProcessState::Present, ProcessState::Empty) => return Err("marker-identity-lost"),
         (ProcessState::Present, ProcessState::Present) => {}
     }
     // The group signal may have raced with exit/reuse.  A fresh full identity
     // query is mandatory before direct PID signalling can be attempted.
-    validate_captured_identity(captured)?;
+    if validate_captured_identity(captured).is_err() {
+        return wait_after_group_signal(captured, deadline);
+    }
     signal_pid(captured.pid)?;
     loop {
         let direct = pid_state(i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?);
@@ -257,6 +265,31 @@ pub(super) fn terminate_group(
             (ProcessState::Other(_), _) | (_, ProcessState::Other(_)) => {
                 return Err("marker-process-probe-failed");
             }
+            _ if Instant::now() >= deadline => return Err("marker-residual"),
+            _ => thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+/// After a validated group SIGKILL, wait only for kernel disappearance.  This
+/// avoids a stale direct-PID signal when macOS briefly exposes a zombie or the
+/// identity helper cannot observe a just-killed process.
+fn wait_after_group_signal(
+    captured: &ProcessIdentity,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    loop {
+        let direct = pid_state(i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?);
+        let group = group_state(captured.pgid);
+        match (direct, group) {
+            (ProcessState::Empty, ProcessState::Empty) => return Ok(()),
+            (ProcessState::PermissionDenied, _) | (_, ProcessState::PermissionDenied) => {
+                return Err("marker-eperm");
+            }
+            (ProcessState::Other(_), _) | (_, ProcessState::Other(_)) => {
+                return Err("marker-process-probe-failed");
+            }
+            (ProcessState::Present, ProcessState::Empty) => return Err("marker-identity-lost"),
             _ if Instant::now() >= deadline => return Err("marker-residual"),
             _ => thread::sleep(Duration::from_millis(50)),
         }

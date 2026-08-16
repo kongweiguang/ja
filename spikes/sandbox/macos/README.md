@@ -16,6 +16,10 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   读写与 worker 自身 exec；metadata 仅覆盖 loader、worker/workspace 的根组件和
   精确父目录。resource sibling、workspace executable、product DB、secret、`..`、
   symlink escape 均必须失败，且 smoke 单独验证 protected metadata 不可见。
+- 为兼容 macOS 的 dyld/firmlink 与标准库启动，profile 仅增加固定的 system-only
+  `vnguard`/Sandbox syscall、`opendirectoryd`/`secinitd` lookup、系统根组件
+  metadata、`/bin`/`/usr/bin` 等只读 loader paths 及 `/dev` stdio 设备；这些规则不
+  允许 workspace/tmp executable mapping，也不开放 network 或 unrestricted process control。
 - worker、workspace 和 profile parent 在准备阶段只 canonicalize 一次；profile 与
   实际 exec/current directory 共用同一组路径，避免 `/var` 与 `/private/var` alias drift。
 - process-info 与 signal 仅允许 `same-sandbox` target，不开放 unrestricted process control。

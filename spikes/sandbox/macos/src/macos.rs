@@ -670,6 +670,39 @@ fn build_profile(spec: &PreparedSandboxSpec) -> Result<String, SandboxError> {
 (allow process-info* (target same-sandbox))\n\
 (allow signal (target same-sandbox))\n\
 (allow sysctl-read)\n\
+; These exact system-runtime rules mirror the minimal macOS startup\n\
+; exceptions used by the pinned Codex restricted policy. They cover\n\
+; firmlink/vnode setup, stdlib service lookup and inherited stdio without\n\
+; granting workspace, temporary-tree or network access.\n\
+(allow system-mac-syscall (mac-policy-name \"vnguard\"))\n\
+(allow system-mac-syscall\n\
+  (require-all\n\
+    (mac-policy-name \"Sandbox\")\n\
+    (mac-syscall-number 67)))\n\
+(allow mach-lookup\n\
+  (global-name \"com.apple.system.opendirectoryd.libinfo\")\n\
+  (global-name \"com.apple.secinitd\"))\n\
+(allow file-read-metadata file-test-existence\n\
+  (literal \"/etc\")\n\
+  (literal \"/tmp\")\n\
+  (literal \"/var\")\n\
+  (literal \"/private/etc/localtime\"))\n\
+(allow file-read-metadata\n\
+  (literal \"/System/Volumes\")\n\
+  (literal \"/System/Volumes/Data\")\n\
+  (literal \"/System/Volumes/Data/Users\"))\n\
+(allow file-read* file-test-existence (literal \"/\"))\n\
+(allow file-read* file-test-existence file-write-data\n\
+  (literal \"/dev/null\")\n\
+  (literal \"/dev/zero\"))\n\
+(allow file-read-data file-test-existence file-write-data\n\
+  (subpath \"/dev/fd\"))\n\
+(allow file-read-data file-read-metadata\n\
+  (subpath \"/bin\")\n\
+  (subpath \"/sbin\")\n\
+  (subpath \"/usr/bin\")\n\
+  (subpath \"/usr/sbin\")\n\
+  (subpath \"/usr/libexec\"))\n\
 (allow file-read* (subpath \"/usr/lib\") (subpath \"/System/Library\") (subpath \"/usr/share\"))\n\
 (allow file-map-executable (subpath \"/usr/lib\") (subpath \"/System/Library\"))\n\
 (allow file-read* (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\"))\n\
@@ -721,6 +754,34 @@ mod tests {
             line == "(allow file-map-executable (subpath \"/usr/lib\") (subpath \"/System/Library\"))"
         }));
         assert!(!profile.contains("file-map-executable (subpath \"/private/var"));
+    }
+
+    /// Keep the loader control additions system-only; a future profile edit
+    /// must not turn startup compatibility into workspace code execution.
+    #[test]
+    fn profile_startup_rules_are_narrow_system_allowlist() {
+        let profile = build_profile(&PreparedSandboxSpec {
+            worker: PathBuf::from("/private/var/tmp/worker"),
+            workspace: PathBuf::from("/private/var/tmp/workspace"),
+            profile_path: PathBuf::from("/private/var/tmp/profile.sb"),
+            args: Vec::<OsString>::new(),
+            env: BTreeMap::new(),
+            max_output_bytes: 64 * 1024,
+        })
+        .expect("build profile");
+
+        for rule in [
+            "(allow system-mac-syscall (mac-policy-name \"vnguard\"))",
+            "(global-name \"com.apple.system.opendirectoryd.libinfo\")",
+            "(global-name \"com.apple.secinitd\")",
+            "(subpath \"/usr/bin\")",
+            "(subpath \"/System/Volumes/Data/Users\")",
+        ] {
+            assert!(profile.contains(rule), "missing startup rule: {rule}");
+        }
+        assert!(!profile.contains("(allow file-map-executable (subpath \"/private"));
+        assert!(!profile.contains("(allow file-read* (subpath \"/private/var/tmp\")"));
+        assert!(!profile.contains("(allow network-outbound)"));
     }
 
     /// Reserved process identifiers are typed errors rather than “gone”
