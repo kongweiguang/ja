@@ -6,7 +6,7 @@
 use super::marker::write_fixture_marker;
 use super::process::{
     EPERM, ProcessIdentity, abort_unreaped_query, classify_errno, current_pgid, current_uid,
-    query_identity_until, reap_child_bounded, reap_child_group_bounded,
+    probe_pid_group_until, query_identity_until, reap_child_bounded, reap_child_group_bounded,
     reap_child_without_group_until, set_nonblocking, terminate_group_with_identity_fallback,
 };
 use super::{MARKER_MODE, O_CLOEXEC_FLAG, O_NOFOLLOW_FLAG, cleanup_markers_until};
@@ -450,11 +450,33 @@ fn finish_descendant_failure(
         }
         peers.push(launcher_identity.clone());
     }
-    let identity_result = terminate_group_with_identity_fallback(identity, &peers, deadline);
+    // `reap_child_bounded` has already proved the direct launcher is reaped and
+    // its PGID is empty.  Re-signalling the captured descendant after that
+    // proof would turn a safe gone state into a PID-reuse/identity error and
+    // obscure the original production cleanup category.  Only fall back to
+    // identity-checked signals when the direct/group reap itself was uncertain.
+    let identity_result = if launcher_result.is_ok() {
+        verify_reaped_group(identity, deadline)
+    } else {
+        terminate_group_with_identity_fallback(identity, &peers, deadline)
+    };
     match (evidence_result, launcher_result, identity_result) {
         (Ok(()), Ok(()), Ok(())) => Err(category),
         (_, Err(error), _) | (_, _, Err(error)) => abort_fixture_group(error),
         (Err(_), Ok(()), Ok(())) => abort_fixture_group("fixture-failure-evidence"),
+    }
+}
+
+/// Confirm the already-reaped descendant's PID and complete PGID are both
+/// kernel-empty without issuing a signal to a possibly reused numeric PID.
+fn verify_reaped_group(identity: &ProcessIdentity, deadline: Instant) -> Result<(), &'static str> {
+    match probe_pid_group_until(identity.pid, identity.pgid, deadline)? {
+        (super::process::ProcessState::Empty, super::process::ProcessState::Empty) => Ok(()),
+        (super::process::ProcessState::PermissionDenied, _)
+        | (_, super::process::ProcessState::PermissionDenied) => Err("marker-eperm"),
+        (super::process::ProcessState::Other(_), _)
+        | (_, super::process::ProcessState::Other(_)) => Err("marker-process-probe-failed"),
+        _ => Err("marker-residual"),
     }
 }
 
@@ -652,6 +674,11 @@ fn is_fixture_failure_category(category: &str) -> bool {
             | "fixture-group-eperm"
             | "fixture-group-probe-failed"
             | "fixture-group-signal-failed"
+            | "fixture-group-identity"
+            | "fixture-group-query"
+            | "fixture-group-reap"
+            | "fixture-group-remove"
+            | "fixture-group-evidence"
             | "fixture-group-failed"
             | "fixture-descendant-cleanup-residual"
             | "fixture-descendant-cleanup-eperm"
@@ -820,6 +847,11 @@ fn fixture_group_failure_reason(category: &'static str) -> &'static str {
         "marker-eperm" => "fixture-group-eperm",
         "marker-process-probe-failed" => "fixture-group-probe-failed",
         "marker-signal-failed" => "fixture-group-signal-failed",
+        "marker-identity-lost" | "marker-owner-mismatch" => "fixture-group-identity",
+        "marker-query-unreaped" | "marker-query-group-residual" => "fixture-group-query",
+        "fixture-unreaped" => "fixture-group-reap",
+        "marker-remove-failed" => "fixture-group-remove",
+        "fixture-failure-evidence" => "fixture-group-evidence",
         _ => "fixture-group-failed",
     }
 }
@@ -960,6 +992,11 @@ mod tests {
             ("marker-eperm", "fixture-group-eperm"),
             ("marker-process-probe-failed", "fixture-group-probe-failed"),
             ("marker-signal-failed", "fixture-group-signal-failed"),
+            ("marker-identity-lost", "fixture-group-identity"),
+            ("marker-query-unreaped", "fixture-group-query"),
+            ("fixture-unreaped", "fixture-group-reap"),
+            ("marker-remove-failed", "fixture-group-remove"),
+            ("fixture-failure-evidence", "fixture-group-evidence"),
             ("unexpected", "fixture-group-failed"),
         ];
         for (category, expected) in cases {
