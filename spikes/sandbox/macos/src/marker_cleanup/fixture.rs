@@ -13,7 +13,7 @@ use super::process::{
 };
 use super::{
     MARKER_MODE, O_CLOEXEC_FLAG, O_NOFOLLOW_FLAG, cleanup_markers_until,
-    cleanup_markers_until_with_group_signal_hook,
+    cleanup_markers_until_with_group_signal_hook_and_diagnostics, emit_cleanup_diagnostic_line,
 };
 use crate::spawn_grouped;
 use std::fs::{self, File, OpenOptions};
@@ -340,22 +340,25 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
     };
     // Capture the launcher identity while it is still alive so an early pipe
     // or parsing fault can still use the same identity-checked group cleanup.
-    let launcher_identity = match accept_launcher_identity(
-        query_identity_until(launcher.id(), fixture_deadline),
-        launcher.id(),
-        launcher_group,
-    ) {
-        Ok(identity) => Some(identity),
-        Err(category) => {
-            return finish_supervisor_identity_failure(
-                &root,
-                &mut launcher,
-                launcher_group,
-                fixture_deadline,
-                category,
-            );
-        }
-    };
+    emit_cleanup_diagnostic_line("supervisor-identity", "begin");
+    let launcher_query = query_identity_until(launcher.id(), fixture_deadline);
+    match &launcher_query {
+        Ok(_) => emit_cleanup_diagnostic_line("supervisor-identity", "ok"),
+        Err(category) => emit_cleanup_diagnostic_line("supervisor-identity", category),
+    }
+    let launcher_identity =
+        match accept_launcher_identity(launcher_query, launcher.id(), launcher_group) {
+            Ok(identity) => Some(identity),
+            Err(category) => {
+                return finish_supervisor_identity_failure(
+                    &root,
+                    &mut launcher,
+                    launcher_group,
+                    fixture_deadline,
+                    category,
+                );
+            }
+        };
     let stdout = match launcher.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -389,7 +392,13 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
         );
     }
     let mut launcher_output = BufReader::new(stdout);
-    let output = match read_launcher_output(&mut launcher_output, &mut launcher, fixture_deadline) {
+    emit_cleanup_diagnostic_line("supervisor-status", "begin");
+    let output_result = read_launcher_output(&mut launcher_output, &mut launcher, fixture_deadline);
+    match &output_result {
+        Ok(_) => emit_cleanup_diagnostic_line("supervisor-status", "ok"),
+        Err(category) => emit_cleanup_diagnostic_line("supervisor-status", category),
+    }
+    let output = match output_result {
         Ok(output) => output,
         Err(error) => {
             return finish_launcher_failure(
@@ -437,7 +446,13 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             );
         }
     };
-    let identity = match query_identity_until(pid, fixture_deadline) {
+    emit_cleanup_diagnostic_line("direct-pid", "begin");
+    let target_query = query_identity_until(pid, fixture_deadline);
+    match &target_query {
+        Ok(_) => emit_cleanup_diagnostic_line("direct-pid", "ok"),
+        Err(category) => emit_cleanup_diagnostic_line("direct-pid", category),
+    }
+    let identity = match target_query {
         Ok(identity) => identity,
         Err(_) => {
             return finish_launcher_failure(
@@ -454,15 +469,18 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             );
         }
     };
+    emit_cleanup_diagnostic_line("direct-pgid", "begin");
     let process_group = match i32::try_from(pid) {
         Ok(process_group)
             if process_group > 1
                 && process_group != current_pgid()
                 && identity.pgid == process_group =>
         {
+            emit_cleanup_diagnostic_line("direct-pgid", "ok");
             process_group
         }
         _ => {
+            emit_cleanup_diagnostic_line("direct-pgid", "fixture-helper-identity");
             return finish_launcher_failure(
                 &root,
                 &mut launcher,
@@ -478,6 +496,7 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
         }
     };
     if identity.pid != pid {
+        emit_cleanup_diagnostic_line("direct-pid", "fixture-helper-identity");
         return finish_launcher_failure(
             &root,
             &mut launcher,
@@ -549,8 +568,19 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
                 return Err(error);
             }
             let result = complete_fixture_reap_handshake(fixture_deadline, |deadline| {
-                request_fixture_launcher_shutdown(&mut launcher, deadline)?;
-                wait_fixture_reap_ack(&mut launcher_output, &mut launcher, deadline)
+                emit_cleanup_diagnostic_line("supervisor-status", "begin");
+                if let Err(error) = request_fixture_launcher_shutdown(&mut launcher, deadline) {
+                    emit_cleanup_diagnostic_line("supervisor-status", error);
+                    return Err(error);
+                }
+                emit_cleanup_diagnostic_line("supervisor-status", "ok");
+                emit_cleanup_diagnostic_line("ack-read", "begin");
+                let ack = wait_fixture_reap_ack(&mut launcher_output, &mut launcher, deadline);
+                match &ack {
+                    Ok(()) => emit_cleanup_diagnostic_line("ack-read", "ok"),
+                    Err(error) => emit_cleanup_diagnostic_line("ack-read", error),
+                }
+                ack
             })
             .map_err(|_| "marker-query-unreaped");
             match result {
@@ -564,12 +594,16 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
                 }
             }
         };
-        cleanup_markers_until_with_group_signal_hook(
+        let mut query_diagnostic = |stage: &'static str, code: &'static str| {
+            emit_cleanup_diagnostic_line(stage, code);
+        };
+        cleanup_markers_until_with_group_signal_hook_and_diagnostics(
             &root,
             &report,
             true,
             fixture_deadline,
             &mut signal_hook,
+            &mut query_diagnostic,
         )
     };
     // Let the supervisor perform its own bounded target reap after production
@@ -587,7 +621,9 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
         // Preserve only the production report's fixed category so a native
         // runner can distinguish residual, identity, query and signal faults
         // without exposing a PID, path, locale text or marker contents.
+        emit_cleanup_diagnostic_line("cleanup-report", "begin");
         let category = fixture_cleanup_failure_category_until(&report, fixture_deadline);
+        emit_cleanup_diagnostic_line("cleanup-report", category);
         return finish_descendant_failure(
             &root,
             launcher_identity.as_ref(),
@@ -805,7 +841,9 @@ fn finish_supervisor_identity_failure(
     let mut target_identity = None;
     if let Some(mut stdout) = launcher.stdout.take() {
         if set_nonblocking(&stdout).is_ok() {
+            emit_cleanup_diagnostic_line("supervisor-status", "begin");
             if let Ok(output) = read_launcher_output(&mut stdout, launcher, deadline) {
+                emit_cleanup_diagnostic_line("supervisor-status", "ok");
                 if let Ok(pid) = output.trim().parse::<u32>() {
                     if let Ok(process_group) = i32::try_from(pid)
                         && pid > 1
@@ -813,14 +851,21 @@ fn finish_supervisor_identity_failure(
                         && process_group != current_pgid()
                     {
                         target_reference = Some((pid, process_group));
-                        target_identity =
-                            query_identity_until(pid, deadline).ok().filter(|identity| {
-                                identity.pid == pid
-                                    && identity.pgid == process_group
-                                    && identity.uid == current_uid()
-                            });
+                        emit_cleanup_diagnostic_line("direct-pid", "begin");
+                        let target_query = query_identity_until(pid, deadline);
+                        match &target_query {
+                            Ok(_) => emit_cleanup_diagnostic_line("direct-pid", "ok"),
+                            Err(category) => emit_cleanup_diagnostic_line("direct-pid", category),
+                        }
+                        target_identity = target_query.ok().filter(|identity| {
+                            identity.pid == pid
+                                && identity.pgid == process_group
+                                && identity.uid == current_uid()
+                        });
                     }
                 }
+            } else {
+                emit_cleanup_diagnostic_line("supervisor-status", "fixture-helper-output");
             }
         }
     }

@@ -155,9 +155,14 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   且严格匹配 `category=true`（唯一、按生产顺序）和最后一个 `marker-count=<n>`；未知、
   路径、重复、冲突、`false`、空行、尾随内容、超限或缺失 count 都是
   `fixture-descendant-cleanup-report`，不会把具体 PID、路径或系统错误文本带入 CI。
-  合法报告才映射为固定的 `fixture-descendant-cleanup-{residual,eperm,signal,query,
-  identity,remove,scan,unsafe}` 类别。
-  目录 entry
+合法报告才映射为固定的 `fixture-descendant-cleanup-{residual,eperm,signal,query,
+identity,remove,scan,unsafe}` 类别。
+descendant fixture 同时在 CI stderr 输出固定格式的
+`SANDBOX-MARKER-QUERY: stage=<allowlisted-stage> code=<allowlisted-code>` 诊断行；
+`begin`/`ok`/错误码只用于定位 supervisor、marker identity、direct PID/PGID、ACK
+和 report 的发生顺序，不构成清理成功证明，也不包含 PID、路径、comm、start identity
+或系统错误文本。未知 stage/code 会被归一化为 `unknown` 并保持原有 fail-closed 结果。
+目录 entry
   读取错误会清空已收集的 signal target 并报告固定 `marker-entry-invalid`，不会静默
   忽略不完整扫描。group cleanup 最长 20 秒，workflow 外层还设置 2 分钟 timeout，不能
   把 timeout 当作已确认的 reap 或 `ESRCH`。

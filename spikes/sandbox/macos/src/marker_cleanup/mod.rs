@@ -87,6 +87,125 @@ const O_NOFOLLOW_FLAG: i32 = 0x0000_0100;
 type MarkerCleanupKey = (u32, u128, u32, i32, u64, u64, u64, u32, u32, u8);
 type GroupSignalHook<'a> =
     dyn FnMut(&ProcessIdentity) -> Result<GroupSignalRelease, &'static str> + 'a;
+type CleanupDiagnosticHook<'a> = dyn FnMut(&'static str, &'static str) + 'a;
+
+/// Keep native fixture diagnostics on a closed, path-free vocabulary.  The
+/// callback receives only stage and error codes so a query cannot leak a PID,
+/// pathname, process command line, or platform error text into CI output.
+pub(super) fn emit_cleanup_diagnostic_line(stage: &str, code: &str) {
+    eprintln!(
+        "SANDBOX-MARKER-QUERY: stage={} code={}",
+        cleanup_diagnostic_stage(stage),
+        cleanup_diagnostic_code(code)
+    );
+}
+
+/// Normalize a diagnostic stage before it is printed or passed to a fixture
+/// callback; unknown stages fail closed instead of becoming free-form output.
+fn cleanup_diagnostic_stage(stage: &str) -> &'static str {
+    const KNOWN: &[&str] = &[
+        "supervisor-identity",
+        "supervisor-status",
+        "launcher-output",
+        "ack-read",
+        "marker-entry-identity",
+        "cleaned-entry-identity",
+        "identity",
+        "direct-pid",
+        "direct-pgid",
+        "post-signal-identity",
+        "group-signal",
+        "marker-entry",
+        "cleanup-report",
+        "cleanup-deadline",
+        "root",
+    ];
+    KNOWN
+        .iter()
+        .copied()
+        .find(|known| *known == stage)
+        .unwrap_or("unknown")
+}
+
+/// Normalize a backend result before it reaches the native runner log.  A
+/// new internal category must be explicitly classified before it is observable.
+fn cleanup_diagnostic_code(code: &str) -> &'static str {
+    const KNOWN: &[&str] = &[
+        "begin",
+        "ok",
+        "unknown",
+        "marker-owner-mismatch",
+        "marker-query-unreaped",
+        "marker-query-group-residual",
+        "marker-process-probe-failed",
+        "marker-identity-lost",
+        "marker-eperm",
+        "marker-signal-failed",
+        "marker-remove-failed",
+        "marker-residual",
+        "marker-group-unsafe",
+        "marker-entry-invalid",
+        "marker-root-invalid",
+        "marker-pending",
+        "fixture-helper-query",
+        "fixture-helper-output",
+        "fixture-helper-control",
+        "fixture-helper-ack",
+        "fixture-helper-reap",
+        "fixture-helper-identity",
+        "fixture-helper-pid",
+        "fixture-helper-pipe",
+        "fixture-clock",
+        "fixture-marker-write",
+        "fixture-launcher-cleanup",
+        "fixture-group-control",
+        "fixture-group-query",
+        "fixture-group-identity",
+        "fixture-descendant-cleanup-query",
+        "fixture-descendant-cleanup-report",
+        "fixture-descendant-cleanup-identity",
+        "fixture-descendant-cleanup-remove",
+        "fixture-descendant-cleanup-residual",
+        "fixture-descendant-cleanup-signal",
+        "fixture-descendant-cleanup-eperm",
+        "fixture-descendant-cleanup-scan",
+        "fixture-descendant-cleanup-unsafe",
+        "fixture-descendant-cleanup-unknown",
+    ];
+    KNOWN
+        .iter()
+        .copied()
+        .find(|known| *known == code)
+        .unwrap_or("unknown")
+}
+
+/// Invoke the optional fixture-only callback while retaining the same closed
+/// diagnostic vocabulary used by the direct CI line.
+fn emit_cleanup_diagnostic(
+    hook: &mut Option<&mut CleanupDiagnosticHook<'_>>,
+    stage: &'static str,
+    code: &'static str,
+) {
+    if let Some(hook) = hook.as_deref_mut() {
+        hook(
+            cleanup_diagnostic_stage(stage),
+            cleanup_diagnostic_code(code),
+        );
+    }
+}
+
+/// Associate a production failure with the narrowest observable cleanup
+/// stage without exposing the lower-level process-query implementation.
+fn diagnostic_stage_for_error(category: &'static str) -> &'static str {
+    match category {
+        "marker-process-probe-failed" => "direct-pid",
+        "marker-query-unreaped" | "marker-query-group-residual" => "direct-pgid",
+        "marker-identity-lost" | "marker-owner-mismatch" => "identity",
+        "marker-eperm" | "marker-signal-failed" => "group-signal",
+        "marker-remove-failed" => "marker-entry",
+        _ => "marker-entry",
+    }
+}
 
 /// Build a complete marker identity for deduplication.  Owner/nonce alone is
 /// insufficient because suffixes, PGIDs, or inode replacements can represent
@@ -137,19 +256,19 @@ pub(super) fn cleanup_markers_until(
     allow_fixture: bool,
     cleanup_deadline: Instant,
 ) -> Result<(), &'static str> {
-    cleanup_markers_until_impl(root, report, allow_fixture, cleanup_deadline, None)
+    cleanup_markers_until_impl(root, report, allow_fixture, cleanup_deadline, None, None)
 }
 
-/// Run cleanup with a bounded callback that is invoked immediately after a
-/// target group signal succeeds.  The descendant fixture uses this narrow
-/// handshake to let its supervisor reap a killed child before the production
-/// identity wait checks the direct PID; normal workflow callers pass no hook.
-pub(super) fn cleanup_markers_until_with_group_signal_hook(
+/// Run the fixture hook with bounded, path-free query diagnostics.  The
+/// production cleanup ordering remains identical; only fixed stage/error
+/// observations are exposed so a native failure can be localized on CI.
+pub(super) fn cleanup_markers_until_with_group_signal_hook_and_diagnostics(
     root: &Path,
     report: &Path,
     allow_fixture: bool,
     cleanup_deadline: Instant,
     on_group_signal: &mut GroupSignalHook<'_>,
+    on_diagnostic: &mut CleanupDiagnosticHook<'_>,
 ) -> Result<(), &'static str> {
     cleanup_markers_until_impl(
         root,
@@ -157,6 +276,7 @@ pub(super) fn cleanup_markers_until_with_group_signal_hook(
         allow_fixture,
         cleanup_deadline,
         Some(on_group_signal),
+        Some(on_diagnostic),
     )
 }
 
@@ -168,6 +288,7 @@ fn cleanup_markers_until_impl(
     allow_fixture: bool,
     cleanup_deadline: Instant,
     mut on_group_signal: Option<&mut GroupSignalHook<'_>>,
+    mut on_diagnostic: Option<&mut CleanupDiagnosticHook<'_>>,
 ) -> Result<(), &'static str> {
     let own_pgid = current_pgid();
     if own_pgid <= 1 {
@@ -208,6 +329,11 @@ fn cleanup_markers_until_impl(
             continue;
         }
         if Instant::now() >= cleanup_deadline {
+            emit_cleanup_diagnostic(
+                &mut on_diagnostic,
+                "cleanup-deadline",
+                "marker-query-unreaped",
+            );
             report_categories.insert("marker-query-unreaped");
             break;
         }
@@ -231,19 +357,34 @@ fn cleanup_markers_until_impl(
         let mut group_valid = true;
         for candidate in &group_records {
             if Instant::now() >= cleanup_deadline {
+                emit_cleanup_diagnostic(
+                    &mut on_diagnostic,
+                    "cleanup-deadline",
+                    "marker-query-unreaped",
+                );
                 report_categories.insert("marker-query-unreaped");
                 group_valid = false;
                 break;
             }
+            emit_cleanup_diagnostic(&mut on_diagnostic, "marker-entry-identity", "begin");
             let actual = match query_identity_until(candidate.pid, cleanup_deadline) {
-                Ok(identity) => identity,
+                Ok(identity) => {
+                    emit_cleanup_diagnostic(&mut on_diagnostic, "marker-entry-identity", "ok");
+                    identity
+                }
                 Err(category) => {
+                    emit_cleanup_diagnostic(&mut on_diagnostic, "marker-entry-identity", category);
                     report_categories.insert(category);
                     group_valid = false;
                     continue;
                 }
             };
             if !identity_matches(candidate, &actual, allow_fixture) {
+                emit_cleanup_diagnostic(
+                    &mut on_diagnostic,
+                    "marker-entry-identity",
+                    "marker-owner-mismatch",
+                );
                 report_categories.insert("marker-owner-mismatch");
                 group_valid = false;
                 continue;
@@ -253,6 +394,7 @@ fn cleanup_markers_until_impl(
         if !group_valid || identities.is_empty() {
             continue;
         }
+        emit_cleanup_diagnostic(&mut on_diagnostic, "group-signal", "begin");
         match on_group_signal.as_deref_mut() {
             Some(hook) => {
                 let mut observed_release = GroupSignalRelease::Continue;
@@ -281,7 +423,14 @@ fn cleanup_markers_until_impl(
                     finish_hooked_group(&mut context, &identities[0], observed_release, termination)
                 };
                 if let Err(category) = hook_result {
+                    emit_cleanup_diagnostic(
+                        &mut on_diagnostic,
+                        diagnostic_stage_for_error(category),
+                        category,
+                    );
                     report_categories.insert(category);
+                } else {
+                    emit_cleanup_diagnostic(&mut on_diagnostic, "group-signal", "ok");
                 }
             }
             None => match terminate_group_with_identity_fallback(
@@ -290,6 +439,7 @@ fn cleanup_markers_until_impl(
                 cleanup_deadline,
             ) {
                 Ok(()) => {
+                    emit_cleanup_diagnostic(&mut on_diagnostic, "group-signal", "ok");
                     if remove_identity_markers(
                         root,
                         &root_directory,
@@ -304,6 +454,11 @@ fn cleanup_markers_until_impl(
                     }
                 }
                 Err(category) => {
+                    emit_cleanup_diagnostic(
+                        &mut on_diagnostic,
+                        diagnostic_stage_for_error(category),
+                        category,
+                    );
                     report_categories.insert(category);
                 }
             },
@@ -368,6 +523,12 @@ fn cleanup_markers_until_impl(
                 completed_cleaned_entries.insert(counterpart);
             }
         }
+        let pending_stage = if pending.cleaned {
+            "cleaned-entry-identity"
+        } else {
+            "marker-entry"
+        };
+        emit_cleanup_diagnostic(&mut on_diagnostic, pending_stage, "begin");
         let result = remove_pending_marker(
             root,
             &root_directory,
@@ -376,6 +537,14 @@ fn cleanup_markers_until_impl(
             allow_fixture,
             cleanup_deadline,
         );
+        match &result {
+            Ok(_) => emit_cleanup_diagnostic(&mut on_diagnostic, pending_stage, "ok"),
+            Err(category) => emit_cleanup_diagnostic(
+                &mut on_diagnostic,
+                diagnostic_stage_for_error(category),
+                category,
+            ),
+        }
         if result.is_ok() {
             completed_cleaned_entries.insert(pending_name.clone());
             if let Ok((counterpart, _)) = recovery_backup_names(&pending_name) {
@@ -422,6 +591,7 @@ fn cleanup_markers_until_impl(
             report_categories.insert("marker-query-unreaped");
             break;
         }
+        emit_cleanup_diagnostic(&mut on_diagnostic, "marker-entry", "begin");
         let result = remove_pending_marker(
             root,
             &root_directory,
@@ -430,6 +600,14 @@ fn cleanup_markers_until_impl(
             allow_fixture,
             cleanup_deadline,
         );
+        match &result {
+            Ok(_) => emit_cleanup_diagnostic(&mut on_diagnostic, "marker-entry", "ok"),
+            Err(category) => emit_cleanup_diagnostic(
+                &mut on_diagnostic,
+                diagnostic_stage_for_error(category),
+                category,
+            ),
+        }
         if let Ok(outcome) = &result {
             completed_pending_entries.extend(outcome.completed_names.iter().cloned());
         }
@@ -2342,6 +2520,22 @@ mod unit_tests {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, symlink};
     #[cfg(target_os = "macos")]
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Keep diagnostic stage/error mapping closed so native logs can localize
+    /// a query failure without accepting arbitrary paths or OS text.
+    #[test]
+    fn query_diagnostic_mapping_is_closed_and_stable() {
+        assert_eq!(
+            cleanup_diagnostic_stage("marker-entry-identity"),
+            "marker-entry-identity"
+        );
+        assert_eq!(cleanup_diagnostic_stage("/tmp/secret"), "unknown");
+        assert_eq!(
+            cleanup_diagnostic_code("marker-query-unreaped"),
+            "marker-query-unreaped"
+        );
+        assert_eq!(cleanup_diagnostic_code("permission denied /tmp"), "unknown");
+    }
 
     /// Keep the identity comparison strict so a forged fixture cannot reach a
     /// signal call merely by matching a PID or group number.
