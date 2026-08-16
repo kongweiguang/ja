@@ -1050,9 +1050,7 @@ fn write_fixture_failure_evidence_transaction(
     if Instant::now() >= deadline {
         return Err("fixture-failure-evidence");
     }
-    root_directory
-        .sync_all()
-        .map_err(|_| "fixture-failure-evidence")?;
+    fd::sync_directory(&root_directory).map_err(|_| "fixture-failure-evidence")?;
     if Instant::now() >= deadline || faults.fail_once(FixtureEvidenceFault::Rename) {
         return Err("fixture-failure-evidence");
     }
@@ -1069,9 +1067,7 @@ fn write_fixture_failure_evidence_transaction(
     if Instant::now() >= deadline || faults.fail_once(FixtureEvidenceFault::DirectorySync) {
         return Err("fixture-failure-evidence");
     }
-    root_directory
-        .sync_all()
-        .map_err(|_| "fixture-failure-evidence")?;
+    fd::sync_directory(&root_directory).map_err(|_| "fixture-failure-evidence")?;
     match read_fixture_evidence_copy(
         root_fd,
         FIXTURE_FAILURE_EVIDENCE.as_bytes(),
@@ -1405,9 +1401,7 @@ fn recover_existing_fixture_evidence(
             if Instant::now() >= deadline || faults.fail_once(FixtureEvidenceFault::DirectorySync) {
                 return Err("fixture-failure-evidence");
             }
-            root_directory
-                .sync_all()
-                .map_err(|_| "fixture-failure-evidence")?;
+            fd::sync_directory(root_directory).map_err(|_| "fixture-failure-evidence")?;
             return Ok(true);
         }
     }
@@ -1443,9 +1437,7 @@ fn quarantine_invalid_fixture_evidence(
                 {
                     return Err("fixture-failure-evidence");
                 }
-                root_directory
-                    .sync_all()
-                    .map_err(|_| "fixture-failure-evidence")?;
+                fd::sync_directory(root_directory).map_err(|_| "fixture-failure-evidence")?;
                 return Ok(());
             }
             Err(error) if error.raw_os_error() == Some(fd::EEXIST) => continue,
@@ -2136,7 +2128,7 @@ mod tests {
         file.write_all(contents.as_bytes())
             .expect("candidate write");
         file.sync_all().expect("candidate sync");
-        directory.sync_all().expect("candidate directory sync");
+        super::fd::sync_directory(&directory).expect("candidate directory sync");
     }
 
     /// Require every version-2 field and identity state before recovery can

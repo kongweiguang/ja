@@ -3,6 +3,7 @@
 
 //! Bounded native process-table evidence for probe-owned temporary roots.
 
+use super::fd;
 use super::process::{
     abort_unreaped_query, current_uid, reap_child_bounded, reap_child_without_group,
 };
@@ -699,9 +700,7 @@ fn content_digest(bytes: &[u8]) -> u64 {
 /// Synchronize the private parent directory after each rename/unlink batch so
 /// a crash cannot report success while the quarantine publication is lost.
 fn sync_directory(root: &Path) -> Result<(), &'static str> {
-    File::open(root)
-        .map_err(|_| "process-table-evidence")?
-        .sync_all()
+    fd::sync_directory(&File::open(root).map_err(|_| "process-table-evidence")?)
         .map_err(|_| "process-table-evidence")
 }
 

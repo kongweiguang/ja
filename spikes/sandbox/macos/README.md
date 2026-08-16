@@ -64,7 +64,9 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   dirfd 的 `renameat/unlinkat`；因此授权扫描、marker open 与删除不会各自解析一份
   可替换的 root pathname。active marker 会先在该目录内原子改名为
   `.ja-sandbox-cleaned.*`，并在同一目录内写入 `.ja-sandbox-recovery.*` 原始镜像后
-  fsync；同一轮保持完整 backup 直到 recovery 的最终 unlink 与目录 fsync 都成功，
+  fsync；目录描述符先尝试 Darwin `F_FULLFSYNC`，对目录不支持该 regular-file
+  操作时仅回退到 `fsync(dirfd)`，普通文件仍使用文件级 `F_FULLFSYNC`；两种目录
+  同步都失败都会 fail-closed。同一轮保持完整 backup 直到 recovery 的最终 unlink 与目录 fsync 都成功，
   然后才删除 backup，所以成功的 active cleanup 不留下 cleaned/recovery evidence。
   任一最终 unlink 后的
   fstat、root revalidate、directory sync 或 deadline 失败，都会用持有的完整 image

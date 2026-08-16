@@ -371,7 +371,7 @@ pub(super) fn cleanup_markers_until(
     // successful unlink without a parent-directory sync cannot be reported as
     // complete after a runner crash/restart boundary.
     if !has_cleanup_budget(cleanup_deadline, CLEANUP_SYSCALL_RESERVE)
-        || root_directory.sync_all().is_err()
+        || fd::sync_directory(&root_directory).is_err()
         || Instant::now() >= cleanup_deadline
     {
         report_categories.insert("marker-remove-failed");
@@ -804,7 +804,7 @@ fn ensure_pending_alias(
             return Err(());
         }
         faults.before_directory_sync(0)?;
-        root_directory.sync_all().map_err(|_| ())?;
+        fd::sync_directory(root_directory).map_err(|_| ())?;
         if Instant::now() >= deadline {
             return Err(());
         }
@@ -822,7 +822,7 @@ fn ensure_pending_alias(
     drop(file);
     verify_root_path_until(root, root_identity, deadline)?;
     faults.before_directory_sync(0)?;
-    root_directory.sync_all().map_err(|_| ())?;
+    fd::sync_directory(root_directory).map_err(|_| ())?;
     if Instant::now() >= deadline {
         return Err(());
     }
@@ -879,7 +879,7 @@ fn unlink_pending_entry(
     faults.before_root_revalidate(ordinal)?;
     verify_root_path_until(root, root_identity, deadline)?;
     faults.before_directory_sync(ordinal + 1)?;
-    root_directory.sync_all().map_err(|_| ())?;
+    fd::sync_directory(root_directory).map_err(|_| ())?;
     if Instant::now() >= deadline {
         return Err(());
     }
@@ -1203,9 +1203,7 @@ fn isolate_damaged_sibling(
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
         return Err("marker-remove-failed");
     }
-    root_directory
-        .sync_all()
-        .map_err(|_| "marker-remove-failed")?;
+    fd::sync_directory(root_directory).map_err(|_| "marker-remove-failed")?;
     if Instant::now() >= deadline {
         return Err("marker-remove-failed");
     }
@@ -1233,9 +1231,7 @@ fn isolate_damaged_sibling(
     {
         return Err("marker-remove-failed");
     }
-    root_directory
-        .sync_all()
-        .map_err(|_| "marker-remove-failed")?;
+    fd::sync_directory(root_directory).map_err(|_| "marker-remove-failed")?;
     if Instant::now() >= deadline {
         return Err("marker-remove-failed");
     }
@@ -1349,7 +1345,7 @@ fn unlink_cleaned_evidence(
         entry_gone,
         verify_root_path_until(root, root_identity, deadline).is_ok(),
         has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE),
-        root_directory.sync_all().is_ok(),
+        fd::sync_directory(root_directory).is_ok(),
     );
     if final_state_is_durable {
         // The target is now durably gone, so remove the retained backup last.
@@ -1508,7 +1504,7 @@ fn prepare_recovery_backup(
     pending_file.sync_all().map_err(|_| ())?;
     drop(pending_file);
     verify_root_path_until(root, root_identity, deadline)?;
-    root_directory.sync_all().map_err(|_| ())?;
+    fd::sync_directory(root_directory).map_err(|_| ())?;
     if Instant::now() >= deadline {
         return Err(());
     }
@@ -1516,7 +1512,7 @@ fn prepare_recovery_backup(
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
         return Err(());
     }
-    root_directory.sync_all().map_err(|_| ())?;
+    fd::sync_directory(root_directory).map_err(|_| ())?;
     if Instant::now() >= deadline {
         return Err(());
     }
@@ -1580,7 +1576,7 @@ fn remove_recovery_backup(
     {
         return Err(());
     }
-    root_directory.sync_all().map_err(|_| ())?;
+    fd::sync_directory(root_directory).map_err(|_| ())?;
     if Instant::now() >= deadline {
         return Err(());
     }
@@ -1761,7 +1757,7 @@ fn restore_recovery_evidence_with_fault<F: RestoreFaultInjector>(
         drop(file);
         if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE)
             || faults.before_directory_sync(index).is_err()
-            || root_directory.sync_all().is_err()
+            || fd::sync_directory(root_directory).is_err()
             || Instant::now() >= deadline
             || verify_root_path_until(root, root_identity, deadline).is_err()
         {
@@ -1810,7 +1806,7 @@ fn finalize_durable_restore_candidate<F: RestoreFaultInjector>(
     } = request;
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE)
         || faults.before_directory_sync(candidate_index).is_err()
-        || root_directory.sync_all().is_err()
+        || fd::sync_directory(root_directory).is_err()
         || Instant::now() >= deadline
         || verify_root_path_until(root, root_identity, deadline).is_err()
     {
@@ -1888,7 +1884,7 @@ fn remove_restore_candidate<F: RestoreFaultInjector>(
     {
         return Err(());
     }
-    root_directory.sync_all().map_err(|_| ())?;
+    fd::sync_directory(root_directory).map_err(|_| ())?;
     if Instant::now() >= deadline {
         return Err(());
     }
@@ -1944,7 +1940,7 @@ fn unlink_verified_entry(
         return Err(());
     }
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE)
-        || root_directory.sync_all().is_err()
+        || fd::sync_directory(root_directory).is_err()
         || Instant::now() >= deadline
     {
         return Err(());
@@ -1988,7 +1984,7 @@ fn unlink_verified_entry(
     }
     recovery_file.sync_all().map_err(|_| ())?;
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE)
-        || root_directory.sync_all().is_err()
+        || fd::sync_directory(root_directory).is_err()
         || Instant::now() >= deadline
     {
         return Err(());
@@ -2017,7 +2013,7 @@ fn unlink_verified_entry(
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
         return Err(());
     }
-    root_directory.sync_all().map_err(|_| ())?;
+    fd::sync_directory(root_directory).map_err(|_| ())?;
     if Instant::now() >= deadline {
         return Err(());
     }
@@ -2148,9 +2144,7 @@ fn write_report_with_count_label_until(
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
         return Err("report-deadline");
     }
-    File::open(parent)
-        .map_err(|_| "report-write-failed")?
-        .sync_all()
+    fd::sync_directory(&File::open(parent).map_err(|_| "report-write-failed")?)
         .map_err(|_| "report-write-failed")?;
     if Instant::now() >= deadline {
         return Err("report-deadline");
@@ -2927,7 +2921,7 @@ mod unit_tests {
         )
         .expect("retained backup");
         fd::unlink_at(root_fd, original).expect("simulate target unlink");
-        root_directory.sync_all().expect("target unlink sync");
+        fd::sync_directory(&root_directory).expect("target unlink sync");
 
         let mut plan =
             RestoreFaultPlan::new([RestoreFaultPoint::Write(0), RestoreFaultPoint::Write(1)]);

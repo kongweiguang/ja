@@ -13,7 +13,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::ptr;
 use std::slice;
 
@@ -198,6 +198,36 @@ pub(super) fn unlink_at(root_fd: RawFd, name: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Synchronize a verified directory descriptor without treating Apple's
+/// regular-file-only `F_FULLFSYNC` behavior as a marker-removal failure.  The
+/// stronger command is attempted first; only the documented unsupported-file
+/// class falls back to Darwin `fsync`, while real I/O errors remain fatal.
+pub(super) fn sync_directory(directory: &File) -> io::Result<()> {
+    let fd = directory.as_raw_fd();
+    let full_sync = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
+    if full_sync == 0 {
+        return Ok(());
+    }
+    let full_error = io::Error::last_os_error();
+    let unsupported = matches!(
+        full_error.raw_os_error(),
+        Some(code)
+            if code == libc::EINVAL
+                || code == libc::ENOTSUP
+                || code == libc::EOPNOTSUPP
+                || code == libc::ENOTTY
+    );
+    if !unsupported {
+        return Err(full_error);
+    }
+    let directory_sync = unsafe { libc::fsync(fd) };
+    if directory_sync == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Keep errno access in one libc boundary so scan EOF and unlink failures
 /// never depend on locale text or hand-written platform symbols.
 pub(super) fn last_errno() -> i32 {
@@ -214,7 +244,7 @@ fn set_errno(value: i32) {
 mod tests {
     use super::{
         DirectoryStream, ENOENT, create_at_file, fstatat_no_follow, open_at_file, rename_at,
-        rename_at_no_replace, unlink_at,
+        rename_at_no_replace, sync_directory, unlink_at,
     };
     use std::fs::{self, DirBuilder, OpenOptions};
     use std::io::Write;
@@ -271,7 +301,7 @@ mod tests {
                 .raw_os_error(),
             Some(ENOENT)
         );
-        directory.sync_all().expect("directory sync");
+        sync_directory(&directory).expect("directory sync");
         assert_eq!(
             fs::metadata(&root)
                 .expect("root metadata")
@@ -320,7 +350,7 @@ mod tests {
         );
         drop(final_file);
         drop(pending);
-        directory.sync_all().expect("directory sync");
+        sync_directory(&directory).expect("directory sync");
         fs::remove_dir_all(&root).expect("private root cleanup");
     }
 }
