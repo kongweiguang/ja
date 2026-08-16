@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:error-catalog-1","method":"version","params":{}}
+{"jsonrpc":"2.0","id":"c:error-catalog-1","error":{"code":-32017,"message":"握手未完成","data":{"jaCode":"HANDSHAKE_FAILED","retryable":false,"diagnosticId":"diag_handshake"}}}

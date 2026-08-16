@@ -85,6 +85,13 @@
       "pattern": "^srv_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
       "maxLength": 101
     },
+    "readyToken": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{32}$",
+      "minLength": 32,
+      "maxLength": 32,
+      "description": "Fresh 128-bit per-generation handshake challenge; non-secret, non-reusable, and never logged."
+    },
     "seq": {
       "type": "integer",
       "minimum": 1,
@@ -162,6 +169,12 @@
         "method": { "type": "string", "minLength": 1, "maxLength": 128 },
         "params": { "type": "object" }
       },
+      "not": {
+        "anyOf": [
+          { "required": ["result"] },
+          { "required": ["error"] }
+        ]
+      },
       "additionalProperties": true
     },
     "requestBaseServer": {
@@ -172,6 +185,12 @@
         "id": { "$ref": "#/$defs/serverRequestId" },
         "method": { "type": "string", "minLength": 1, "maxLength": 128 },
         "params": { "type": "object" }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["result"] },
+          { "required": ["error"] }
+        ]
       },
       "additionalProperties": true
     },
@@ -188,6 +207,15 @@
         "workspacePolicy": { "$ref": "#/$defs/workspacePolicy" }
       },
       "additionalProperties": true
+    },
+    "initializedParams": {
+      "type": "object",
+      "required": ["readyToken"],
+      "properties": {
+        "readyToken": { "$ref": "#/$defs/readyToken" }
+      },
+      "additionalProperties": false,
+      "description": "Rust proves the current pipe generation before Java may publish runtime ready."
     },
     "versionParams": {
       "type": "object",
@@ -497,11 +525,18 @@
       "required": ["jsonrpc", "id"],
       "properties": { "jsonrpc": { "$ref": "#/$defs/jsonRpc" }, "id": { "$ref": "#/$defs/requestId" }, "result": { "type": ["object", "array", "string", "number", "boolean", "null"] }, "error": { "$ref": "#/$defs/error" } },
       "oneOf": [ { "required": ["result"], "not": { "required": ["error"] } }, { "required": ["error"], "not": { "required": ["result"] } } ],
+      "not": {
+        "anyOf": [
+          { "required": ["method"] },
+          { "required": ["params"] }
+        ]
+      },
       "additionalProperties": true
     },
     "error": {
       "type": "object",
       "required": ["code", "message", "data"],
+      "propertyNames": { "not": { "const": "readyToken" } },
       "properties": {
         "code": { "type": "integer", "minimum": -32768, "maximum": -32000 },
         "message": { "type": "string", "minLength": 1, "maxLength": 512 },
@@ -514,8 +549,13 @@
             "diagnosticId": { "type": "string", "pattern": "^diag_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 101 },
             "field": { "type": "string", "maxLength": 256 },
             "retryAfterMs": { "type": "integer", "minimum": 1, "maximum": 3600000 },
-            "details": { "type": "object", "additionalProperties": true }
+            "details": {
+              "type": "object",
+              "propertyNames": { "not": { "const": "readyToken" } },
+              "additionalProperties": true
+            }
           },
+          "propertyNames": { "not": { "const": "readyToken" } },
           "additionalProperties": true
         }
       },
@@ -544,9 +584,16 @@
       "type": "object",
       "required": ["jsonrpc", "method", "params"],
       "properties": { "jsonrpc": { "$ref": "#/$defs/jsonRpc" }, "method": { "type": "string", "minLength": 1, "maxLength": 128 }, "params": { "type": "object" } },
+      "not": {
+        "anyOf": [
+          { "required": ["id"] },
+          { "required": ["result"] },
+          { "required": ["error"] }
+        ]
+      },
       "additionalProperties": true
     },
-    "initializedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "initialized" }, "params": { "$ref": "#/$defs/emptyParams" } }, "required": ["method", "params"] } ] },
+    "initializedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "initialized" }, "params": { "$ref": "#/$defs/initializedParams" } }, "required": ["method", "params"] } ] },
     "threadEventBase": {
       "type": "object",
       "required": ["serverInstanceId", "threadId", "seq", "eventId", "occurredAt"],
@@ -696,7 +743,25 @@
     "runtimeStatusParams": {
       "type": "object",
       "required": ["status"],
-      "properties": { "status": { "enum": ["starting", "ready", "degraded", "shutting_down", "stopped", "crashed"] }, "reason": { "type": "string", "maxLength": 1024 }, "health": { "type": "object", "additionalProperties": true } },
+      "properties": {
+        "status": { "enum": ["starting", "ready", "degraded", "shutting_down", "stopped", "crashed"] },
+        "readyToken": { "$ref": "#/$defs/readyToken" },
+        "reason": { "type": "string", "maxLength": 1024 },
+        "health": { "type": "object", "additionalProperties": true }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "ready" } }, "required": ["status"] },
+          "then": { "required": ["readyToken"] }
+        },
+        {
+          "if": {
+            "properties": { "status": { "enum": ["starting", "degraded", "shutting_down", "stopped", "crashed"] } },
+            "required": ["status"]
+          },
+          "then": { "not": { "required": ["readyToken"] } }
+        }
+      ],
       "additionalProperties": true
     },
     "runtimeNoticeParams": {

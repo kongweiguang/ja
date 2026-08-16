@@ -1,0 +1,6 @@
+{"jsonrpc":"2.0","method":"runtime/statusChanged","params":{"serverInstanceId":"srv_handshake1","eventId":"evt_handshake_start","occurredAt":"2026-08-16T00:00:00Z","status":"starting"}}
+{"jsonrpc":"2.0","method":"initialized","params":{"readyToken":"abcdef0123456789abcdef0123456789"},"traceId":"extension-safe"}
+{"jsonrpc":"2.0","method":"runtime/statusChanged","params":{"serverInstanceId":"srv_handshake1","eventId":"evt_handshake_ready1","occurredAt":"2026-08-16T00:00:01Z","status":"ready","readyToken":"abcdef0123456789abcdef0123456789"}}
+{"jsonrpc":"2.0","method":"runtime/statusChanged","params":{"serverInstanceId":"srv_handshake1","eventId":"evt_handshake_stop1","occurredAt":"2026-08-16T00:00:02Z","status":"stopped"}}
+{"jsonrpc":"2.0","method":"initialized","params":{"readyToken":"fedcba9876543210fedcba9876543210"}}
+{"jsonrpc":"2.0","method":"runtime/statusChanged","params":{"serverInstanceId":"srv_handshake2","eventId":"evt_handshake_ready2","occurredAt":"2026-08-16T00:00:03Z","status":"ready","readyToken":"fedcba9876543210fedcba9876543210"}}

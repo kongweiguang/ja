@@ -20,8 +20,10 @@
 `code` 是稳定 JSON-RPC server error code，`data.jaCode` 是稳定机器码，
 `data.retryable` 是唯一重试提示；`diagnosticId` 只能引用脱敏日志。错误不得包含
 SQL、绝对路径、token、secret、stack trace、完整 Prompt、源码或 Provider 原始响应。
-`details` 只放可公开的字段名、限制值、版本或状态摘要。新增错误只追加，不复用旧码
-改变含义。
+脱敏边界递归适用于 `error`、`data`、`details`、数组和嵌套 provider/tool payload：禁止
+出现 `readyToken` 键，也禁止把当前或历史 generation 的 challenge 原值作为任意 JSON
+object key 或 value。`details`
+只放可公开的字段名、限制值、版本或状态摘要。新增错误只追加，不复用旧码改变含义。
 
 ## 协议与队列
 
@@ -43,6 +45,7 @@ SQL、绝对路径、token、secret、stack trace、完整 Prompt、源码或 Pr
 | -32014 | `REQUEST_DEADLINE_EXCEEDED` | 是 | 普通 request deadline 到期；仅幂等查询可安全重试 |
 | -32015 | `PAYLOAD_TOO_LARGE` | 否 | delta、inline Tool output、schema 或集合超限 |
 | -32016 | `RESYNC_REQUIRED` | 是 | seq 缺口、事件丢失或订阅过载；重新读取 snapshot |
+| -32017 | `HANDSHAKE_FAILED` | 否 | `initialized` challenge 缺失、格式错误、错误、旧代或重复；禁止进入 ready，关闭本代连接 |
 
 ## 运行时、数据与并发
 

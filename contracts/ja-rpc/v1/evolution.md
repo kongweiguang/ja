@@ -7,6 +7,18 @@
 Schema、Markdown 和 golden fixtures 必须在同一变更中更新；实现升级前先运行旧 fixture，
 再运行新 fixture。没有通过兼容验证的变更不能仅修改版本号掩盖。
 
+当前 v1 仍处于未公开发布的实现前契约阶段；本轮把 `initialized.readyToken` 和
+`runtime/statusChanged(ready).readyToken` 固化为 v1 当前握手要求，保持
+`protocolMajor=1`，不为尚未发布的旧实现保留空 `initialized` 兼容分支。公开发布后，
+任何把已发布可选字段改成必填的握手变化都必须升 major；不能用 minor 版本号掩盖握手
+状态机变化。
+
+握手安全字段是严格例外：`readyToken` 的存在、固定格式、原样相等、generation 唯一性、
+非 ready 禁止携带，以及 notification 禁止 `id/result/error`，都不是可由未知字段或
+minor 扩展放宽的可选语义。错误对象的递归 token redaction 同样是不可降级的安全不变量：
+`readyToken` 字段名，以及当前/历史 challenge 原值作为任意 JSON object key/value 都必须拒绝；
+未知扩展只能出现在不改变这些安全边界的普通字段中。
+
 ## Minor 版本（兼容）
 
 允许的 minor 变更：
@@ -43,6 +55,10 @@ minor 变更仍须满足 `minimumCompatibleMinor`。如果对端无法理解新�
   之外的未来计数器应改为字符串并升 major，不得截断。
 - error message 面向用户但必须脱敏；客户端只根据 `jaCode`、`retryable` 和字段读取
   恢复策略，不匹配 message 文本。
+- `readyToken` 是每个 stdio generation 新生成的 128-bit 十六进制 challenge。它不是
+  secret，但不得记录或持久化；只有 schema 能证明 presence/format，runtime 必须证明
+  与当前 `initialized` 的原样相等、generation 未切换且未重复使用。非 `ready` runtime
+  状态不得携带该字段。
 
 ## 方法/事件注册
 
@@ -68,6 +84,7 @@ client request 的 `c:` namespace。`approvalId` 的决策与 `eventId`/seq 去�
 | seq 缺口/旧 instance | resync snapshot | 保留已提交事实，不伪造连续序列 |
 | unknown method/capability | `METHOD_NOT_FOUND`/`CAPABILITY_UNSUPPORTED` | 不静默 fallback |
 | missing/null/unknown field | 缺失按默认，null 按 Schema，未知忽略 | 同样语义并保留安全边界 |
+| handshake challenge | `initialized` 缺失/错误/重复 token 时拒绝并不进入 ready | 新 generation 生成新 token，`ready` 只接受原样回显 |
 
 Golden fixture 是跨语言兼容的最小证据，不是完整产品状态快照。生产实现必须额外覆盖
 并发、背压、取消、进程树清理、数据库恢复、Native Image、真实 Tauri runtime 和

@@ -23,6 +23,11 @@ client 到 Java/AgentScope server，`S→C` 是反向 request；notification 不
 错误或 EOF 都必须释放 pending request、审批、workspace lease、Tool/MCP 子进程和
 数据库锁。Java 日志只能写 stderr/文件。
 
+`initialized` 与 `runtime/statusChanged(ready)` 是握手通知而非额外 method：Rust 在
+`initialized.params.readyToken` 发送当前 generation 的一次性 128-bit challenge，Java
+处理后必须在 `ready` 状态中原样回显。缺失、错误、旧或重复 token 都是
+`HANDSHAKE_FAILED`，不能以 `ready` 状态继续；非 ready runtime 状态不携带 token。
+
 ## Workspace 与 Thread
 
 | 方法 | 方向 | params 要点 | 副作用/幂等边界 |

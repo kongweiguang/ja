@@ -46,7 +46,11 @@ response 必须恰好包含 `result` 或 `error` 之一，且回显原 request �
 {"jsonrpc":"2.0","method":"item/delta","params":{"serverInstanceId":"srv_demo","threadId":"thr_demo","seq":4,"eventId":"evt_demo4","occurredAt":"2026-08-16T00:00:04Z","itemId":"item_msg","delta":"已读取"}}
 ```
 
-notification 没有 `id`，不产生 response。Thread 事件必须包含 `serverInstanceId`、`threadId`、`seq`、`eventId` 和 RFC 3339 `occurredAt`。`seq` 从 1 开始，在一个 `serverInstanceId + threadId` 内严格递增；重启会生成新的 `serverInstanceId`。Rust 发现 seq 缺口、重复或旧实例事件时停止直接归并，重新读取 snapshot。
+notification 没有 `id`、`result` 或 `error`，不产生 response；未知的普通扩展字段仍可保留。
+Thread 事件必须包含 `serverInstanceId`、`threadId`、`seq`、`eventId` 和 RFC 3339
+`occurredAt`。`seq` 从 1 开始，在一个 `serverInstanceId + threadId` 内严格递增；重启
+会生成新的 `serverInstanceId`。Rust 发现 seq 缺口、重复或旧实例事件时停止直接归并，
+重新读取 snapshot。
 
 ## 3. 初始化与版本
 
@@ -55,8 +59,8 @@ notification 没有 `id`，不产生 response。Thread 事件必须包含 `serve
 ```text
 Rust -> initialize(request)
 Java -> initialize(response)
-Rust -> initialized(notification)
-Java -> runtime/statusChanged(ready)
+Rust -> initialized(notification {readyToken})
+Java -> runtime/statusChanged(ready {readyToken})
 ... full-duplex requests/events ...
 Rust -> shutdown(request)
 Java -> shutdown(response)
@@ -87,6 +91,30 @@ major 不等于 1 或双方没有交集时返回 `PROTOCOL_VERSION_UNSUPPORTED`�
 `capabilities/read` 返回已协商能力与明确的 `unsupported` 条目。首发明确不提供
 OpenAI Responses、ACP、WebSocket、OAuth、MCP Resources/Prompts/Sampling、插件热加载；
 请求这些功能必须得到 `CAPABILITY_UNSUPPORTED` 或等价稳定错误，不得静默降级成另一种语义。
+
+### 一次性 readiness challenge
+
+`initialized` 是 Rust/Tauri 对当前 stdio pipe generation 的一次性 challenge，不是空
+通知。Rust 必须使用系统 CSPRNG 生成一个新的 128-bit `readyToken`，以 32 个十六进制
+字符传入 `initialized.params.readyToken`。它用于证明通知和后续 ready 事件属于同一代
+管道，因此虽然不是 secret，仍禁止写入日志、诊断、trace、崩溃报告或持久化状态。
+
+Java 只有在成功解析并接受这一条 `initialized` 后，才能发送
+`runtime/statusChanged`，且 `status` 必须为 `ready`、`params.readyToken` 必须与
+challenge 按字节原样相等。schema 只能校验 presence 和格式；相等性、顺序和一次性由
+Rust/Java runtime invariant 校验。缺失、格式错误、错误、旧 generation、重复
+`initialized` 或重复 `ready` 都必须以 `HANDSHAKE_FAILED` 终止本次握手，禁止进入
+`ready`。
+
+`starting`、`degraded`、`shutting_down`、`stopped` 和 `crashed` 等非 `ready` 状态不
+携带 `readyToken`；schema 会拒绝带 token 的非 ready 状态。每次 sidecar 重启或
+generation 切换都必须生成不同 token；旧 token 不能恢复新 generation 的 ready 状态。
+
+整帧脱敏边界只有两个精确例外：当前 `initialized.params.readyToken`，以及与当前
+challenge 匹配的 `runtime/statusChanged(ready).params.readyToken`。握手序列中任何其他
+位置（包括 error response 外层 meta、runtime notice message/extensions、diagnostics、
+result、provider/tool failure payload）出现 `readyToken` 键，或把当前/历史 challenge
+原值作为 JSON object key/value，都必须拒绝；不允许通过未知扩展字段绕过。
 
 ## 4. 领域 ID 与权威状态
 

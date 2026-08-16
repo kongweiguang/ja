@@ -13,13 +13,20 @@ Rust/React 执行；缺口必须走 snapshot/resync，不能猜测补齐。
 
 | method | params 核心字段 | 终态/恢复语义 |
 | --- | --- | --- |
-| `runtime/statusChanged` | `serverInstanceId`、`eventId`、`occurredAt`、`status` (`starting/ready/degraded/shutting_down/stopped/crashed`)、`reason?`、`health?` | sidecar 生命周期；不带 Thread seq |
+| `runtime/statusChanged` | `serverInstanceId`、`eventId`、`occurredAt`、`status` (`starting/ready/degraded/shutting_down/stopped/crashed`)、`readyToken`（仅 `status=ready` 条件必填；非 ready 禁止）、`reason?`、`health?` | sidecar 生命周期；ready 必须带当前 generation 的 challenge；不带 Thread seq |
 | `runtime/notice` | runtime 基础字段、稳定 `code`、脱敏 `message`、`threadId?`、`turnId?` | 说明恢复、重连、resync 或 enforcement，不改变事实状态 |
 | `runtime/overload` | runtime 基础字段、`queue`、`retryable`、`retryAfterMs?` | 说明 inbound/outbound/pending/artifact/tool_output 超限；关键事实不能静默丢弃 |
 
 `runtime/statusChanged(ready)` 只能在 `initialize`/`initialized` 完成且数据库、能力和
-limits 已确定后发送。`crashed` 只表示本实例异常退出；新实例用新的 serverInstanceId
+limits 已确定后发送，并且必须原样回显 `initialized.params.readyToken`。schema 只负责
+校验 token 的 32 位 hex 格式；Rust/Java 必须额外校验 token 相等、generation 未切换、
+没有重复 ready，并在失败时用 `HANDSHAKE_FAILED` 禁止晋级。challenge 不得记录到日志。
+`crashed` 只表示本实例异常退出；新实例用新的 serverInstanceId 和新的 challenge，
 并通过 snapshot 恢复已提交事实。
+
+所有 `error` response、`runtime/notice`、诊断和 provider/tool 失败详情共享同一脱敏
+边界：递归禁止 `readyToken` 键，也禁止把当前或历史 generation 的 challenge 原值作为
+任意 JSON object key 或 value；不得通过 `details`、数组或嵌套 provider payload 绕过。
 
 ## Thread 与 Turn
 
