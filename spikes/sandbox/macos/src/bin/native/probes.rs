@@ -521,7 +521,7 @@ fn run_setsid_case(
             evidence,
             None,
             Duration::from_millis(700),
-            SetSidExpectation::DeniedSuccess,
+            SetSidExpectation::Escaped,
             "setsid-report-timeout",
         );
     }
@@ -533,7 +533,7 @@ fn run_setsid_case(
                 evidence,
                 None,
                 Duration::from_millis(700),
-                SetSidExpectation::DeniedSuccess,
+                SetSidExpectation::Escaped,
                 "setsid-report-read",
             );
         }
@@ -545,7 +545,7 @@ fn run_setsid_case(
                 evidence,
                 None,
                 Duration::from_millis(700),
-                SetSidExpectation::NoDescendantSuccess,
+                SetSidExpectation::DeniedUnsupported,
                 "setsid-denial-exit",
             );
         }
@@ -556,7 +556,7 @@ fn run_setsid_case(
                 evidence,
                 None,
                 Duration::from_millis(700),
-                SetSidExpectation::DeniedSuccess,
+                SetSidExpectation::Escaped,
                 "setsid-report-parse",
             );
         }
@@ -564,14 +564,24 @@ fn run_setsid_case(
     // Capture the escaped descendant while the report's long-lived fixture is
     // still alive, before host cleanup can create a PID-reuse ambiguity.
     let identity = match capture_escaped_identity(pid, "setsid descendant identity query failed") {
-        Ok(identity) => Some(identity),
+        Ok(identity) if escaped_identity_is_valid(&identity, &evidence) => Some(identity),
+        Ok(_) => {
+            return finish_setsid_case(
+                child,
+                evidence,
+                None,
+                Duration::from_millis(700),
+                SetSidExpectation::Escaped,
+                "setsid-identity-not-escaped",
+            );
+        }
         Err(_) => {
             return finish_setsid_case(
                 child,
                 evidence,
                 None,
                 Duration::from_millis(700),
-                SetSidExpectation::DeniedSuccess,
+                SetSidExpectation::Escaped,
                 "setsid-identity-capture",
             );
         }
@@ -639,7 +649,7 @@ fn run_setsid_output_case(
             evidence,
             None,
             Duration::from_secs(5),
-            SetSidExpectation::Overflow,
+            SetSidExpectation::Escaped,
             "setsid-output-report-timeout",
         );
     }
@@ -651,7 +661,7 @@ fn run_setsid_output_case(
                 evidence,
                 None,
                 Duration::from_secs(5),
-                SetSidExpectation::Overflow,
+                SetSidExpectation::Escaped,
                 "setsid-output-report-read",
             );
         }
@@ -664,7 +674,7 @@ fn run_setsid_output_case(
                     evidence,
                     None,
                     Duration::from_secs(5),
-                    SetSidExpectation::NoDescendantSuccess,
+                    SetSidExpectation::DeniedUnsupported,
                     "setsid-output-deadline",
                 );
             }
@@ -673,7 +683,7 @@ fn run_setsid_output_case(
                 evidence,
                 None,
                 Duration::from_secs(5),
-                SetSidExpectation::NoDescendantSuccess,
+                SetSidExpectation::DeniedUnsupported,
                 "setsid-output-denial-exit",
             );
         }
@@ -684,21 +694,31 @@ fn run_setsid_output_case(
                 evidence,
                 None,
                 Duration::from_secs(5),
-                SetSidExpectation::Overflow,
+                SetSidExpectation::Escaped,
                 "setsid-output-report-parse",
             );
         }
     };
     let identity =
         match capture_escaped_identity(pid, "continuous setsid descendant identity query failed") {
-            Ok(identity) => Some(identity),
+            Ok(identity) if escaped_identity_is_valid(&identity, &evidence) => Some(identity),
+            Ok(_) => {
+                return finish_setsid_case(
+                    child,
+                    evidence,
+                    None,
+                    Duration::from_secs(5),
+                    SetSidExpectation::Escaped,
+                    "setsid-output-identity-not-escaped",
+                );
+            }
             Err(_) => {
                 return finish_setsid_case(
                     child,
                     evidence,
                     None,
                     Duration::from_secs(5),
-                    SetSidExpectation::Overflow,
+                    SetSidExpectation::Escaped,
                     "setsid-output-identity-capture",
                 );
             }
@@ -736,10 +756,10 @@ fn run_setsid_output_case(
 }
 
 enum SetSidExpectation {
-    /// The worker explicitly proved Seatbelt denied setsid before creating a
-    /// descendant; this is the only branch where an absent PID is success.
-    NoDescendantSuccess,
-    DeniedSuccess,
+    /// The worker explicitly reported a platform-level setsid refusal.  This
+    /// is cleaned up and surfaced as a native capability failure; it is never
+    /// accepted as the supported macOS escaped-session result.
+    DeniedUnsupported,
     Escaped,
     Overflow,
 }
@@ -759,7 +779,28 @@ fn recover_escaped_identity(
         return Err("setsid recovery report empty".into());
     }
     let pid = parse_report_pid(&text, "setsid recovery report pid missing")?;
-    capture_escaped_identity(pid, "setsid recovery identity query failed")
+    let identity = capture_escaped_identity(pid, "setsid recovery identity query failed")?;
+    if !escaped_identity_is_valid(&identity, evidence) {
+        return Err("setsid recovery identity did not escape group".into());
+    }
+    Ok(identity)
+}
+
+/// Require the captured child to prove the actual setsid topology: Darwin
+/// makes a successful session leader its own process-group leader, and its
+/// PGID must differ from the host wrapper group before cleanup can target it.
+fn escaped_identity_is_valid(
+    identity: &ControlledProcessIdentity,
+    evidence: &EscapeEvidence,
+) -> bool {
+    let Ok(pid) = i32::try_from(identity.pid) else {
+        return false;
+    };
+    identity.pid > 1
+        && identity.pgid > 1
+        && identity.pid != evidence.parent_pid
+        && identity.pgid == pid
+        && identity.pgid != evidence.parent_pgid
 }
 
 /// Finish every setsid path through one bounded child/descendant finalizer.
@@ -775,7 +816,7 @@ fn finish_setsid_case(
 ) -> Result<(), String> {
     let mut escaped = escaped;
     let recovery_error =
-        if escaped.is_none() && !matches!(expectation, SetSidExpectation::NoDescendantSuccess) {
+        if escaped.is_none() && !matches!(expectation, SetSidExpectation::DeniedUnsupported) {
             match recover_escaped_identity(&evidence) {
                 Ok(identity) => {
                     escaped = Some(identity);
@@ -786,18 +827,10 @@ fn finish_setsid_case(
         } else {
             false
         };
-    let result = child.wait_with_output(timeout);
-    let child_cleanup_ok = !matches!(result, Err(SandboxError::ChildCleanup(_)));
-    let outcome_ok = match expectation {
-        SetSidExpectation::NoDescendantSuccess => {
-            matches!(&result, Ok(output) if output.outcome.status.success())
-        }
-        SetSidExpectation::DeniedSuccess => {
-            matches!(&result, Ok(output) if output.outcome.status.success())
-        }
-        SetSidExpectation::Escaped => result.is_err(),
-        SetSidExpectation::Overflow => matches!(result, Err(SandboxError::OutputOverflow)),
-    };
+    // Close an escaped writer before waiting on the wrapper.  The wrapper's
+    // process-group kill cannot reach a child that successfully called
+    // setsid, so waiting first would only observe an output-pipe timeout and
+    // abort before this negative case had proved its bounded escape cleanup.
     let escaped_cleanup_ok = !recovery_error
         && escaped.as_ref().is_none_or(|identity| {
             let Ok(pid) = i32::try_from(identity.pid) else {
@@ -806,6 +839,15 @@ fn finish_setsid_case(
             terminate_controlled_identity(identity, Duration::from_secs(2)).is_ok()
                 && verify_process_gone(pid).is_ok()
         });
+    let result = child.wait_with_output(timeout);
+    let child_cleanup_ok = !matches!(result, Err(SandboxError::ChildCleanup(_)));
+    let outcome_ok = match expectation {
+        SetSidExpectation::DeniedUnsupported => {
+            matches!(&result, Ok(output) if output.outcome.status.success())
+        }
+        SetSidExpectation::Escaped => result.is_err(),
+        SetSidExpectation::Overflow => matches!(result, Err(SandboxError::OutputOverflow)),
+    };
     let escape_observed = escaped.is_some();
     if !child_cleanup_ok || !outcome_ok || !escaped_cleanup_ok {
         fail_closed_setsid(&mut evidence, escaped.as_ref(), failure_category);
@@ -816,6 +858,9 @@ fn finish_setsid_case(
     }
     if escape_observed {
         return Err("setsid descendant escaped process-group cleanup".into());
+    }
+    if matches!(expectation, SetSidExpectation::DeniedUnsupported) {
+        return Err("setsid was denied by the macOS runner".into());
     }
     Ok(())
 }

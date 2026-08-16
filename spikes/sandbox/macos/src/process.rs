@@ -36,7 +36,23 @@ pub struct BoundedCommandOutput {
 /// The process group is assigned before exec so cleanup never depends on a
 /// post-spawn race; an impossible reserved PID is reaped before returning.
 pub fn spawn_grouped(command: &mut Command) -> io::Result<Child> {
-    command.process_group(0);
+    spawn_internal(command, true)
+}
+
+/// Spawn an ordinary descendant without changing its inherited process group.
+/// Host cleanup must be able to terminate normal worker descendants with the
+/// wrapper group; only the explicit setsid fixture is allowed to create an
+/// escape group, and it is handled as a separate negative test.
+pub fn spawn_inherited(command: &mut Command) -> io::Result<Child> {
+    spawn_internal(command, false)
+}
+
+/// Share reserved-PID handling between the two explicitly reviewed spawn
+/// modes so no caller can receive an untracked child after a fork boundary.
+fn spawn_internal(command: &mut Command, new_process_group: bool) -> io::Result<Child> {
+    if new_process_group {
+        command.process_group(0);
+    }
     let mut child = command.spawn()?;
     let pid = i32::try_from(child.id()).unwrap_or(-1);
     if pid > 1 {

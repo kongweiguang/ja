@@ -14,7 +14,7 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use ja_macos_sandbox_spike::{run_bounded_command, spawn_grouped};
+    use ja_macos_sandbox_spike::{run_bounded_command, spawn_inherited};
     use std::env;
     use std::fs::{self, OpenOptions};
     use std::io::{self, Write};
@@ -22,7 +22,7 @@ mod macos {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -106,8 +106,10 @@ mod macos {
         write_stdout(&lines.join("\n"))
     }
 
-    /// Start a descendant that holds a report barrier so timeout cleanup can be
-    /// proven against a real PID rather than a process-name guess.
+    /// Start a descendant and keep the direct parent on the same barrier so
+    /// the host's timeout path is exercised before normal parent-exit cleanup;
+    /// otherwise the parent can exit immediately and make a blocked descendant
+    /// look like a successful normal completion.
     fn run_spawn_grandchild(args: &[String]) -> Result<(), String> {
         let report = path_arg(args, "--report")?;
         let child_report = path_arg(args, "--child-report")?;
@@ -128,11 +130,12 @@ mod macos {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let child =
-            spawn_grouped(&mut command).map_err(|error| format!("spawn descendant: {error}"))?;
+            spawn_inherited(&mut command).map_err(|error| format!("spawn descendant: {error}"))?;
         write_report(
             &report,
             &format!("grandchild-started=true\npid={}", child.id()),
-        )
+        )?;
+        wait_for_barrier(&release, Duration::from_secs(30))
     }
 
     /// Let the direct parent exit while a grandchild inherits stdout/stderr; the
@@ -156,7 +159,7 @@ mod macos {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        let _child = spawn_grouped(&mut command)
+        let _child = spawn_inherited(&mut command)
             .map_err(|error| format!("spawn inherited descendant: {error}"))?;
         write_report(&report, "grandchild-started=true")
     }
@@ -182,7 +185,7 @@ mod macos {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        let _child = spawn_grouped(&mut command)
+        let _child = spawn_inherited(&mut command)
             .map_err(|error| format!("spawn overflow descendant: {error}"))?;
         write_report(&report, "grandchild-started=true")?;
         let mut output = io::stdout().lock();
@@ -231,12 +234,29 @@ mod macos {
                 }
             });
         }
-        let started = match spawn_grouped(&mut command) {
-            Ok(child) => {
+        // The child must inherit the wrapper group before pre_exec calls
+        // setsid; making it a group leader first would make setsid fail with
+        // EPERM and silently skip the real escaped-session negative case.
+        let started = match spawn_inherited(&mut command) {
+            Ok(mut child) => {
                 // Keep the marker and PID as one fixed record so the host can
                 // reject duplicates, unknown fields, and mixed denial states.
-                write_report(&report, &format!("setsid-started=true\npid={}", child.id()))?;
-                true
+                match write_report(&report, &format!("setsid-started=true\npid={}", child.id())) {
+                    Ok(()) => {
+                        // The host now owns the durable PID evidence and will
+                        // terminate this escaped group after capture; dropping
+                        // only the Rust handle does not signal the child.
+                        drop(child);
+                        true
+                    }
+                    Err(error) => {
+                        // Without a report the host cannot capture the escaped
+                        // PID, so this worker must synchronously reap the exact
+                        // direct child rather than release an untracked group.
+                        reap_unreported_child(&mut child);
+                        return Err(error);
+                    }
+                }
             }
             Err(_) => {
                 write_report(&report, "setsid-denied=true")?;
@@ -383,6 +403,26 @@ mod macos {
             .write_all(content.as_bytes())
             .and_then(|_| io::stdout().flush())
             .map_err(|error| error.to_string())
+    }
+
+    /// Reap a setsid child whose startup record could not be published.  The
+    /// host has no PID evidence in this branch, so returning with a live child
+    /// would make bounded process-tree cleanup impossible to audit.
+    fn reap_unreported_child(child: &mut Child) {
+        let _ = child.kill();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) | Err(_) => {
+                    eprintln!("SANDBOX-WORKER: unreported setsid child cleanup failed");
+                    std::process::abort();
+                }
+            }
+        }
     }
 
     /// Read a named option without treating a following option as its value.

@@ -151,7 +151,9 @@ setsid report 只接受完整的 `setsid-denied=true`，或恰好一次
 尾随和 denied/PID 冲突字段都是 typed failure，PID 还必须是无符号 ASCII 十进制，不是“没有 descendant”。child recovery
 report 也必须是一个包含已知 marker 与恰好一次有效 PID 的完整记录。report 缺失、空内容、
 无 PID 或非法 PID 都是 typed failure，不是“没有 descendant”。
-只有 worker 明确写出 `setsid-denied=true` 的预先分支才可证明 no descendant。其余
+只有 worker 明确写出 `setsid-denied=true` 的预先分支才可证明 no descendant；在当前
+macOS acceptance runner 上该分支会作为明确的平台能力失败返回，不能替代真实
+`setsid-started=true` escaped-session 负例。其余
 report、read、parse、capture 或 identity cleanup 任一失败都会经同一个 bounded finalizer
 升级固定 failure state 并保留 evidence；若 failure upgrade、证据恢复或 detached
 descendant cleanup 不能证明完成，先持久化固定 evidence 再 abort。只有 direct reap、

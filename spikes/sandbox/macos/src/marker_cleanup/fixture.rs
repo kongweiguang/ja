@@ -112,7 +112,10 @@ fn descendant_case() -> Result<(), &'static str> {
     command
         .args([
             "-c",
-            "/bin/sh -c '/bin/sleep 30 & wait' </dev/null >/dev/null 2>/dev/null & echo $!",
+            // Let the launcher exit while its sleep descendant keeps the
+            // inherited group alive; cleanup then targets a real descendant,
+            // not the short-lived launcher shell itself.
+            "/bin/sleep 30 & echo $!",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

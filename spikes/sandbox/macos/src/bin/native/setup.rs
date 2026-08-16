@@ -1687,6 +1687,58 @@ mod scope_lifecycle_tests {
         }
     }
 
+    /// A setsid report is accepted only when the queried PID became its own
+    /// new process-group leader; matching the wrapper PGID would otherwise
+    /// let the denied pre_exec path masquerade as an escaped-session test.
+    #[test]
+    fn escaped_identity_requires_new_process_group() {
+        let evidence = EscapeEvidence {
+            path: PathBuf::new(),
+            identity: ScopeFileIdentity {
+                dev: 1,
+                ino: 2,
+                nlink: 1,
+                mode: 0o600,
+                uid: 3,
+            },
+            contents: Vec::new(),
+            operation_id: "setsid".into(),
+            parent_pid: 7,
+            parent_pgid: 8,
+            nonce: 9,
+            recovery_report: None,
+        };
+        let valid = ControlledProcessIdentity {
+            pid: 42,
+            pgid: 42,
+            start_identity: "Mon Jan 1 00:00:00 2026".into(),
+            comm: "ja-sandbox-worker".into(),
+        };
+        assert!(escaped_identity_is_valid(&valid, &evidence));
+        assert!(!escaped_identity_is_valid(
+            &ControlledProcessIdentity {
+                pgid: 8,
+                ..valid.clone()
+            },
+            &evidence
+        ));
+        assert!(!escaped_identity_is_valid(
+            &ControlledProcessIdentity {
+                pgid: 43,
+                ..valid.clone()
+            },
+            &evidence
+        ));
+        assert!(!escaped_identity_is_valid(
+            &ControlledProcessIdentity {
+                pid: 1,
+                pgid: 1,
+                ..valid
+            },
+            &evidence
+        ));
+    }
+
     /// Provisional escape evidence is durable before spawn and cannot be
     /// mistaken for a captured descendant; reserved parent identities are
     /// rejected before any file image is published.

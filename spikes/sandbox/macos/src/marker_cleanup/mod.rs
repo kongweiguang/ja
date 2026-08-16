@@ -158,7 +158,10 @@ fn identity_matches(record: &MarkerRecord, actual: &ProcessIdentity, allow_fixtu
             && matches!(actual.comm.as_str(), "log" | "/usr/bin/log"))
             || (allow_fixture
                 && record.executable_kind == "fixture"
-                && matches!(actual.comm.as_str(), "sh" | "/bin/sh")))
+                && matches!(
+                    actual.comm.as_str(),
+                    "sh" | "/bin/sh" | "sleep" | "/bin/sleep"
+                )))
 }
 
 /// Remove only the exact sibling marker names derived from a validated owner
