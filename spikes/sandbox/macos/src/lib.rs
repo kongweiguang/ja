@@ -12,6 +12,9 @@ mod path;
 mod macos;
 
 #[cfg(target_os = "macos")]
+pub mod marker_cleanup;
+
+#[cfg(target_os = "macos")]
 pub use macos::{
     ChildOutcome, MAX_OUTPUT_BYTES, RunOutput, SandboxChild, SandboxError, SandboxSpec,
     kill_process, process_is_alive, spawn,

@@ -43,7 +43,29 @@ jobs:
           cargo +1.88.0 metadata --manifest-path spikes/sandbox/macos/Cargo.toml --locked --format-version 1 --no-deps >/dev/null
           # cargo fmt has no --locked option; the locked metadata check above
           # verifies the manifest/lock contract before rustfmt runs.
-          cargo +1.88.0 fmt --manifest-path spikes/sandbox/macos/Cargo.toml -- --check
+          cargo +1.88.0 fmt --all --manifest-path spikes/sandbox/macos/Cargo.toml -- --check
+          for source in \
+            spikes/sandbox/macos/src/bin/probe.rs \
+            spikes/sandbox/macos/src/bin/probe_unit_tests/mod.rs \
+            spikes/sandbox/macos/src/bin/probe_lifecycle/mod.rs \
+            spikes/sandbox/macos/src/bin/native/mod.rs \
+            spikes/sandbox/macos/src/bin/native/setup.rs \
+            spikes/sandbox/macos/src/bin/native/probes.rs \
+            spikes/sandbox/macos/src/bin/probe_diagnostics/mod.rs \
+            spikes/sandbox/macos/src/bin/probe_diagnostics/capture.rs \
+            spikes/sandbox/macos/src/bin/probe_diagnostics/evidence.rs \
+            spikes/sandbox/macos/src/bin/probe_diagnostics/lifecycle.rs \
+            spikes/sandbox/macos/src/bin/probe_diagnostics/marker.rs \
+            spikes/sandbox/macos/src/bin/probe_diagnostics/query.rs \
+            spikes/sandbox/macos/src/bin/probe_diagnostics/redaction.rs \
+            spikes/sandbox/macos/src/bin/probe_diagnostics/tests.rs \
+            spikes/sandbox/macos/src/bin/marker_cleanup.rs \
+            spikes/sandbox/macos/src/marker_cleanup/mod.rs \
+            spikes/sandbox/macos/src/marker_cleanup/marker.rs \
+            spikes/sandbox/macos/src/marker_cleanup/process.rs \
+            spikes/sandbox/macos/src/marker_cleanup/fixture.rs; do
+            rustfmt +1.88.0 --edition 2024 --check "$source"
+          done
 
       - name: Native compile gate
         shell: bash
@@ -54,6 +76,11 @@ jobs:
         shell: bash
         timeout-minutes: 5
         run: cargo +1.88.0 clippy --manifest-path spikes/sandbox/macos/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Marker cleanup fixture gate
+        shell: bash
+        timeout-minutes: 3
+        run: bash spikes/sandbox/macos/ci/marker_cleanup_fixture.sh
 
       - name: Native security tests
         shell: bash
@@ -75,13 +102,35 @@ jobs:
             | tee "$RUNNER_TEMP/ja-sandbox-report/probe.log"
           grep -F "SANDBOX-PASS" "$RUNNER_TEMP/ja-sandbox-report/probe.log"
 
-      - name: Residual process gate
+      - name: Cleanup diagnostic helpers
+        if: always()
         shell: bash
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          if ps -axo comm= | awk '$1 == "ja-sandbox-probe" || $1 == "ja-sandbox-worker" || $1 == "ja_sandbox_probe" || $1 == "ja_sandbox_worker" { found = 1 } END { exit !found }'; then
-            echo "JA sandbox process residue detected" >&2
+          report_dir="$RUNNER_TEMP/ja-sandbox-report"
+          mkdir -p "$report_dir"
+          cargo +1.88.0 run \
+            --manifest-path spikes/sandbox/macos/Cargo.toml \
+            --bin marker_cleanup \
+            --locked \
+            -- --root "$RUNNER_TEMP" --report "$report_dir/helper-cleanup.log"
+
+      - name: Residual process gate
+        if: always()
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          cleanup_log="$RUNNER_TEMP/ja-sandbox-report/helper-cleanup.log"
+          if [[ -f "$cleanup_log" ]] && grep -Eq "marker-(residual|invalid|incomplete|entry-invalid|group-unsafe|owner-mismatch|remove-failed|fallback-missing|pending|stat-invalid|root-invalid|process-probe-failed|signal-failed|eperm|query-unreaped|query-group-residual)=true" "$cleanup_log"; then
+            echo "JA sandbox diagnostic helper cleanup evidence is unsafe or residual" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          residual_markers=("$RUNNER_TEMP"/ja-sandbox-log-helper-*.marker "$RUNNER_TEMP"/ja-sandbox-log-helper-*.fallback "$RUNNER_TEMP"/ja-sandbox-log-helper-*.emergency "$RUNNER_TEMP"/.ja-sandbox-log-helper-*.marker.pending "$RUNNER_TEMP"/.ja-sandbox-log-helper-*.fallback.pending "$RUNNER_TEMP"/.ja-sandbox-log-helper-*.emergency.pending)
+          if (( ${#residual_markers[@]} > 0 )); then
+            echo "JA sandbox marker residue detected" >&2
             exit 1
           fi
 
