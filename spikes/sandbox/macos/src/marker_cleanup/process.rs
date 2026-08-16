@@ -255,10 +255,10 @@ pub(super) fn reap_child_bounded(
     require_group_empty(process_group, deadline)
 }
 
-/// Kill the freshly spawned child's complete process group when identity
-/// inspection failed before a trusted `ProcessIdentity` existed.  The live
-/// `Child` handle pins its PID against reuse, while strict PGID validation and
-/// bounded direct reap prevent an early query fault from orphaning descendants.
+/// Strict group reap for EOF, invalid-control and setup-failure paths.  The
+/// native fixture uses the separate proof-bound direct-reap path only after a
+/// real production hook has completed the initial group signal; every other
+/// path must retain this second-signal fail-closed behavior.
 #[cfg(target_os = "macos")]
 pub(super) fn reap_child_group_bounded(
     child: &mut Child,
@@ -1357,6 +1357,21 @@ mod tests {
             Ok(())
         );
         assert_eq!(probe.validations.len(), 1);
+    }
+
+    /// An unauthorized same-group descendant keeps the PGID present; the
+    /// acknowledged path must retain evidence rather than treating a direct
+    /// Child reap as permission to publish an ACK.
+    #[test]
+    fn acknowledged_group_signal_retains_residual_group() {
+        let mut probe = FakePostSignalProbe {
+            states: VecDeque::from([Ok((ProcessState::Empty, ProcessState::Present))]),
+            validations: VecDeque::new(),
+        };
+        assert_eq!(
+            wait_after_acknowledged_group_signal(&mut probe, Instant::now(),),
+            Err("marker-residual")
+        );
     }
 
     /// Prove a direct-PID/group disagreement takes the identity revalidation

@@ -153,6 +153,7 @@ fn cleanup_diagnostic_code(code: &str) -> &'static str {
         "fixture-helper-ack",
         "fixture-helper-reap",
         "fixture-helper-identity",
+        "fixture-helper-proof",
         "fixture-helper-pid",
         "fixture-helper-pipe",
         "fixture-clock",

@@ -131,6 +131,14 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   supervisor terminal/EOF，chunked 合法行才接受，任何第二行、尾随字节、超量输出或
   nonzero status 都失败。父端随后只等待/reap supervisor 并再次独立复核
   target/supervisor，绝不会在 ack 被消费前直接杀 supervisor。
+  supervisor 收到 `q` 时 target group 可能已经被 production 的 group signal 清空；
+  production hook 会把一次性 `PostSignalProof` 连同 q 发送，proof 绑定 target 的
+  PID/PGID/UID/comm/start identity。supervisor 只有在重新查询并匹配这组完整 identity、
+  且 proof 尚未消费时，才能用仍持有的 direct `Child` 做 bounded reap，再独立要求
+  target PGID `ESRCH`；不会把第二次 group signal 的预期 `ESRCH` 误报成 ACK 失败。
+  proof 缺失、格式错误、重复、PID reuse 或 PGID 仍有未授权 descendant 时，回到严格
+  group cleanup 或直接 fail-closed，绝不写 ACK。EOF、非 q、读错和 setup fault 从不调用
+  proof-bound helper。
   ACK 成功后，生产状态机继续使用已捕获的 target identity 只做 PID/PGID
   disappearance 复核；即使 Darwin 短暂把 direct PID 报为 present，也等待其
   gone/residual 结果而不对预期已 reap 的 PID 重新执行 `ps` identity query。

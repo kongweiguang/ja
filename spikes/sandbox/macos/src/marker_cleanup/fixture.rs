@@ -26,6 +26,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FIXTURE_CLEANUP_DEADLINE: Duration = Duration::from_secs(8);
 const FIXTURE_ACK_BYTES: usize = 256;
+const FIXTURE_ACK_WRITE_DEADLINE: Duration = Duration::from_secs(1);
+const POST_SIGNAL_PROOF_BYTES: usize = 1024;
+const POST_SIGNAL_PROOF_FIELD_BYTES: usize = 256;
 
 /// Run forged, pending, residual-descendant and exact-EPERM cases using the
 /// same scan/signal implementation that production workflow cleanup invokes.
@@ -150,14 +153,38 @@ pub(super) fn run_fixture_launcher() -> ! {
         };
         match event {
             FixtureControlEvent::Command => {
-                terminate_fixture_child(&mut child, "fixture-helper-control");
-                if write_fixture_reap_ack().is_err() {
-                    // The target is already reaped, but without an explicit
-                    // acknowledgement the parent cannot safely distinguish a
-                    // completed supervisor transaction from a crashed one.
-                    abort_unreaped_query("fixture-helper-ack");
+                let proof_deadline = Instant::now() + Duration::from_secs(2);
+                match read_fixture_post_signal_proof(&mut control, proof_deadline) {
+                    Ok(mut proof) => {
+                        if reap_fixture_child_after_group_signal(
+                            &mut child,
+                            &mut proof,
+                            proof_deadline,
+                        )
+                        .is_ok()
+                        {
+                            if write_fixture_reap_ack().is_err() {
+                                // The target is already reaped, but without an
+                                // explicit acknowledgement the parent cannot
+                                // distinguish completion from a crashed helper.
+                                abort_unreaped_query("fixture-helper-ack");
+                            }
+                            break;
+                        }
+                        // A q without a valid production proof is not the
+                        // post-signal path.  Re-enter the original strict
+                        // group cleanup, preserving fail-closed behavior for
+                        // forged/PID-reused/malformed control payloads.
+                        terminate_fixture_child(&mut child, "fixture-helper-control");
+                        abort_unreaped_query("fixture-helper-proof");
+                    }
+                    Err(_) => {
+                        // Missing or malformed proof is handled exactly like
+                        // every other non-production control fault.
+                        terminate_fixture_child(&mut child, "fixture-helper-control");
+                        abort_unreaped_query("fixture-helper-proof");
+                    }
                 }
-                break;
             }
             FixtureControlEvent::Eof => {
                 terminate_fixture_child(&mut child, "fixture-helper-control");
@@ -188,6 +215,178 @@ enum FixtureControlEvent {
     SetupFailed,
 }
 
+/// Carry the production hook's completed group-signal proof across the
+/// supervisor pipe.  The child-side helper may use the direct-reap shortcut
+/// only after this exact identity has been checked and this value consumed;
+/// EOF, malformed input, and ordinary control paths never receive such a
+/// capability.
+struct PostSignalProof {
+    identity: ProcessIdentity,
+    consumed: bool,
+}
+
+impl PostSignalProof {
+    /// Issue a proof only from the callback that production invokes after its
+    /// captured group signal phase.  Keeping construction private prevents a
+    /// generic fixture-control branch from manufacturing the shortcut.
+    fn issue_from_production_hook(captured: &ProcessIdentity) -> Self {
+        Self {
+            identity: captured.clone(),
+            consumed: false,
+        }
+    }
+
+    /// Encode all PID-reuse dimensions without putting command/path text into
+    /// the control protocol or diagnostics; the child validates the decoded
+    /// identity against its own exact Child before consuming the proof.
+    fn encode(&self) -> Result<Vec<u8>, &'static str> {
+        if self.consumed {
+            return Err("fixture-helper-proof");
+        }
+        let comm = encode_proof_field(&self.identity.comm)?;
+        let start = encode_proof_field(&self.identity.start_identity)?;
+        let wire = format!(
+            "post-signal-proof-v1;pid={};pgid={};uid={};comm={comm};start={start}\n",
+            self.identity.pid, self.identity.pgid, self.identity.uid
+        );
+        if wire.len() > POST_SIGNAL_PROOF_BYTES {
+            return Err("fixture-helper-proof");
+        }
+        Ok(wire.into_bytes())
+    }
+
+    /// Consume exactly once after every identity field matches the observed
+    /// target.  Reuse, cross-target proof, and PID-replacement attempts are
+    /// all rejected before any direct Child signal is attempted.
+    fn consume_for(&mut self, observed: &ProcessIdentity) -> Result<(), &'static str> {
+        if self.consumed || self.identity != *observed {
+            return Err("fixture-helper-identity");
+        }
+        self.consumed = true;
+        Ok(())
+    }
+}
+
+/// Convert a bounded identity string to an ASCII-only wire field.  Hex keeps
+/// spaces and platform command names out of the grammar while preserving the
+/// complete start/comm identity for the child-side equality check.
+fn encode_proof_field(value: &str) -> Result<String, &'static str> {
+    if value.is_empty() || value.len() > POST_SIGNAL_PROOF_FIELD_BYTES {
+        return Err("fixture-helper-proof");
+    }
+    Ok(value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// Decode one strict hexadecimal identity field; unknown, empty, oversized,
+/// and non-UTF-8 values never become a usable post-signal capability.
+fn decode_proof_field(value: &str) -> Result<String, &'static str> {
+    if value.is_empty()
+        || value.len() > POST_SIGNAL_PROOF_FIELD_BYTES * 2
+        || !value.len().is_multiple_of(2)
+    {
+        return Err("fixture-helper-proof");
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = proof_hex_nibble(pair[0]).ok_or("fixture-helper-proof")?;
+        let low = proof_hex_nibble(pair[1]).ok_or("fixture-helper-proof")?;
+        bytes.push((high << 4) | low);
+    }
+    String::from_utf8(bytes).map_err(|_| "fixture-helper-proof")
+}
+
+/// Parse one ASCII hex nibble without accepting locale or Unicode variants.
+fn proof_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse the exact proof record emitted by the production hook.  Field order,
+/// count, bounds and identity ranges are fixed so a malformed q payload can
+/// only enter the strict cleanup path, never the post-signal shortcut.
+fn decode_post_signal_proof(line: &[u8]) -> Result<PostSignalProof, &'static str> {
+    if line.len() > POST_SIGNAL_PROOF_BYTES || !line.ends_with(b"\n") {
+        return Err("fixture-helper-proof");
+    }
+    let line = std::str::from_utf8(line).map_err(|_| "fixture-helper-proof")?;
+    let fields: Vec<&str> = line[..line.len() - 1].split(';').collect();
+    if fields.len() != 6 || fields[0] != "post-signal-proof-v1" {
+        return Err("fixture-helper-proof");
+    }
+    let pid = parse_proof_field(fields[1], "pid=")
+        .and_then(|value| value.parse::<u32>().map_err(|_| "fixture-helper-proof"))?;
+    let pgid = parse_proof_field(fields[2], "pgid=")
+        .and_then(|value| value.parse::<i32>().map_err(|_| "fixture-helper-proof"))?;
+    let uid = parse_proof_field(fields[3], "uid=")
+        .and_then(|value| value.parse::<u32>().map_err(|_| "fixture-helper-proof"))?;
+    let comm = decode_proof_field(parse_proof_field(fields[4], "comm=")?)?;
+    let start_identity = decode_proof_field(parse_proof_field(fields[5], "start=")?)?;
+    // The fixture target is spawned with process_group(0), so its production
+    // proof is valid only when the target PID is also its PGID.  Rejecting the
+    // mismatch in the wire parser keeps malformed q payloads out of the
+    // direct-reap helper even before a Child is available for comparison.
+    if pid <= 1 || pgid <= 1 || u32::try_from(pgid).ok() != Some(pid) {
+        return Err("fixture-helper-proof");
+    }
+    Ok(PostSignalProof {
+        identity: ProcessIdentity {
+            pid,
+            pgid,
+            uid,
+            comm,
+            start_identity,
+        },
+        consumed: false,
+    })
+}
+
+/// Extract one ordered proof field while preserving the input slice lifetime;
+/// the parser never accepts a duplicate, unknown, empty, or reordered key.
+fn parse_proof_field<'a>(field: &'a str, name: &str) -> Result<&'a str, &'static str> {
+    field
+        .strip_prefix(name)
+        .filter(|value| !value.is_empty())
+        .ok_or("fixture-helper-proof")
+}
+
+/// Read one complete proof record after the command byte.  The reader is
+/// nonblocking and bounded so a q without a production proof cannot hang the
+/// supervisor or accidentally enter the direct-reap shortcut.
+fn read_fixture_post_signal_proof(
+    reader: &mut impl Read,
+    deadline: Instant,
+) -> Result<PostSignalProof, &'static str> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 128];
+    while Instant::now() < deadline {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Err("fixture-helper-proof"),
+            Ok(read) => {
+                output.extend_from_slice(&buffer[..read]);
+                if output.len() > POST_SIGNAL_PROOF_BYTES || output.contains(&b'\n') {
+                    // A newline is accepted only when it terminates the
+                    // complete bounded record; trailing bytes are rejected by
+                    // the exact parser below rather than silently discarded.
+                    return decode_post_signal_proof(&output);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return Err("fixture-helper-proof"),
+        }
+    }
+    Err("fixture-helper-proof")
+}
+
 /// Convert the control pipe boundary into a closed vocabulary before the
 /// launcher decides whether it may keep waiting; unknown reads fail closed.
 fn classify_fixture_control(
@@ -212,15 +411,18 @@ fn control_setup_state(result: Result<(), std::io::ErrorKind>) -> FixtureControl
     }
 }
 
-/// Terminate the helper's own private target group through the same bounded
-/// primitive as production cleanup, so the control path cannot strand a child
-/// merely because the parent fixture encountered an early parsing fault.
+/// Reap a control-path target through the original strict group cleanup.  This
+/// remains the only path for EOF, invalid bytes, setup faults, and q payloads
+/// that do not carry a proof issued by the production signal hook.
 fn terminate_fixture_child(child: &mut std::process::Child, reason: &'static str) {
-    let Some(process_group) = i32::try_from(child.id()).ok().filter(|value| *value > 1) else {
-        if !reap_child_without_group_until(child, Instant::now() + Duration::from_secs(2)) {
-            abort_unreaped_query(reason);
+    let process_group = match i32::try_from(child.id()).ok().filter(|value| *value > 1) {
+        Some(value) if value != current_pgid() => value,
+        Some(_) | None => {
+            if !reap_child_without_group_until(child, Instant::now() + Duration::from_secs(2)) {
+                abort_unreaped_query(reason);
+            }
+            abort_unreaped_query("fixture-group-unsafe");
         }
-        abort_unreaped_query("fixture-group-unsafe");
     };
     if reap_child_group_bounded(
         child,
@@ -233,6 +435,79 @@ fn terminate_fixture_child(child: &mut std::process::Child, reason: &'static str
     }
 }
 
+/// Finish a target after a real production group signal.  The typed proof is
+/// the only authority that allows the already-signalled direct-reap path; it
+/// binds Child PID/PGID/UID/comm/start identity and is consumed once before
+/// requiring the complete target PGID to disappear.
+fn reap_fixture_child_after_group_signal(
+    child: &mut std::process::Child,
+    proof: &mut PostSignalProof,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    let child_pid = child.id();
+    let process_group = proof.identity.pgid;
+    let expected_pid = proof.identity.pid;
+    if expected_pid <= 1
+        || process_group <= 1
+        || child_pid != expected_pid
+        || i32::try_from(child_pid).ok() != Some(process_group)
+        || process_group == current_pgid()
+        || proof.identity.uid != current_uid()
+    {
+        return Err("fixture-helper-identity");
+    }
+
+    // Query the complete identity before consuming the proof.  This check is
+    // what prevents a reused numeric Child PID from inheriting the q shortcut.
+    let observed =
+        query_identity_until(expected_pid, deadline).map_err(|_| "fixture-helper-identity")?;
+    proof.consume_for(&observed)?;
+
+    // Revalidate immediately before the direct Child signal as well.  macOS
+    // lacks pidfd semantics, so a failed final query must never fall through
+    // to an unconditional numeric kill.
+    let latest =
+        query_identity_until(expected_pid, deadline).map_err(|_| "fixture-helper-identity")?;
+    if latest != proof.identity {
+        return Err("fixture-helper-identity");
+    }
+    if !reap_fixture_direct_after_proof(child, &latest, deadline) {
+        return Err("fixture-helper-control");
+    }
+    require_group_empty(process_group, deadline).map_err(|_| "fixture-helper-control")
+}
+
+/// Reap only the Child bound by a consumed production proof.  The final
+/// identity query precedes the direct kill, and every terminal path remains
+/// bounded so an unresolved descendant cannot become a false ACK.
+fn reap_fixture_direct_after_proof(
+    child: &mut std::process::Child,
+    identity: &ProcessIdentity,
+    deadline: Instant,
+) -> bool {
+    match child.try_wait() {
+        Ok(Some(_)) => return true,
+        Ok(None) => {}
+        Err(_) => return false,
+    }
+    if query_identity_until(identity.pid, deadline)
+        .map(|current| current == *identity)
+        .unwrap_or(false)
+    {
+        let _ = child.kill();
+    } else {
+        return false;
+    }
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 /// Publish the bounded target-reap acknowledgement only after the supervisor
 /// has proved direct reap and target PGID emptiness; the parent uses this line
 /// as the happens-before edge before it probes the marker identity again.
@@ -241,15 +516,31 @@ fn write_fixture_reap_ack() -> Result<(), &'static str> {
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     set_nonblocking(&stdout).map_err(|_| "fixture-helper-ack")?;
+    write_fixture_reap_ack_until(&mut stdout, Instant::now() + FIXTURE_ACK_WRITE_DEADLINE)
+}
+
+/// Complete the small ACK write without turning a transient nonblocking pipe
+/// state into a false supervisor crash.  The hard deadline preserves the
+/// parent-side fail-closed handshake when the reader is unavailable.
+fn write_fixture_reap_ack_until(
+    writer: &mut impl Write,
+    deadline: Instant,
+) -> Result<(), &'static str> {
     let ack = b"target-reaped=true\n";
-    // The acknowledgement is one short pipe write.  Refusing a partial or
-    // would-block write avoids starting a second timeout window in the child;
-    // the parent's single absolute deadline then records the missing ack.
-    if stdout.write(ack).ok() == Some(ack.len()) {
-        Ok(())
-    } else {
-        Err("fixture-helper-ack")
+    let mut written = 0;
+    while written < ack.len() && Instant::now() < deadline {
+        match writer.write(&ack[written..]) {
+            Ok(0) => return Err("fixture-helper-ack"),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(_) => return Err("fixture-helper-ack"),
+        }
     }
+    (written == ack.len())
+        .then_some(())
+        .ok_or("fixture-helper-ack")
 }
 
 /// Keep the control-write and acknowledgement read in one bounded phase so a
@@ -569,7 +860,10 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             }
             let result = complete_fixture_reap_handshake(fixture_deadline, |deadline| {
                 emit_cleanup_diagnostic_line("supervisor-status", "begin");
-                if let Err(error) = request_fixture_launcher_shutdown(&mut launcher, deadline) {
+                let proof = PostSignalProof::issue_from_production_hook(captured);
+                if let Err(error) =
+                    request_fixture_launcher_shutdown_with_proof(&mut launcher, &proof, deadline)
+                {
                     emit_cleanup_diagnostic_line("supervisor-status", error);
                     return Err(error);
                 }
@@ -730,9 +1024,34 @@ fn request_fixture_launcher_shutdown(
     launcher: &mut std::process::Child,
     deadline: Instant,
 ) -> Result<(), &'static str> {
+    write_fixture_control(launcher, b"q", deadline)
+}
+
+/// Send q together with the proof issued by the real production hook.  The
+/// supervisor cannot manufacture this payload itself, so only this callback
+/// can unlock its already-signalled direct-reap path.
+fn request_fixture_launcher_shutdown_with_proof(
+    launcher: &mut std::process::Child,
+    proof: &PostSignalProof,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    let proof_wire = proof.encode()?;
+    let mut payload = Vec::with_capacity(1 + proof_wire.len());
+    payload.push(b'q');
+    payload.extend_from_slice(&proof_wire);
+    write_fixture_control(launcher, &payload, deadline)
+}
+
+/// Write one bounded control payload without using write_all, because a full
+/// pipe must not turn a supervisor cleanup phase into an unbounded wait.
+fn write_fixture_control(
+    launcher: &mut std::process::Child,
+    payload: &[u8],
+    deadline: Instant,
+) -> Result<(), &'static str> {
     let stdin = launcher.stdin.as_mut().ok_or("fixture-helper-control")?;
     set_nonblocking(stdin).map_err(|_| "fixture-helper-control")?;
-    let mut remaining = b"q".as_slice();
+    let mut remaining = payload;
     while !remaining.is_empty() && Instant::now() < deadline {
         match stdin.write(remaining) {
             Ok(0) => return Err("fixture-helper-control"),
@@ -2094,18 +2413,21 @@ fn remove_fixture_root(root: PathBuf) -> Result<(), &'static str> {
 mod tests {
     use super::{
         FixtureAckProof, FixtureControlEvent, FixtureEvidenceFault, FixtureFailureContext,
-        GroupSignalRelease, ProcessIdentity, accept_launcher_identity, classify_fixture_control,
-        complete_fixture_reap_handshake, control_setup_state, finish_fixture_failure_with,
-        fixture_cleanup_failure_category, fixture_group_failure_reason, fixture_paths,
-        is_fixture_reap_ack, persist_fixture_failure_pair_until, wait_child_exit_until,
+        GroupSignalRelease, PostSignalProof, ProcessIdentity, accept_launcher_identity,
+        classify_fixture_control, complete_fixture_reap_handshake, control_setup_state,
+        decode_post_signal_proof, finish_fixture_failure_with, fixture_cleanup_failure_category,
+        fixture_group_failure_reason, fixture_paths, is_fixture_reap_ack,
+        persist_fixture_failure_pair_until, read_fixture_post_signal_proof,
+        reap_fixture_child_after_group_signal, wait_child_exit_until,
         write_fixture_failure_evidence_until, write_fixture_failure_evidence_with_fault,
+        write_fixture_reap_ack_until,
     };
     use crate::marker_cleanup::process::{
         ProcessState, current_uid, group_state, reap_child_group_bounded, set_nonblocking,
     };
     use crate::spawn_grouped;
     use std::fs;
-    use std::io::{BufReader, Write};
+    use std::io::{self, BufReader, Cursor, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::DirBuilderExt;
     use std::path::Path;
@@ -2181,6 +2503,43 @@ mod tests {
         }
     }
 
+    /// Prove the supervisor ACK writer tolerates bounded partial/WouldBlock
+    /// states while still rejecting a closed or expired control pipe.
+    #[test]
+    fn fixture_reap_ack_writer_is_bounded_and_complete() {
+        struct FlakyWriter {
+            calls: usize,
+            output: Vec<u8>,
+        }
+
+        impl Write for FlakyWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "retry"));
+                }
+                let count = bytes.len().min(3);
+                self.output.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = FlakyWriter {
+            calls: 0,
+            output: Vec::new(),
+        };
+        write_fixture_reap_ack_until(&mut writer, Instant::now() + Duration::from_secs(1))
+            .expect("bounded ACK write");
+        assert_eq!(writer.output, b"target-reaped=true\n");
+
+        let mut closed = io::sink();
+        assert!(write_fixture_reap_ack_until(&mut closed, Instant::now()).is_err());
+    }
+
     /// Prove the production proof slot is single-use and rejects a second
     /// marker group, including PID reuse with a changed start/comm/PGID.
     #[test]
@@ -2205,6 +2564,94 @@ mod tests {
             ..target
         };
         assert_eq!(proof.release_for(&reused), GroupSignalRelease::Continue);
+    }
+
+    /// Exercise the actual production-hook proof wire and its one-shot,
+    /// full-identity binding.  A changed PID/PGID/UID/comm/start field or any
+    /// grammar mutation must remain outside the post-signal shortcut.
+    #[test]
+    fn post_signal_proof_is_strict_and_single_use() {
+        let target = ProcessIdentity {
+            pid: 42,
+            pgid: 42,
+            uid: current_uid(),
+            comm: "target worker".to_owned(),
+            start_identity: "Tue Jan 2 00:00:00 2026".to_owned(),
+        };
+        let proof = PostSignalProof::issue_from_production_hook(&target);
+        let wire = proof.encode().expect("proof wire");
+        let mut decoded = decode_post_signal_proof(&wire).expect("decode proof wire");
+        assert_eq!(decoded.identity, target);
+        decoded.consume_for(&target).expect("first proof consume");
+        assert_eq!(decoded.consume_for(&target), Err("fixture-helper-identity"));
+
+        for malformed in [
+            String::from_utf8(wire.clone())
+                .expect("wire utf8")
+                .replace("pgid=42", "pgid=43"),
+            String::from_utf8(wire.clone())
+                .expect("wire utf8")
+                .replace(";start=", ";unknown=x;start="),
+            String::from_utf8(wire.clone())
+                .expect("wire utf8")
+                .replace("\n", ";pid=42\n"),
+            String::from_utf8(wire.clone())
+                .expect("wire utf8")
+                .trim_end_matches('\n')
+                .to_owned(),
+        ] {
+            assert!(decode_post_signal_proof(malformed.as_bytes()).is_err());
+        }
+
+        let mut reused = PostSignalProof::issue_from_production_hook(&target);
+        let changed = ProcessIdentity {
+            start_identity: "reused-start".to_owned(),
+            ..target.clone()
+        };
+        assert_eq!(reused.consume_for(&changed), Err("fixture-helper-identity"));
+        reused
+            .consume_for(&target)
+            .expect("wrong proof must not consume capability");
+    }
+
+    /// Drive the bounded control reader itself so a missing proof, trailing
+    /// record, or malformed identity cannot be mistaken for production q.
+    #[test]
+    fn post_signal_proof_reader_rejects_missing_and_trailing_data() {
+        let target = ProcessIdentity {
+            pid: 42,
+            pgid: 42,
+            uid: current_uid(),
+            comm: "target".to_owned(),
+            start_identity: "start".to_owned(),
+        };
+        let wire = PostSignalProof::issue_from_production_hook(&target)
+            .encode()
+            .expect("proof wire");
+        let mut valid_reader = Cursor::new(wire.clone());
+        assert!(
+            read_fixture_post_signal_proof(
+                &mut valid_reader,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_ok()
+        );
+        let mut missing_reader = Cursor::new(Vec::<u8>::new());
+        assert!(
+            read_fixture_post_signal_proof(
+                &mut missing_reader,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_err()
+        );
+        let mut trailing_reader = Cursor::new([wire.as_slice(), b"extra\n"].concat());
+        assert!(
+            read_fixture_post_signal_proof(
+                &mut trailing_reader,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_err()
+        );
     }
 
     /// Exercise the acknowledgement reader against real nonblocking pipes so
@@ -2279,6 +2726,78 @@ mod tests {
                 assert_eq!(group_state(process_group), ProcessState::Empty);
             }
         }
+    }
+
+    /// Exercise the production supervisor branch after the target PGID was
+    /// already signalled by marker cleanup.  A second group signal may report
+    /// ESRCH even though the direct Child still needs reaping; the shared
+    /// helper must accept that ordering only after PGID emptiness is proven.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fixture_child_reap_accepts_pre_signalled_group() {
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_grouped(&mut command).expect("spawn pre-signalled child");
+        let process_group = i32::try_from(child.id())
+            .ok()
+            .filter(|value| *value > 1)
+            .expect("pre-signalled process group");
+        let identity =
+            super::query_identity_until(child.id(), Instant::now() + Duration::from_secs(2))
+                .expect("pre-signalled target identity");
+        let mut proof = PostSignalProof::issue_from_production_hook(&identity);
+        crate::safe_signal_group(process_group, 9).expect("signal target group");
+        reap_fixture_child_after_group_signal(
+            &mut child,
+            &mut proof,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("reap pre-signalled target");
+        assert_eq!(group_state(process_group), ProcessState::Empty);
+    }
+
+    /// A PID-reused or cross-group proof must be rejected before the helper
+    /// sends a direct signal; the strict group finalizer then owns cleanup.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn post_signal_helper_rejects_wrong_proof_before_reap() {
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_grouped(&mut command).expect("spawn proof rejection target");
+        let process_group = i32::try_from(child.id())
+            .ok()
+            .filter(|value| *value > 1)
+            .expect("proof rejection process group");
+        let identity =
+            super::query_identity_until(child.id(), Instant::now() + Duration::from_secs(2))
+                .expect("proof rejection identity");
+        let wrong_identity = ProcessIdentity {
+            start_identity: "reused-start".to_owned(),
+            ..identity.clone()
+        };
+        let mut proof = PostSignalProof::issue_from_production_hook(&wrong_identity);
+        assert_eq!(
+            reap_fixture_child_after_group_signal(
+                &mut child,
+                &mut proof,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err("fixture-helper-identity")
+        );
+        reap_child_group_bounded(
+            &mut child,
+            process_group,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("strict cleanup after rejected proof");
     }
 
     /// Exercise the complete q-plus-ack phase, including control loss, ack
