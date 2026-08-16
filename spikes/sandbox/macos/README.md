@@ -60,11 +60,15 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   launcher 的 pipe、输出、PID 解析和后续 `?` 传播也统一经过同一个有界 Child
   finalizer；二次 reap 仍失败时固定输出安全类别并 abort，不让 live Child 进入 Drop。
   fixture 的 descendant group 在每个早期失败返回前再执行两次有界 SIGKILL/ESRCH
-  收口；residual、EPERM 或其他 probe 错误固定映射为 abort 类别，不能依赖尚未创建的
-  marker 或 workflow glob 推迟清理。descendant fixture 读取同一次生产 cleanup
-  report 时只映射为固定的 `fixture-descendant-cleanup-{residual,eperm,signal,query,
-  identity,remove,scan,unsafe,unknown}` 类别；report 不可读则为
+  收口；launcher 身份查询失败时仍以未释放的 Child 句柄锚定新建 PGID，先持久化
+  脱敏的 group/identity/failure evidence，再执行整组有界回收；residual、EPERM 或
+  其他 probe 错误固定映射为 abort 类别，不能依赖尚未创建的 marker 或 workflow glob
+  推迟清理。descendant fixture 读取同一次生产 cleanup report 时要求完整、有界、ASCII
+  且严格匹配 `category=true`（唯一、按生产顺序）和最后一个 `marker-count=<n>`；未知、
+  路径、重复、冲突、`false`、空行、尾随内容、超限或缺失 count 都是
   `fixture-descendant-cleanup-report`，不会把具体 PID、路径或系统错误文本带入 CI。
+  合法报告才映射为固定的 `fixture-descendant-cleanup-{residual,eperm,signal,query,
+  identity,remove,scan,unsafe}` 类别。
   目录 entry
   读取错误会清空已收集的 signal target 并报告固定 `marker-entry-invalid`，不会静默
   忽略不完整扫描。group cleanup 最长 20 秒，workflow 外层还设置 2 分钟 timeout，不能

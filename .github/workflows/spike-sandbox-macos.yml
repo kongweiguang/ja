@@ -138,6 +138,11 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
+          cargo +1.88.0 build \
+            --manifest-path spikes/sandbox/macos/Cargo.toml \
+            --bin ja-sandbox-probe \
+            --bin ja-sandbox-worker \
+            --locked
           cargo +1.88.0 run --manifest-path spikes/sandbox/macos/Cargo.toml --bin ja-sandbox-probe --locked 2>&1 \
             | tee "$RUNNER_TEMP/ja-sandbox-report/probe.log"
           grep -F "SANDBOX-PASS" "$RUNNER_TEMP/ja-sandbox-report/probe.log"

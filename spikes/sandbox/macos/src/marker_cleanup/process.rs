@@ -163,6 +163,28 @@ pub(super) fn reap_child_bounded(
     require_group_empty(process_group, deadline)
 }
 
+/// Kill the freshly spawned child's complete process group when identity
+/// inspection failed before a trusted `ProcessIdentity` existed.  The live
+/// `Child` handle pins its PID against reuse, while strict PGID validation and
+/// bounded direct reap prevent an early query fault from orphaning descendants.
+#[cfg(target_os = "macos")]
+pub(super) fn reap_child_group_bounded(
+    child: &mut Child,
+    process_group: i32,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    if process_group <= 1 {
+        return Err("marker-owner-mismatch");
+    }
+    let signal_result = signal_group(process_group);
+    let reap_result = finalize_child(child, process_group, deadline, "fixture-unreaped");
+    let group_result = require_group_empty(process_group, deadline);
+    match (signal_result, reap_result, group_result) {
+        (Ok(_), Ok(()), Ok(())) => Ok(()),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+    }
+}
+
 /// Reap a failed query child before returning a fixed identity error; this
 /// prevents an early pipe/status branch from dropping a live supervisor.
 fn query_failure(child: &mut Child, process_group: i32) -> Result<ProcessIdentity, &'static str> {
@@ -748,6 +770,34 @@ mod tests {
             Instant::now(),
             Duration::from_secs(1)
         ));
+        assert_eq!(group_state(process_group), ProcessState::Empty);
+    }
+
+    /// Exercise the identity-query fallback with a real descendant: the
+    /// anchored Child permits a group kill even before a trusted ps identity
+    /// exists, and success still requires direct reap plus group emptiness.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_group_reap_cleans_descendant_without_identity() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "/bin/sleep 30 & wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_grouped(&mut command).expect("spawn descendant fixture");
+        let process_group = i32::try_from(child.id())
+            .ok()
+            .filter(|value| *value > 1)
+            .expect("fixture process group");
+        assert!(
+            reap_child_group_bounded(
+                &mut child,
+                process_group,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_ok()
+        );
         assert_eq!(group_state(process_group), ProcessState::Empty);
     }
 }
