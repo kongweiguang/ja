@@ -26,6 +26,7 @@ pub(super) const O_EXCL: c_int = libc::O_EXCL;
 pub(super) const AT_SYMLINK_NOFOLLOW: c_int = libc::AT_SYMLINK_NOFOLLOW;
 pub(super) const F_DUPFD_CLOEXEC: c_int = libc::F_DUPFD_CLOEXEC;
 pub(super) const ENOENT: i32 = libc::ENOENT;
+pub(super) const EEXIST: i32 = libc::EEXIST;
 
 /// Own a duplicated directory stream descriptor; `fdopendir` takes ownership
 /// of the duplicate, never of the caller's verified root descriptor.
@@ -156,6 +157,35 @@ pub(super) fn rename_at(root_fd: RawFd, old_name: &[u8], new_name: &[u8]) -> io:
     }
 }
 
+/// Publish a sibling without replacing an already durable final entry.
+/// Darwin's `RENAME_EXCL` keeps the pending-to-final transaction atomic while
+/// making an unexpected concurrent final creation a fail-closed error rather
+/// than destroying the only good evidence copy.
+pub(super) fn rename_at_no_replace(
+    root_fd: RawFd,
+    old_name: &[u8],
+    new_name: &[u8],
+) -> io::Result<()> {
+    let old_name =
+        CString::new(old_name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let new_name =
+        CString::new(new_name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let result = unsafe {
+        libc::renameatx_np(
+            root_fd,
+            old_name.as_ptr(),
+            root_fd,
+            new_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Remove one exact sibling only; callers must perform identity and deadline
 /// checks before and after this syscall and must sync the parent directory.
 pub(super) fn unlink_at(root_fd: RawFd, name: &[u8]) -> io::Result<()> {
@@ -184,7 +214,7 @@ fn set_errno(value: i32) {
 mod tests {
     use super::{
         DirectoryStream, ENOENT, create_at_file, fstatat_no_follow, open_at_file, rename_at,
-        unlink_at,
+        rename_at_no_replace, unlink_at,
     };
     use std::fs::{self, DirBuilder, OpenOptions};
     use std::io::Write;
@@ -251,5 +281,46 @@ mod tests {
             0o700
         );
         fs::remove_dir(&root).expect("private root cleanup");
+    }
+
+    /// Refuse to replace a pre-existing final sibling so a late concurrent
+    /// writer cannot destroy the only complete recovery evidence.
+    #[test]
+    fn exclusive_rename_preserves_existing_destination() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ja-fd-exclusive-{0}-{nonce}", std::process::id()));
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .expect("private root");
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(super::O_NOFOLLOW | super::O_CLOEXEC)
+            .open(&root)
+            .expect("root fd");
+        let root_fd = directory.as_raw_fd();
+        let mut pending = create_at_file(root_fd, b"pending", 0o600).expect("pending");
+        pending.write_all(b"pending").expect("pending write");
+        pending.sync_all().expect("pending sync");
+        let mut final_file = create_at_file(root_fd, b"final", 0o600).expect("final");
+        final_file.write_all(b"good").expect("final write");
+        final_file.sync_all().expect("final sync");
+        assert!(rename_at_no_replace(root_fd, b"pending", b"final").is_err());
+        assert_eq!(
+            fs::read(root.join("final")).expect("final contents"),
+            b"good"
+        );
+        assert_eq!(
+            fs::read(root.join("pending")).expect("pending contents"),
+            b"pending"
+        );
+        drop(final_file);
+        drop(pending);
+        directory.sync_all().expect("directory sync");
+        fs::remove_dir_all(&root).expect("private root cleanup");
     }
 }
