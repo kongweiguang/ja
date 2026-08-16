@@ -469,7 +469,11 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
     // Keep the launcher Child owned until production cleanup has observed and
     // terminated its real descendant; reaping before this point would make the
     // fixture prove only a helper exit, not the marker cleanup contract.
-    let launcher_result = reap_child_bounded(&mut launcher, process_group, fixture_deadline);
+    // The supervisor owns its own group; the target group was already handled
+    // by production marker cleanup.  Reaping with the target PGID would leave
+    // the live supervisor outside the identity proof and can strand it when
+    // the target exits normally.
+    let launcher_result = reap_child_bounded(&mut launcher, launcher_group, fixture_deadline);
     if result.is_err() {
         // Preserve only the production report's fixed category so a native
         // runner can distinguish residual, identity, query and signal faults
@@ -1194,9 +1198,10 @@ fn validate_fixture_failure_evidence(contents: &[u8]) -> Result<(), &'static str
 }
 
 /// Validate one supervisor/target identity record, including state-specific
-/// fields.  A provisional record may retain only PID/PGID; an unavailable
-/// record may retain a direct PID from the no-process-group branch, but neither
-/// state may invent UID, command, start identity, or an incomplete group.
+/// fields. A known record keeps the trusted numeric identity and current UID;
+/// its command/start values may be redacted because path-bearing `ps` output
+/// must not enter evidence, while provisional/unavailable records must redact
+/// every field that was not independently captured before the fault.
 fn parse_fixture_evidence_identity(
     fields: &[&str],
 ) -> Result<ParsedFixtureEvidenceIdentity, &'static str> {
@@ -1222,8 +1227,6 @@ fn parse_fixture_evidence_identity(
             if pid.is_none()
                 || pgid.is_none()
                 || uid != Some(current_uid())
-                || comm == "redacted"
-                || start == "redacted"
                 || pid.is_some_and(|pid| pid <= 1 || pid == std::process::id())
                 || pgid.is_some_and(|pgid| pgid <= 1 || pgid == current_pgid())
             {
@@ -2439,6 +2442,48 @@ mod tests {
         assert!(contents.contains("target-pgid=45\n"));
         assert!(!contents.contains("supervisor-pgid=45\n"));
         fs::remove_dir_all(root).expect("remove pair root");
+    }
+
+    /// Accept a known identity whose path-bearing command/start fields were
+    /// redacted.  The numeric identity and UID still authorize recovery; the
+    /// redaction is required when Darwin's `ps` value contains a path.
+    #[test]
+    fn known_identity_allows_path_redaction() {
+        let (root, _) = fixture_paths("known-redacted");
+        let uid = super::current_uid();
+        let supervisor = ProcessIdentity {
+            pid: 42,
+            pgid: 43,
+            uid,
+            comm: "/bin/sleep".to_owned(),
+            start_identity: "/private/var/start".to_owned(),
+        };
+        let target = ProcessIdentity {
+            pid: 44,
+            pgid: 45,
+            uid,
+            comm: "/usr/bin/sleep".to_owned(),
+            start_identity: "/private/var/target".to_owned(),
+        };
+        persist_fixture_failure_pair_until(
+            &root,
+            supervisor.pid,
+            FixtureFailureContext {
+                supervisor_group: supervisor.pgid,
+                supervisor_identity: Some(&supervisor),
+                target_identity: Some(&target),
+                target_reference: Some((target.pid, target.pgid)),
+            },
+            "fixture-helper-control",
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("redacted known identity evidence");
+        let contents = fs::read_to_string(root.join(super::FIXTURE_FAILURE_EVIDENCE))
+            .expect("redacted evidence contents");
+        assert!(contents.contains("supervisor-state=known\n"));
+        assert!(contents.contains("supervisor-comm=redacted\n"));
+        assert!(contents.contains("target-start=redacted\n"));
+        fs::remove_dir_all(root).expect("remove redacted evidence root");
     }
 
     /// Reject cross-domain collisions as well as same-domain collisions: a

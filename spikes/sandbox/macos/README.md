@@ -106,6 +106,8 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   每份 evidence 必须是完整的 version-2 固定 14 行 grammar：version、允许的 category、
   supervisor 的 state/pid/pgid/uid/comm/start，以及 target 的同一组字段，字段顺序固定且
   不允许重复、未知、空值、缺行、尾随内容或截断。`known` 必须有当前 UID 和有效 PID/PGID；
+  `comm/start` 在值含路径或其他不安全字符时可固定为 `redacted`，不影响内存中已捕获
+  的 UID/PID/PGID 身份校验；
   `provisional` 只能保留大于 1 的 PID/PGID，并将 UID/comm/start 固定为 unknown/redacted；
   `unavailable` 只能保留可验证的大于 1 direct PID 或全 unknown，不能伪造 PGID/身份。PID、
   PGID 还必须互不冲突，且 supervisor PID↔target PGID、supervisor PGID↔target PID 两种交叉
