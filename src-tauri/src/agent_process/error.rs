@@ -118,7 +118,6 @@ impl From<PendingRegisterError> for AgentProcessError {
 pub(crate) struct ErrorCatalogEntry {
     pub(crate) code: i64,
     pub(crate) ja_code: &'static str,
-    pub(crate) message: &'static str,
     pub(crate) retryable: bool,
 }
 
@@ -129,10 +128,9 @@ pub(crate) fn error_catalog(
     retryable: bool,
 ) -> Option<ErrorCatalogEntry> {
     crate::agent_process::codec::catalog_entry(code, ja_code, retryable).map(
-        |(canonical_ja_code, message)| ErrorCatalogEntry {
+        |(canonical_ja_code, _message)| ErrorCatalogEntry {
             code,
             ja_code: canonical_ja_code,
-            message,
             retryable,
         },
     )

@@ -259,6 +259,62 @@ fn codec_preserves_null_result_and_validates_hand_built_error() {
     assert!(RpcFrame::response_error("c:bad", -32_001, "x", "A", false).is_err());
 }
 
+/// 构造 frozen error fixture，证明 code/jaCode/retryable 决定分类而 message
+/// 可以是 bounded 本地化文案，同时拒绝空、超长、路径和敏感诊断。
+#[test]
+fn codec_accepts_localized_catalog_errors_and_rejects_unsafe_messages() {
+    fn fixture(message: &str, retryable: bool) -> Vec<u8> {
+        let value = json!({
+            "jsonrpc":"2.0",
+            "id":"c:localized",
+            "error":{
+                "code":-32020,
+                "message":message,
+                "data":{"jaCode":"SHUTTING_DOWN","retryable":retryable}
+            }
+        });
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    let localized = codec::decode_frame(&fixture("正在关闭", true), 4096)
+        .expect("bounded localized message is valid");
+    assert_eq!(localized.error().unwrap().message(), "正在关闭");
+    assert!(
+        RpcFrame::response_error("c:localized", -32_020, "正在关闭", "SHUTTING_DOWN", true,)
+            .is_ok()
+    );
+
+    let invalid_messages = [
+        "",
+        &"x".repeat(513),
+        "0123456789abcdef0123456789abcdef",
+        r"C:\Users\24052\prompt.txt",
+        "failed: /Users/24052/project",
+        "/etc/passwd",
+        "prefix HTTPS://example.test/query?x=%2FUsers%2Fprivate suffix",
+        "file:///Users/24052/private.txt",
+        "custom+scheme://example.test/resource",
+        "api_key=sk-test-secret",
+        "API KEY=sk-test-secret",
+        "api-key: sk-test-secret",
+        "Api_Key sk-test-secret",
+    ];
+    for message in invalid_messages {
+        assert_eq!(
+            codec::decode_frame(&fixture(message, true), 4096),
+            Err(CodecError::InvalidEnvelope),
+            "unsafe error message must fail closed: {message:?}"
+        );
+    }
+    assert_eq!(
+        codec::decode_frame(&fixture("正在关闭", false), 4096),
+        Err(CodecError::InvalidErrorCatalog)
+    );
+    assert!(codec::decode_frame(&fixture("失败/重试", true), 4096).is_ok());
+}
+
 /// 锁定 readyToken 的 schema 形状与递归拒绝边界，防止伪 ready 进入 supervisor。
 #[test]
 fn ready_token_codec_rejects_missing_malformed_and_nested_markers() {

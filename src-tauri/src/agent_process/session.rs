@@ -895,12 +895,11 @@ impl Session {
             return Err(AgentProcessError::SessionClosed);
         }
         let entry = error_catalog(code, ja_code, retryable)
-            .filter(|entry| entry.message == message)
             .ok_or(AgentProcessError::InvalidErrorCatalog)?;
         self.respond(RpcFrame::response_error(
             id.to_owned(),
             entry.code,
-            entry.message,
+            message,
             entry.ja_code,
             entry.retryable,
         )?)

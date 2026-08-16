@@ -468,7 +468,7 @@ impl RpcError {
         self.code
     }
 
-    /// 返回 catalog 固定 message，避免把原始诊断写入用户界面或 wire。
+    /// 返回经过 bounded 脱敏校验的 message；分类仍由 code/jaCode/retryable 决定。
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -717,7 +717,7 @@ fn parse_error(object: &Map<String, Value>) -> Result<RpcError, CodecError> {
     let message = object
         .get("message")
         .and_then(Value::as_str)
-        .filter(|message| !message.is_empty() && message.len() <= 512)
+        .filter(|message| valid_error_message(message))
         .ok_or(CodecError::InvalidEnvelope)?
         .to_owned();
     let data = object.get("data").ok_or(CodecError::InvalidEnvelope)?;
@@ -759,10 +759,7 @@ fn valid_ja_code(code: &str) -> bool {
 
 /// 复用 decode 的 error 约束校验手工 response，防止内部 caller 绕过 schema。
 fn validate_error(error: &RpcError) -> Result<(), CodecError> {
-    if !(-32_768..=-32_000).contains(&error.code)
-        || error.message.is_empty()
-        || error.message.len() > 512
-    {
+    if !(-32_768..=-32_000).contains(&error.code) || !valid_error_message(&error.message) {
         return Err(CodecError::InvalidEnvelope);
     }
     let Some(data) = error.data.as_object() else {
@@ -777,12 +774,177 @@ fn validate_error(error: &RpcError) -> Result<(), CodecError> {
         .get("retryable")
         .and_then(Value::as_bool)
         .ok_or(CodecError::InvalidErrorCatalog)?;
-    let (_, expected) =
-        catalog_entry(error.code, ja_code, retryable).ok_or(CodecError::InvalidErrorCatalog)?;
-    if error.message != expected {
-        return Err(CodecError::InvalidErrorCatalog);
-    }
+    // code/jaCode/retryable are the sole stable classifier.  Localized bounded
+    // messages remain display text and must not decide the catalog entry.
+    catalog_entry(error.code, ja_code, retryable).ok_or(CodecError::InvalidErrorCatalog)?;
     Ok(())
+}
+
+/// 只允许 bounded、可显示的错误 message，拒绝把路径、凭据或 challenge
+/// 形状的原始诊断带入 UI/日志，同时保留合法本地化文案。
+fn valid_error_message(message: &str) -> bool {
+    if message.is_empty() || message.len() > 512 {
+        return false;
+    }
+    ErrorMessageScanner::new(message).is_safe()
+}
+
+/// Bounded lexical scanner for user-visible error text; keeping all safety
+/// checks in one pass prevents a new marker rule from bypassing another.
+struct ErrorMessageScanner<'a> {
+    message: &'a str,
+    bytes: &'a [u8],
+}
+
+impl<'a> ErrorMessageScanner<'a> {
+    /// Borrow a bounded message so every scanner operation has a fixed input cap.
+    fn new(message: &'a str) -> Self {
+        Self {
+            message,
+            bytes: message.as_bytes(),
+        }
+    }
+
+    /// Reject control characters and lexical URI/path/secret/token indicators.
+    fn is_safe(&self) -> bool {
+        !self.message.chars().any(char::is_control)
+            && !self.has_uri()
+            && !self.has_posix_path()
+            && !self.has_windows_path()
+            && !self.has_secret_marker()
+            && !self.has_hex_run()
+    }
+
+    /// Detect any ASCII scheme followed by `://`, including URL prefixes,
+    /// suffixes and query strings without decoding percent escapes.
+    fn has_uri(&self) -> bool {
+        self.bytes.windows(3).enumerate().any(|(index, window)| {
+            if window != b"://" {
+                return false;
+            }
+            let mut start = index;
+            while start > 0 && is_scheme_byte(self.bytes[start - 1]) {
+                start -= 1;
+            }
+            start < index && self.bytes[start].is_ascii_alphabetic()
+        })
+    }
+
+    /// Detect absolute POSIX paths at lexical boundaries while allowing normal
+    /// Chinese slash punctuation such as `失败/重试`.
+    fn has_posix_path(&self) -> bool {
+        for index in 0..self.bytes.len() {
+            if self.bytes[index] != b'/' || !is_path_boundary(self.bytes, index) {
+                continue;
+            }
+            let segment_start = index + 1;
+            if segment_start >= self.bytes.len() || !is_path_byte(self.bytes[segment_start]) {
+                continue;
+            }
+            let mut end = segment_start + 1;
+            while end < self.bytes.len() && is_path_byte(self.bytes[end]) {
+                end += 1;
+            }
+            let segment = &self.bytes[segment_start..end];
+            let has_nested_component = self.bytes.get(end) == Some(&b'/');
+            let known_root = matches!(
+                segment,
+                b"etc"
+                    | b"home"
+                    | b"Users"
+                    | b"users"
+                    | b"private"
+                    | b"tmp"
+                    | b"var"
+                    | b"usr"
+                    | b"opt"
+                    | b"root"
+                    | b"dev"
+                    | b"proc"
+                    | b"sys"
+                    | b"Volumes"
+                    | b"volumes"
+            );
+            if has_nested_component || known_root {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Detect drive-letter and UNC paths without decoding or normalizing input.
+    fn has_windows_path(&self) -> bool {
+        self.bytes.windows(2).any(|window| window == b"\\\\")
+            || self.bytes.windows(3).any(|window| {
+                window[0].is_ascii_alphabetic()
+                    && window[1] == b':'
+                    && matches!(window[2], b'/' | b'\\')
+            })
+    }
+
+    /// Detect case/separator variants of credential labels without treating
+    /// ordinary localized wording as a secret value.
+    fn has_secret_marker(&self) -> bool {
+        let lower = self.message.to_ascii_lowercase();
+        let compact = lower
+            .bytes()
+            .filter(|byte| byte.is_ascii_alphanumeric())
+            .collect::<Vec<_>>();
+        [
+            b"secret".as_slice(),
+            b"token".as_slice(),
+            b"password".as_slice(),
+            b"apikey".as_slice(),
+            b"bearer".as_slice(),
+            b"cookie".as_slice(),
+            b"authorization".as_slice(),
+        ]
+        .iter()
+        .any(|marker| {
+            compact
+                .windows(marker.len())
+                .any(|window| window == *marker)
+        }) || lower.contains("sk-")
+            || lower.contains("sk_")
+    }
+
+    /// Detect contiguous ASCII hex runs that could carry a challenge even when
+    /// embedded in otherwise displayable text.
+    fn has_hex_run(&self) -> bool {
+        let mut run = 0_usize;
+        for byte in self.bytes {
+            if byte.is_ascii_hexdigit() {
+                run = run.saturating_add(1);
+                if run >= 32 {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        false
+    }
+}
+
+/// Scheme names follow RFC-style ASCII letters/digits plus `+.-`.
+fn is_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+}
+
+/// Restrict path segments to ASCII lexical characters before declaring a path.
+fn is_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'%')
+}
+
+/// A path boundary is ASCII punctuation/whitespace; non-ASCII preceding bytes
+/// preserve common Chinese slash prose instead of treating it as `/path`.
+fn is_path_boundary(bytes: &[u8], index: usize) -> bool {
+    index == 0
+        || bytes[index - 1].is_ascii_whitespace()
+        || matches!(
+            bytes[index - 1],
+            b':' | b'=' | b'(' | b'[' | b'{' | b'"' | b','
+        )
 }
 
 /// 通过独立 catalog 模块查询稳定错误映射，避免 framing 文件承担业务表维护。
