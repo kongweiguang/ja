@@ -823,28 +823,52 @@ fn emit_marker_remove_stage(diagnostic: &mut Option<&mut CleanupDiagnosticHook<'
     }
 }
 
-/// Compare the held descriptor identity with the current pathname without
-/// spending time beyond the shared cleanup deadline.
+/// Compare the live descriptor and pathname identities without treating APFS's
+/// mutable directory link count as a root replacement.  APFS reports regular
+/// directory entries in `st_nlink`, so every rename/create/unlink legitimately
+/// changes that field; comparing the pathname to the descriptor at this point
+/// preserves the nlink check while the captured dev/ino/mode/uid fields keep
+/// the original private root bound to this cleanup transaction.
 fn verify_root_path_until(
     root: &Path,
+    root_directory: &File,
     expected: RootDirectoryIdentity,
     deadline: Instant,
 ) -> Result<(), ()> {
     if Instant::now() >= deadline {
         return Err(());
     }
+    let descriptor_metadata = root_directory.metadata().map_err(|_| ())?;
+    if Instant::now() >= deadline {
+        return Err(());
+    }
+    let descriptor = RootDirectoryIdentity {
+        dev: descriptor_metadata.dev(),
+        ino: descriptor_metadata.ino(),
+        nlink: descriptor_metadata.nlink(),
+        mode: descriptor_metadata.permissions().mode() & 0o777,
+        uid: descriptor_metadata.uid(),
+    };
+    if !descriptor_metadata.file_type().is_dir()
+        || descriptor.dev != expected.dev
+        || descriptor.ino != expected.ino
+        || descriptor.mode != expected.mode
+        || descriptor.uid != expected.uid
+    {
+        return Err(());
+    }
     let metadata = fs::symlink_metadata(root).map_err(|_| ())?;
     if Instant::now() >= deadline {
         return Err(());
     }
-    let actual = RootDirectoryIdentity {
+    let path_identity = RootDirectoryIdentity {
         dev: metadata.dev(),
         ino: metadata.ino(),
         nlink: metadata.nlink(),
         mode: metadata.permissions().mode() & 0o777,
         uid: metadata.uid(),
     };
-    (!metadata.file_type().is_symlink() && actual == expected)
+    (!metadata.file_type().is_symlink() && path_identity == descriptor)
         .then_some(())
         .ok_or(())
 }
@@ -1231,7 +1255,7 @@ fn ensure_pending_alias(
     faults: &mut impl PendingFaultInjector,
 ) -> Result<marker::MarkerFileIdentity, ()> {
     let root_fd = root_directory.as_raw_fd();
-    verify_root_path_until(root, root_identity, deadline)?;
+    verify_root_path_until(root, root_directory, root_identity, deadline)?;
     if let Some((identity, existing)) = read_pending_candidate(root_fd, alias, deadline)? {
         if existing != contents {
             return Err(());
@@ -1253,7 +1277,7 @@ fn ensure_pending_alias(
     faults.before_file_sync()?;
     file.sync_all().map_err(|_| ())?;
     drop(file);
-    verify_root_path_until(root, root_identity, deadline)?;
+    verify_root_path_until(root, root_directory, root_identity, deadline)?;
     faults.before_directory_sync(0)?;
     fd::sync_directory(root_directory).map_err(|_| ())?;
     if Instant::now() >= deadline {
@@ -1296,7 +1320,7 @@ fn unlink_pending_entry(
     } = spec;
     let file = open_verified_marker_at(root_directory.as_raw_fd(), name, expected, deadline)?;
     drop(file);
-    verify_root_path_until(root, root_identity, deadline)?;
+    verify_root_path_until(root, root_directory, root_identity, deadline)?;
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
         return Err(());
     }
@@ -1310,7 +1334,7 @@ fn unlink_pending_entry(
         return Err(());
     }
     faults.before_root_revalidate(ordinal)?;
-    verify_root_path_until(root, root_identity, deadline)?;
+    verify_root_path_until(root, root_directory, root_identity, deadline)?;
     faults.before_directory_sync(ordinal + 1)?;
     fd::sync_directory(root_directory).map_err(|_| ())?;
     if Instant::now() >= deadline {
@@ -1433,7 +1457,7 @@ fn remove_pending_evidence_with_fault<F: PendingFaultInjector>(
     if current_identity != pending.file_identity {
         return Err(());
     }
-    verify_root_path_until(root, root_identity, deadline)?;
+    verify_root_path_until(root, root_directory, root_identity, deadline)?;
 
     if is_base {
         let recovery_entry =
@@ -1632,7 +1656,8 @@ fn isolate_damaged_sibling(
     if !marker_records_match(&actual, expected) {
         return Err("marker-owner-mismatch");
     }
-    verify_root_path_until(root, root_identity, deadline).map_err(|_| "marker-remove-failed")?;
+    verify_root_path_until(root, root_directory, root_identity, deadline)
+        .map_err(|_| "marker-remove-failed")?;
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
         return Err("marker-remove-failed");
     }
@@ -1652,14 +1677,15 @@ fn isolate_damaged_sibling(
     )
     .map_err(|_| "marker-remove-failed")?;
     drop(damaged_file);
-    verify_root_path_until(root, root_identity, deadline).map_err(|_| "marker-remove-failed")?;
+    verify_root_path_until(root, root_directory, root_identity, deadline)
+        .map_err(|_| "marker-remove-failed")?;
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
         return Err("marker-remove-failed");
     }
     fd::unlink_at(root_directory.as_raw_fd(), damaged_name).map_err(|_| "marker-remove-failed")?;
     if fd::fstatat_no_follow(root_directory.as_raw_fd(), damaged_name).is_ok()
         || fd::last_errno() != fd::ENOENT
-        || verify_root_path_until(root, root_identity, deadline).is_err()
+        || verify_root_path_until(root, root_directory, root_identity, deadline).is_err()
         || !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE)
     {
         return Err("marker-remove-failed");
@@ -1769,7 +1795,7 @@ fn unlink_cleaned_evidence_with_diagnostics(
         }
     };
     drop(file);
-    if verify_root_path_until(root, root_identity, deadline).is_err() {
+    if verify_root_path_until(root, root_directory, root_identity, deadline).is_err() {
         emit_marker_remove_stage(diagnostic, "evidence-identity");
         return Err(());
     }
@@ -1814,7 +1840,7 @@ fn unlink_cleaned_evidence_with_diagnostics(
     // Both the target and the backup are complete at this point.  Only now is
     // it safe to attempt the target unlink; the backup remains available if
     // any post-unlink check or restore write fails.
-    if verify_root_path_until(root, root_identity, deadline).is_err() {
+    if verify_root_path_until(root, root_directory, root_identity, deadline).is_err() {
         emit_marker_remove_stage(diagnostic, "last-copy-identity");
         return Err(());
     }
@@ -1853,7 +1879,7 @@ fn unlink_cleaned_evidence_with_diagnostics(
     let final_state_is_durable = recovery_postconditions_are_durable(
         Instant::now() < deadline,
         entry_gone,
-        verify_root_path_until(root, root_identity, deadline).is_ok(),
+        verify_root_path_until(root, root_directory, root_identity, deadline).is_ok(),
         has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE),
         fd::sync_directory(root_directory).is_ok(),
     );
@@ -1973,7 +1999,7 @@ fn prepare_recovery_backup(
     if Instant::now() >= deadline || !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
         return Err(());
     }
-    verify_root_path_until(root, root_identity, deadline)?;
+    verify_root_path_until(root, root_directory, root_identity, deadline)?;
     if fd::fstatat_no_follow(root_fd, backup).is_ok() {
         if fd::fstatat_no_follow(root_fd, pending).is_ok() {
             // A second staging entry means the previous publication did not
@@ -2016,7 +2042,7 @@ fn prepare_recovery_backup(
     }
     pending_file.sync_all().map_err(|_| ())?;
     drop(pending_file);
-    verify_root_path_until(root, root_identity, deadline)?;
+    verify_root_path_until(root, root_directory, root_identity, deadline)?;
     fd::sync_directory(root_directory).map_err(|_| ())?;
     if Instant::now() >= deadline {
         return Err(());
@@ -2076,7 +2102,7 @@ fn remove_recovery_backup(
     if image != contents {
         return Err(());
     }
-    verify_root_path_until(root, root_identity, deadline)?;
+    verify_root_path_until(root, root_directory, root_identity, deadline)?;
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
         return Err(());
     }
@@ -2084,7 +2110,7 @@ fn remove_recovery_backup(
     if Instant::now() >= deadline
         || fd::fstatat_no_follow(root_fd, backup).is_ok()
         || fd::last_errno() != fd::ENOENT
-        || verify_root_path_until(root, root_identity, deadline).is_err()
+        || verify_root_path_until(root, root_directory, root_identity, deadline).is_err()
         || !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE)
     {
         return Err(());
@@ -2204,7 +2230,7 @@ fn restore_recovery_evidence_with_fault<F: RestoreFaultInjector>(
         if Instant::now() >= deadline || !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
             return Err(());
         }
-        verify_root_path_until(root, root_identity, deadline)?;
+        verify_root_path_until(root, root_directory, root_identity, deadline)?;
         let mut file = match fd::create_at_file(root_fd, candidate, MARKER_MODE) {
             Ok(file) => file,
             Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
@@ -2272,7 +2298,7 @@ fn restore_recovery_evidence_with_fault<F: RestoreFaultInjector>(
             || faults.before_directory_sync(index).is_err()
             || fd::sync_directory(root_directory).is_err()
             || Instant::now() >= deadline
-            || verify_root_path_until(root, root_identity, deadline).is_err()
+            || verify_root_path_until(root, root_directory, root_identity, deadline).is_err()
         {
             failed_candidates.push((index, candidate.to_vec(), candidate_identity));
             continue;
@@ -2321,7 +2347,7 @@ fn finalize_durable_restore_candidate<F: RestoreFaultInjector>(
         || faults.before_directory_sync(candidate_index).is_err()
         || fd::sync_directory(root_directory).is_err()
         || Instant::now() >= deadline
-        || verify_root_path_until(root, root_identity, deadline).is_err()
+        || verify_root_path_until(root, root_directory, root_identity, deadline).is_err()
     {
         return Err(());
     }
@@ -2383,7 +2409,7 @@ fn remove_restore_candidate<F: RestoreFaultInjector>(
     } = request;
     let file = open_verified_marker_at(root_directory.as_raw_fd(), candidate, expected, deadline)?;
     drop(file);
-    verify_root_path_until(root, root_identity, deadline)?;
+    verify_root_path_until(root, root_directory, root_identity, deadline)?;
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
         return Err(());
     }
@@ -2392,7 +2418,7 @@ fn remove_restore_candidate<F: RestoreFaultInjector>(
     faults.after_candidate_unlink(candidate_index)?;
     if fd::fstatat_no_follow(root_directory.as_raw_fd(), candidate).is_ok()
         || fd::last_errno() != fd::ENOENT
-        || verify_root_path_until(root, root_identity, deadline).is_err()
+        || verify_root_path_until(root, root_directory, root_identity, deadline).is_err()
         || !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE)
     {
         return Err(());
@@ -2471,7 +2497,7 @@ fn unlink_verified_entry_with_diagnostics(
                 return Err(());
             }
         };
-    if verify_root_path_until(root, root_identity, deadline).is_err() {
+    if verify_root_path_until(root, root_directory, root_identity, deadline).is_err() {
         emit_marker_remove_stage(diagnostic, "entry-identity");
         return Err(());
     }
@@ -2596,7 +2622,7 @@ fn unlink_verified_entry_with_diagnostics(
                 return Err(());
             }
         };
-    if verify_root_path_until(root, root_identity, deadline).is_err() {
+    if verify_root_path_until(root, root_directory, root_identity, deadline).is_err() {
         emit_marker_remove_stage(diagnostic, "tombstone-identity");
         return Err(());
     }
@@ -2621,7 +2647,7 @@ fn unlink_verified_entry_with_diagnostics(
         emit_marker_remove_stage(diagnostic, "postcheck");
         return Err(());
     }
-    if verify_root_path_until(root, root_identity, deadline).is_err() {
+    if verify_root_path_until(root, root_directory, root_identity, deadline).is_err() {
         emit_marker_remove_stage(diagnostic, "postcheck-identity");
         return Err(());
     }
@@ -2917,6 +2943,39 @@ mod unit_tests {
         // no output path and cannot block on a fixture-only observer.
         let mut no_hook: Option<&mut CleanupDiagnosticHook<'_>> = None;
         emit_marker_remove_stage(&mut no_hook, "unlink");
+    }
+
+    /// APFS changes a directory's `st_nlink` when regular entries are created,
+    /// renamed, or removed; revalidation must compare the current fd snapshot
+    /// with the pathname instead of rejecting those legitimate transactions.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn root_revalidation_tracks_live_apfs_directory_link_count() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ja-root-nlink-{nonce}"));
+        fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let (root_directory, root_identity) = open_verified_root_directory(&root).expect("open");
+        let deadline = Instant::now() + CLEANUP_DEADLINE;
+        assert!(verify_root_path_until(&root, &root_directory, root_identity, deadline).is_ok());
+        let root_fd = root_directory.as_raw_fd();
+        let mut entry = fd::create_at_file(root_fd, b"entry", MARKER_MODE).expect("entry");
+        entry.write_all(b"entry\n").expect("entry image");
+        entry.sync_all().expect("entry sync");
+        drop(entry);
+        assert!(verify_root_path_until(&root, &root_directory, root_identity, deadline).is_ok());
+        fd::rename_at(root_fd, b"entry", b".ja-sandbox-cleaned.entry").expect("rename");
+        assert!(verify_root_path_until(&root, &root_directory, root_identity, deadline).is_ok());
+        fd::unlink_at(root_fd, b".ja-sandbox-cleaned.entry").expect("unlink");
+        assert!(verify_root_path_until(&root, &root_directory, root_identity, deadline).is_ok());
+        fd::sync_directory(&root_directory).expect("directory sync");
+        fs::remove_dir(&root).expect("root cleanup");
     }
 
     /// Keep the identity comparison strict so a forged fixture cannot reach a

@@ -68,6 +68,10 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   操作时仅回退到 `fsync(dirfd)`，普通文件仍使用文件级 `F_FULLFSYNC`；两种目录
   同步都失败都会 fail-closed。同一轮保持完整 backup 直到 recovery 的最终 unlink 与目录 fsync 都成功，
   然后才删除 backup，所以成功的 active cleanup 不留下 cleaned/recovery evidence。
+  APFS 的目录 `st_nlink` 会随目录项创建、改名和删除变化；每次 root revalidate 都重新
+  `fstat(rootfd)`，再与同一时刻的 root `lstat` 逐字段比较（包括当前 nlink），同时要求
+  dev/ino/mode/uid 仍等于 spawn 前捕获的私有 root。不会把正常事务中的 nlink 变化误判为
+  root replacement，也不会放宽 descriptor/path namespace 绑定。
   任一最终 unlink 后的
   fstat、root revalidate、directory sync 或 deadline 失败，都会用持有的完整 image
   通过 O_EXCL 恢复原 recovery 名称或可识别的 cleaned 别名；两者都无法恢复时固定
@@ -308,7 +312,8 @@ cleanup 和 process-table residual gate 使用 `always()` 继续执行，最终�
   不被这个 spike 完整覆盖；正式写回必须携带 expected hash/revision，写前再次校验
   inode、mode、xattr 和内容，并由固定签名 worker resource 执行。
 - marker cleanup 会持有已校验的私有 root directory descriptor，以 `unlinkat` 锚定目录，
-  并在 unlink 前立即以 `fstat`+`lstat` 比较 `st_dev/st_ino/nlink/mode/uid`，随后同步父目录；
+  并在 unlink 前立即以当前 `fstat`+`lstat` 比较 `st_dev/st_ino/nlink/mode/uid`；其中
+  APFS 的 nlink 以 descriptor 当前快照为准，dev/ino/mode/uid 仍须匹配初始 root，随后同步父目录；
   这不是对同一
   UID 外部进程纳秒级 path swap 的完整防护，也不使用危险的无条件 `unlink` hack。其
   管理父目录必须保持应用私有 `0700`，Seatbelt child 无权访问；若部署改变这一权限或
