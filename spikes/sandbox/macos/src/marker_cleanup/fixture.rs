@@ -491,23 +491,13 @@ fn reap_fixture_child_after_group_signal(
         return Err(error);
     }
 
-    // Revalidate immediately before the direct Child signal as well.  macOS
-    // lacks pidfd semantics, so a failed final query must never fall through
-    // to an unconditional numeric kill.
-    emit_cleanup_diagnostic_line("post-signal-identity", "begin");
-    let latest = match query_identity_until(expected_pid, deadline) {
-        Ok(identity) => identity,
-        Err(error) => {
-            emit_cleanup_diagnostic_line("post-signal-identity", error);
-            return Err("fixture-helper-identity");
-        }
-    };
-    emit_cleanup_diagnostic_line("post-signal-identity", "ok");
-    if latest != proof.identity {
-        emit_cleanup_diagnostic_line("post-signal-identity", "fixture-helper-identity");
-        return Err("fixture-helper-identity");
-    }
-    if !reap_fixture_direct_after_proof(child, &latest, deadline) {
+    // The proof-bound observation is intentionally frozen before reaping.  A
+    // Darwin target can change its `ps` row while becoming a zombie, so a
+    // second numeric identity query would reject the exact child we already
+    // validated.  The owned Child handle and PID equality remain the guard
+    // against reuse; after this point only direct reap and PGID emptiness are
+    // accepted.
+    if !reap_fixture_direct_after_proof(child, &observed, deadline) {
         emit_cleanup_diagnostic_line("post-signal-reap", "fixture-helper-reap");
         return Err("fixture-helper-reap");
     }
@@ -528,27 +518,27 @@ fn reap_fixture_child_after_group_signal(
     }
 }
 
-/// Reap only the Child bound by a consumed production proof.  The final
-/// identity query precedes the direct kill, and every terminal path remains
-/// bounded so an unresolved descendant cannot become a false ACK.
+/// Reap only the Child bound by the frozen, consumed production proof.  The
+/// prior identity query is the sole PID-reuse check before direct Child kill;
+/// re-querying a signal-transitioning zombie would make a safe target look
+/// different, while the owned Child handle and final PGID probe remain strict.
 fn reap_fixture_direct_after_proof(
     child: &mut std::process::Child,
     identity: &ProcessIdentity,
     deadline: Instant,
 ) -> bool {
+    if child.id() != identity.pid || identity.pid <= 1 || identity.pgid <= 1 {
+        return false;
+    }
     match child.try_wait() {
         Ok(Some(_)) => return true,
         Ok(None) => {}
         Err(_) => return false,
     }
-    if query_identity_until(identity.pid, deadline)
-        .map(|current| current == *identity)
-        .unwrap_or(false)
-    {
-        let _ = child.kill();
-    } else {
-        return false;
-    }
+    // The parent already signalled the proof-bound group.  Reissuing kill via
+    // this still-owned Child is handle-bound and does not reopen a stale PID
+    // query window while the target transitions to a reapable zombie.
+    let _ = child.kill();
     while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_)) => return true,
