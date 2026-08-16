@@ -412,6 +412,10 @@ fn run_parent_exit_case(
         false,
         scope,
     )?;
+    // The descendant must publish its own startup marker before the direct
+    // parent exits; otherwise a fast host group kill can remove the child
+    // before this test proves the inherited-pipe cleanup contract.
+    wait_for_file(&child_report, Duration::from_secs(2))?;
     let output = child
         .wait_with_output(Duration::from_secs(5))
         .map_err(|error| format!("parent exit cleanup failed: {error}"))?;
@@ -831,14 +835,23 @@ fn finish_setsid_case(
     // process-group kill cannot reach a child that successfully called
     // setsid, so waiting first would only observe an output-pipe timeout and
     // abort before this negative case had proved its bounded escape cleanup.
-    let escaped_cleanup_ok = !recovery_error
-        && escaped.as_ref().is_none_or(|identity| {
-            let Ok(pid) = i32::try_from(identity.pid) else {
-                return false;
-            };
-            terminate_controlled_identity(identity, Duration::from_secs(2)).is_ok()
-                && verify_process_gone(pid).is_ok()
-        });
+    let escaped_cleanup_result: Result<(), &'static str> = if recovery_error {
+        Err("escaped-identity-unavailable")
+    } else if let Some(identity) = escaped.as_ref() {
+        match i32::try_from(identity.pid) {
+            Ok(pid) => terminate_controlled_identity(identity, Duration::from_secs(2))
+                .and_then(|()| verify_process_gone(pid).map_err(|_| "escaped-process-remained")),
+            Err(_) => Err("escaped-identity-invalid"),
+        }
+    } else {
+        Ok(())
+    };
+    if let Err(category) = escaped_cleanup_result {
+        // Keep the native failure diagnosable without exposing PID, path or
+        // process-table text; the category is the only permitted evidence.
+        eprintln!("SANDBOX-NATIVE: setsid escaped cleanup={category}");
+    }
+    let escaped_cleanup_ok = escaped_cleanup_result.is_ok();
     let result = child.wait_with_output(timeout);
     let child_cleanup_ok = !matches!(result, Err(SandboxError::ChildCleanup(_)));
     let outcome_ok = match expectation {
