@@ -677,11 +677,17 @@ fn cleanup_markers_until_impl(
     }
     // The marker directory entry is part of the durable cleanup evidence; a
     // successful unlink without a parent-directory sync cannot be reported as
-    // complete after a runner crash/restart boundary.
-    if !has_cleanup_budget(cleanup_deadline, CLEANUP_SYSCALL_RESERVE)
-        || fd::sync_directory(&root_directory).is_err()
-        || Instant::now() >= cleanup_deadline
-    {
+    // complete after a runner crash/restart boundary.  Classify each edge
+    // separately so the fixture hook cannot collapse this transaction into a
+    // generic marker-remove failure.
+    if !has_cleanup_budget(cleanup_deadline, CLEANUP_SYSCALL_RESERVE) {
+        emit_marker_remove_stage(&mut on_diagnostic, "deadline");
+        report_categories.insert("marker-remove-failed");
+    } else if fd::sync_directory(&root_directory).is_err() {
+        emit_marker_remove_stage(&mut on_diagnostic, "dir-sync");
+        report_categories.insert("marker-remove-failed");
+    } else if Instant::now() >= cleanup_deadline {
+        emit_marker_remove_stage(&mut on_diagnostic, "deadline");
         report_categories.insert("marker-remove-failed");
     }
     write_report_until(
@@ -867,12 +873,18 @@ fn remove_identity_markers_with_diagnostics(
     let mut result = Ok(());
     for record in records {
         if Instant::now() >= deadline {
+            emit_marker_remove_stage(diagnostic, "deadline");
             categories.insert("marker-query-unreaped");
             return Err(());
         }
         let name = match marker_name(&record.path) {
             Ok(name) => name,
             Err(()) => {
+                // Marker-name validation is the first operation that can
+                // reject a snapshot before the fd-relative opener runs; use
+                // the fixed opener category so the fixture never falls back
+                // to a generic marker-remove failure line.
+                emit_marker_remove_stage(diagnostic, "open-parent");
                 categories.insert("marker-remove-failed");
                 result = Err(());
                 continue;
@@ -1712,10 +1724,21 @@ fn unlink_cleaned_evidence_with_diagnostics(
     deadline: Instant,
     diagnostic: &mut Option<&mut CleanupDiagnosticHook<'_>>,
 ) -> Result<(), ()> {
-    if Instant::now() >= deadline || path.parent() != Some(root) {
+    if Instant::now() >= deadline {
+        emit_marker_remove_stage(diagnostic, "deadline");
         return Err(());
     }
-    let name = marker_name(path)?;
+    if path.parent() != Some(root) {
+        emit_marker_remove_stage(diagnostic, "open-parent");
+        return Err(());
+    }
+    let name = match marker_name(path) {
+        Ok(name) => name,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "open-parent");
+            return Err(());
+        }
+    };
     let mut file =
         match open_verified_marker_at(root_directory.as_raw_fd(), name, expected, deadline) {
             Ok(file) => file,
@@ -1740,7 +1763,13 @@ fn unlink_cleaned_evidence_with_diagnostics(
     // The backup intentionally remains until the target unlink and its
     // directory sync are durable; otherwise a restore write fault could make
     // both O_EXCL candidates partial and leave no parseable evidence.
-    let (backup, pending) = recovery_backup_names(name)?;
+    let (backup, pending) = match recovery_backup_names(name) {
+        Ok(names) => names,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "evidence-open");
+            return Err(());
+        }
+    };
     let backup_identity = match prepare_recovery_backup(
         root,
         root_directory,
@@ -2406,12 +2435,20 @@ fn unlink_verified_entry_with_diagnostics(
     diagnostic: &mut Option<&mut CleanupDiagnosticHook<'_>>,
 ) -> Result<(), ()> {
     if Instant::now() >= deadline {
+        emit_marker_remove_stage(diagnostic, "deadline");
         return Err(());
     }
     if path.parent() != Some(root) {
+        emit_marker_remove_stage(diagnostic, "open-parent");
         return Err(());
     }
-    let name = marker_name(path)?;
+    let name = match marker_name(path) {
+        Ok(name) => name,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "open-parent");
+            return Err(());
+        }
+    };
     let mut file =
         match open_verified_marker_at(root_directory.as_raw_fd(), name, expected, deadline) {
             Ok(file) => file,
@@ -2434,6 +2471,7 @@ fn unlink_verified_entry_with_diagnostics(
     let mut tombstone = b".ja-sandbox-cleaned.".to_vec();
     tombstone.extend_from_slice(name);
     if tombstone.len() > 255 {
+        emit_marker_remove_stage(diagnostic, "revalidate");
         return Err(());
     }
     if fd::rename_at(root_directory.as_raw_fd(), name, &tombstone).is_err() {
@@ -2461,7 +2499,11 @@ fn unlink_verified_entry_with_diagnostics(
     // bounded cleanup pass can discover instead of relying on an unlinked fd.
     let mut recovery = b".ja-sandbox-recovery.".to_vec();
     recovery.extend_from_slice(name);
-    if recovery.len() > 255 || Instant::now() >= deadline {
+    if recovery.len() > 255 {
+        emit_marker_remove_stage(diagnostic, "evidence-open");
+        return Err(());
+    }
+    if Instant::now() >= deadline {
         emit_marker_remove_stage(diagnostic, "deadline");
         return Err(());
     }
@@ -2582,7 +2624,13 @@ fn unlink_verified_entry_with_diagnostics(
         return Err(());
     }
     drop(recovery_file);
-    let recovery_name = std::str::from_utf8(&recovery).map_err(|_| ())?;
+    let recovery_name = match std::str::from_utf8(&recovery) {
+        Ok(name) => name,
+        Err(_) => {
+            emit_marker_remove_stage(diagnostic, "evidence-open");
+            return Err(());
+        }
+    };
     let recovery_path = root.join(recovery_name);
     // The recovery image is part of this transaction, not a deferred item:
     // finalizing it here keeps a successful active-marker cleanup from
@@ -2822,6 +2870,7 @@ mod unit_tests {
             "query",
             "helper",
             "identity",
+            "marker-remove-failed",
             "tombstone-open",
             "/private/path",
             "pid=42",
@@ -3067,6 +3116,146 @@ mod unit_tests {
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty(), "unresolved evidence: {leftovers:?}");
         fs::remove_dir(&root).expect("root cleanup");
+    }
+
+    /// Drive the real fd-relative marker transaction through a failed open and
+    /// verify its optional fixture hook reports a fixed substage before the
+    /// generic marker-remove category can hide the failure.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn marker_remove_hook_is_wired_to_production_transaction() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ja-marker-hook-{nonce}"));
+        fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let marker_path = root.join("marker");
+        let mut marker_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(MARKER_MODE)
+            .custom_flags(O_NOFOLLOW_FLAG | O_CLOEXEC_FLAG)
+            .open(&marker_path)
+            .expect("marker");
+        marker_file.write_all(b"marker-image\n").expect("image");
+        marker_file.sync_all().expect("marker sync");
+        let metadata = marker_file.metadata().expect("marker metadata");
+        let wrong_identity = marker::MarkerFileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino().saturating_add(1),
+            nlink: metadata.nlink(),
+            mode: metadata.permissions().mode() & 0o777,
+            uid: metadata.uid(),
+        };
+        drop(marker_file);
+        let (root_directory, root_identity) = open_verified_root_directory(&root).expect("open");
+        let mut seen = Vec::new();
+        let mut callback = |stage: &'static str, code: &'static str| {
+            seen.push((stage, code));
+        };
+        let mut diagnostic = Some(&mut callback as &mut CleanupDiagnosticHook<'_>);
+        assert!(
+            unlink_verified_entry_with_diagnostics(
+                &root,
+                &root_directory,
+                root_identity,
+                &marker_path,
+                wrong_identity,
+                Instant::now() + CLEANUP_DEADLINE,
+                &mut diagnostic,
+            )
+            .is_err()
+        );
+        assert_eq!(seen, [("marker-remove", "open-parent")]);
+        assert!(marker_path.exists());
+        fs::remove_file(marker_path).expect("marker cleanup");
+        fs::remove_dir(root).expect("root cleanup");
+    }
+
+    /// Drive a successful group cleanup seam and prove the hook does not emit
+    /// a fabricated marker-removal stage when the inner transaction succeeds.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn group_cleanup_does_not_fabricate_marker_hook_event() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ja-marker-group-hook-{nonce}"));
+        fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let marker_path = root.join("ja-sandbox-log-helper-42-12.marker");
+        let mut marker_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(MARKER_MODE)
+            .custom_flags(O_NOFOLLOW_FLAG | O_CLOEXEC_FLAG)
+            .open(&marker_path)
+            .expect("marker");
+        marker_file.write_all(b"marker-image\n").expect("image");
+        marker_file.sync_all().expect("marker sync");
+        let metadata = marker_file.metadata().expect("marker metadata");
+        let file_identity = marker::MarkerFileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            nlink: metadata.nlink(),
+            mode: metadata.permissions().mode() & 0o777,
+            uid: metadata.uid(),
+        };
+        drop(marker_file);
+        let (root_directory, root_identity) = open_verified_root_directory(&root).expect("open");
+        let record = MarkerRecord {
+            path: marker_path,
+            suffix: "marker".to_owned(),
+            file_identity,
+            owner_pid: 42,
+            nonce: 12,
+            pid: 42,
+            pgid: 42,
+            start_identity: "fixture-start".to_owned(),
+            executable_kind: "log".to_owned(),
+        };
+        let records = [&record];
+        let mut categories = BTreeSet::new();
+        let mut context = HookedGroupContext {
+            root: &root,
+            root_directory: &root_directory,
+            root_identity,
+            records: &records,
+            categories: &mut categories,
+            deadline: Instant::now() + CLEANUP_DEADLINE,
+        };
+        let identity = ProcessIdentity {
+            pid: 42,
+            pgid: 42,
+            uid: metadata.uid(),
+            comm: "log".to_owned(),
+            start_identity: "fixture-start".to_owned(),
+        };
+        let mut seen = Vec::new();
+        let mut callback = |stage: &'static str, code: &'static str| {
+            seen.push((stage, code));
+        };
+        let mut diagnostic = Some(&mut callback as &mut CleanupDiagnosticHook<'_>);
+        finish_hooked_group(
+            &mut context,
+            &identity,
+            GroupSignalRelease::Continue,
+            Ok(()),
+            &mut diagnostic,
+        )
+        .expect("group cleanup");
+        assert!(seen.is_empty());
+        assert!(fs::read_dir(&root).expect("read root").next().is_none());
+        fs::remove_dir(root).expect("root cleanup");
     }
 
     /// Exercise the restore path and then run the production finalizer again;
