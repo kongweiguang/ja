@@ -20,6 +20,8 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     include: fullSuite ? ["src/**/*.test.{ts,tsx}"] : ["tests/contract/ts_consumer.test.ts"],
+    // Keep Vitest from rewriting the existing repository cache; only the OS-temp transform cache is allowed.
+    cache: false,
     clearMocks: true,
     restoreMocks: true,
     unstubGlobals: true,

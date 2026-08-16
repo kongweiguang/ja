@@ -6,3 +6,5 @@
 solon.app:
   name: ja
   group: ja
+  http:
+    enable: false

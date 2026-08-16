@@ -30,10 +30,11 @@ python3 tests/contract/run.py
 ```
 
 Vitest 使用仓库内的 `tests/contract/vitest.config.ts` 和 `--configLoader runner`；
-通过 `JA_VITEST_FULL_SUITE` 在 85 个前端测试与 contract adapter 之间切换，缓存目录
-始终指向 OS temp，避免在 `node_modules/.vite-temp` 生成新的仓库 artifact。runner 会把
+通过 `JA_VITEST_FULL_SUITE` 在 85 个前端测试与 contract adapter 之间切换；transform 缓存目录
+始终指向 OS temp，Vitest result cache 显式关闭，避免改写既有结果文件或在 `node_modules/.vite-temp` 生成新的仓库 artifact。runner 会把
 `node_modules/.vite-temp` 纳入前后递归快照；仅清理这个已知目录留下的空目录，非空、新增或
-变更内容仍会 fail-closed。
+变更内容仍会 fail-closed。快照对目录只记录存在性和类型、忽略目录 mtime；文件仍严格比较
+size/mtime，并由 runner 内部 self-check 锁定目录 mtime-only、文件新增、改写和删除语义。
 
 Java gate 要求 `java --version` 为 25；Rust gate 使用根 `src-tauri/Cargo.lock` 的
 `cargo test --locked`（Windows 运行 57 个测试，macOS 跳过 4 个 Windows 进程树测试后
@@ -67,7 +68,7 @@ Gate 直接证明：
   Windows 额外限制最多 1024 个 descendant，并在 deadline 内重复 bounded rescan、按叶到根
   校验 creation stamp 后回收，再以重复空扫描确认无残留；process-tree self-test 会真实创建
   8 个 descendant。超出预算或扫描失败会 fail-closed，不会无限等待。
-- Java 的 67 个测试、Rust 的平台化全量测试和前端的 85 个 Vitest 测试会先运行，随后
+- Java 的 75 个测试、Rust 的平台化全量测试和前端的 85 个 Vitest 测试会先运行，随后
   runner 额外重跑 full-duplex/nested、pending、cancel 和 ready-terminal race 定向筛选；
   每个命令都必须在超时和输出上限内退出并出现预期 marker。
 

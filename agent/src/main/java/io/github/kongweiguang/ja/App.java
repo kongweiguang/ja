@@ -3,12 +3,12 @@
 
 package io.github.kongweiguang.ja;
 
-import org.noear.solon.Solon;
 import org.noear.solon.annotation.SolonMain;
+import io.github.kongweiguang.ja.bootstrap.StdioApplication;
 
 /**
- * Keeps the Java sidecar composition root intentionally small until the
- * AgentScope harness and stdio protocol are wired into the production runtime.
+ * Composition root only: Solon owns lifecycle/configuration and the bootstrap
+ * adapter owns the protocol/runtime graph.
  */
 @SolonMain
 public final class App {
@@ -17,12 +17,15 @@ public final class App {
     }
 
     /**
-     * Lets Solon own lifecycle/configuration bootstrap so later agent services
-     * can be registered without changing the native executable entry point.
+     * Keeps the native/JVM entry point stable while all runtime wiring remains
+     * in a separately testable bootstrap component.
      *
      * @param args process arguments supplied by the Tauri sidecar launcher
      */
     public static void main(String[] args) {
-        Solon.start(App.class, args);
+        int exitCode = new StdioApplication().run(args);
+        if (exitCode != 0) {
+            System.exit(exitCode);
+        }
     }
 }
