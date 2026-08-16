@@ -12,7 +12,8 @@ use super::process::{
     require_group_empty, set_nonblocking, terminate_group_with_identity_fallback,
 };
 use super::{
-    MARKER_MODE, O_CLOEXEC_FLAG, O_NOFOLLOW_FLAG, cleanup_markers_until,
+    MARKER_MODE, O_CLOEXEC_FLAG, O_NOFOLLOW_FLAG, cleanup_diagnostic_code,
+    cleanup_diagnostic_stage, cleanup_markers_until,
     cleanup_markers_until_with_group_signal_hook_and_diagnostics, emit_cleanup_diagnostic_line,
 };
 use crate::spawn_grouped;
@@ -154,22 +155,37 @@ pub(super) fn run_fixture_launcher() -> ! {
         match event {
             FixtureControlEvent::Command => {
                 let proof_deadline = Instant::now() + Duration::from_secs(2);
+                emit_cleanup_diagnostic_line("post-signal-proof", "begin");
                 match read_fixture_post_signal_proof(&mut control, proof_deadline) {
                     Ok(mut proof) => {
-                        if reap_fixture_child_after_group_signal(
+                        emit_cleanup_diagnostic_line("post-signal-proof", "ok");
+                        emit_cleanup_diagnostic_line("post-signal-reap", "begin");
+                        let reap_result = reap_fixture_child_after_group_signal(
                             &mut child,
                             &mut proof,
                             proof_deadline,
-                        )
-                        .is_ok()
-                        {
-                            if write_fixture_reap_ack().is_err() {
-                                // The target is already reaped, but without an
-                                // explicit acknowledgement the parent cannot
-                                // distinguish completion from a crashed helper.
-                                abort_unreaped_query("fixture-helper-ack");
+                        );
+                        match reap_result {
+                            Ok(()) => {
+                                emit_cleanup_diagnostic_line("post-signal-reap", "ok");
+                                emit_cleanup_diagnostic_line("ack-write", "begin");
+                                match write_fixture_reap_ack() {
+                                    Ok(()) => emit_cleanup_diagnostic_line("ack-write", "ok"),
+                                    Err(_) => {
+                                        emit_cleanup_diagnostic_line(
+                                            "ack-write",
+                                            "fixture-helper-ack-write",
+                                        );
+                                        // The target is already reaped, but
+                                        // without an explicit acknowledgement
+                                        // the parent cannot distinguish
+                                        // completion from a crashed helper.
+                                        abort_unreaped_query("fixture-helper-ack");
+                                    }
+                                }
+                                break;
                             }
-                            break;
+                            Err(error) => emit_cleanup_diagnostic_line("post-signal-reap", error),
                         }
                         // A q without a valid production proof is not the
                         // post-signal path.  Re-enter the original strict
@@ -178,7 +194,8 @@ pub(super) fn run_fixture_launcher() -> ! {
                         terminate_fixture_child(&mut child, "fixture-helper-control");
                         abort_unreaped_query("fixture-helper-proof");
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        emit_cleanup_diagnostic_line("post-signal-proof", error);
                         // Missing or malformed proof is handled exactly like
                         // every other non-production control fault.
                         terminate_fixture_child(&mut child, "fixture-helper-control");
@@ -454,27 +471,61 @@ fn reap_fixture_child_after_group_signal(
         || process_group == current_pgid()
         || proof.identity.uid != current_uid()
     {
+        emit_cleanup_diagnostic_line("post-signal-identity", "fixture-helper-identity");
         return Err("fixture-helper-identity");
     }
 
     // Query the complete identity before consuming the proof.  This check is
     // what prevents a reused numeric Child PID from inheriting the q shortcut.
-    let observed =
-        query_identity_until(expected_pid, deadline).map_err(|_| "fixture-helper-identity")?;
-    proof.consume_for(&observed)?;
+    emit_cleanup_diagnostic_line("post-signal-identity", "begin");
+    let observed = match query_identity_until(expected_pid, deadline) {
+        Ok(identity) => identity,
+        Err(error) => {
+            emit_cleanup_diagnostic_line("post-signal-identity", error);
+            return Err("fixture-helper-identity");
+        }
+    };
+    emit_cleanup_diagnostic_line("post-signal-identity", "ok");
+    if let Err(error) = proof.consume_for(&observed) {
+        emit_cleanup_diagnostic_line("post-signal-proof", error);
+        return Err(error);
+    }
 
     // Revalidate immediately before the direct Child signal as well.  macOS
     // lacks pidfd semantics, so a failed final query must never fall through
     // to an unconditional numeric kill.
-    let latest =
-        query_identity_until(expected_pid, deadline).map_err(|_| "fixture-helper-identity")?;
+    emit_cleanup_diagnostic_line("post-signal-identity", "begin");
+    let latest = match query_identity_until(expected_pid, deadline) {
+        Ok(identity) => identity,
+        Err(error) => {
+            emit_cleanup_diagnostic_line("post-signal-identity", error);
+            return Err("fixture-helper-identity");
+        }
+    };
+    emit_cleanup_diagnostic_line("post-signal-identity", "ok");
     if latest != proof.identity {
+        emit_cleanup_diagnostic_line("post-signal-identity", "fixture-helper-identity");
         return Err("fixture-helper-identity");
     }
     if !reap_fixture_direct_after_proof(child, &latest, deadline) {
-        return Err("fixture-helper-control");
+        emit_cleanup_diagnostic_line("post-signal-reap", "fixture-helper-reap");
+        return Err("fixture-helper-reap");
     }
-    require_group_empty(process_group, deadline).map_err(|_| "fixture-helper-control")
+    emit_cleanup_diagnostic_line("post-signal-pgid", "begin");
+    match require_group_empty(process_group, deadline) {
+        Ok(()) => {
+            emit_cleanup_diagnostic_line("post-signal-pgid", "ok");
+            Ok(())
+        }
+        Err("marker-eperm") => {
+            emit_cleanup_diagnostic_line("post-signal-pgid", "marker-eperm");
+            Err("marker-eperm")
+        }
+        Err(_) => {
+            emit_cleanup_diagnostic_line("post-signal-pgid", "fixture-helper-pgid");
+            Err("fixture-helper-pgid")
+        }
+    }
 }
 
 /// Reap only the Child bound by a consumed production proof.  The final
@@ -602,7 +653,7 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
         .arg("--fixture-launcher")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut launcher = spawn_grouped(&mut command).map_err(|_| "fixture-helper-spawn")?;
     // The caller's deadline is shared with the preceding fixture cases; every
     // query, signal, reap and report must consume that same absolute budget.
@@ -682,7 +733,43 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             "fixture-helper-pipe",
         );
     }
+    let stderr = match launcher.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            return finish_launcher_failure(
+                &root,
+                &mut launcher,
+                FixtureFailureContext {
+                    supervisor_group: launcher_group,
+                    supervisor_identity: launcher_identity.as_ref(),
+                    target_identity: None,
+                    target_reference: None,
+                },
+                fixture_deadline,
+                "fixture-helper-pipe",
+            );
+        }
+    };
+    if set_nonblocking(&stderr).is_err() {
+        drop(stderr);
+        return finish_launcher_failure(
+            &root,
+            &mut launcher,
+            FixtureFailureContext {
+                supervisor_group: launcher_group,
+                supervisor_identity: launcher_identity.as_ref(),
+                target_identity: None,
+                target_reference: None,
+            },
+            fixture_deadline,
+            "fixture-helper-pipe",
+        );
+    }
     let mut launcher_output = BufReader::new(stdout);
+    // Keep the diagnostic stream unbuffered so the explicit 4 KiB retained
+    // prefix is also the process-side memory bound, not merely an output cap
+    // hidden behind a larger BufReader allocation.
+    let mut launcher_diagnostics = stderr;
     emit_cleanup_diagnostic_line("supervisor-status", "begin");
     let output_result = read_launcher_output(&mut launcher_output, &mut launcher, fixture_deadline);
     match &output_result {
@@ -869,7 +956,12 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
                 }
                 emit_cleanup_diagnostic_line("supervisor-status", "ok");
                 emit_cleanup_diagnostic_line("ack-read", "begin");
-                let ack = wait_fixture_reap_ack(&mut launcher_output, &mut launcher, deadline);
+                let ack = wait_fixture_reap_ack_with_diagnostics(
+                    &mut launcher_output,
+                    &mut launcher,
+                    Some(&mut launcher_diagnostics),
+                    deadline,
+                );
                 match &ack {
                     Ok(()) => emit_cleanup_diagnostic_line("ack-read", "ok"),
                     Err(error) => emit_cleanup_diagnostic_line("ack-read", error),
@@ -1072,17 +1164,35 @@ fn write_fixture_control(
 /// Wait for the supervisor's exact acknowledgement line under the same
 /// deadline as the control write; a missing, malformed or premature ack keeps
 /// marker evidence alive and never permits production PID cleanup to proceed.
+#[cfg(test)]
 fn wait_fixture_reap_ack(
     reader: &mut impl Read,
     child: &mut std::process::Child,
     deadline: Instant,
 ) -> Result<(), &'static str> {
+    wait_fixture_reap_ack_with_diagnostics(reader, child, None, deadline)
+}
+
+/// Wait for ACK while draining the supervisor's separate fixed diagnostic
+/// stream.  Keeping diagnostics off stdout preserves the exact ACK grammar;
+/// forwarding only the allowlisted stage/code pairs makes the failing child
+/// phase observable without exposing identity values or raw stderr.
+fn wait_fixture_reap_ack_with_diagnostics(
+    reader: &mut impl Read,
+    child: &mut std::process::Child,
+    mut diagnostics: Option<&mut dyn Read>,
+    deadline: Instant,
+) -> Result<(), &'static str> {
     let mut output = Vec::new();
+    let mut diagnostic_output = FixtureDiagnosticBuffer::default();
     let mut buffer = [0_u8; 128];
     let mut terminal_status = None;
     let mut eof = false;
     while Instant::now() < deadline {
         let mut progressed = false;
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            progressed |= drain_fixture_diagnostics(diagnostics, &mut diagnostic_output);
+        }
         match reader.read(&mut buffer) {
             Ok(0) => {
                 eof = true;
@@ -1091,18 +1201,32 @@ fn wait_fixture_reap_ack(
             Ok(read) => {
                 output.extend_from_slice(&buffer[..read]);
                 if output.len() > FIXTURE_ACK_BYTES {
+                    forward_fixture_diagnostics(diagnostic_output.bytes());
                     return Err("fixture-helper-ack");
                 }
                 progressed = true;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => return Err("fixture-helper-ack"),
+            Err(_) => {
+                forward_fixture_diagnostics(diagnostic_output.bytes());
+                return Err("fixture-helper-ack");
+            }
         }
         if terminal_status.is_none() {
-            terminal_status = child.try_wait().map_err(|_| "fixture-helper-ack")?;
+            terminal_status = match child.try_wait() {
+                Ok(status) => status,
+                Err(_) => {
+                    forward_fixture_diagnostics(diagnostic_output.bytes());
+                    return Err("fixture-helper-ack");
+                }
+            };
         }
         if eof {
             if let Some(status) = terminal_status {
+                if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                    drain_fixture_diagnostics(diagnostics, &mut diagnostic_output);
+                }
+                forward_fixture_diagnostics(diagnostic_output.bytes());
                 let ack = std::str::from_utf8(&output)
                     .ok()
                     .is_some_and(is_fixture_reap_ack);
@@ -1117,7 +1241,127 @@ fn wait_fixture_reap_ack(
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    forward_fixture_diagnostics(diagnostic_output.bytes());
     Err("marker-query-unreaped")
+}
+
+const FIXTURE_DIAGNOSTIC_BYTES: usize = 4096;
+const FIXTURE_DIAGNOSTIC_READ_BYTES: usize = 256;
+const FIXTURE_DIAGNOSTIC_DRAIN_BUDGET: usize = 1024;
+
+/// Retain only a bounded diagnostic prefix while allowing the parent to keep
+/// consuming a noisy child pipe.  The drop mode is deliberately independent
+/// from ACK validation: stderr is observability only, so malformed or failed
+/// diagnostics must never turn a valid stdout ACK into a cleanup failure.
+#[derive(Default)]
+struct FixtureDiagnosticBuffer {
+    retained: Vec<u8>,
+    drop_mode: bool,
+    closed: bool,
+}
+
+impl FixtureDiagnosticBuffer {
+    /// Read at most one small budget per call so a continuous stderr writer
+    /// cannot prevent the outer absolute-deadline loop from polling stdout or
+    /// the child status.
+    fn drain(&mut self, reader: &mut dyn Read) -> bool {
+        if self.closed {
+            return false;
+        }
+        let mut buffer = [0_u8; FIXTURE_DIAGNOSTIC_READ_BYTES];
+        let mut budget = FIXTURE_DIAGNOSTIC_DRAIN_BUDGET;
+        let mut progressed = false;
+        while budget > 0 {
+            let read_limit = budget.min(buffer.len());
+            match reader.read(&mut buffer[..read_limit]) {
+                Ok(0) => {
+                    self.closed = true;
+                    return progressed;
+                }
+                Ok(read) => {
+                    progressed = true;
+                    budget = budget.saturating_sub(read);
+                    if !self.drop_mode {
+                        let remaining = FIXTURE_DIAGNOSTIC_BYTES - self.retained.len();
+                        let keep = remaining.min(read);
+                        self.retained.extend_from_slice(&buffer[..keep]);
+                        if keep < read {
+                            self.drop_mode = true;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return progressed;
+                }
+                Err(_) => {
+                    // A failed read cannot authorize any operation, but the
+                    // next bounded poll still attempts to drain a pipe whose
+                    // producer may recover; all subsequent bytes are dropped.
+                    self.drop_mode = true;
+                    return progressed;
+                }
+            }
+        }
+        progressed
+    }
+
+    /// Expose only the retained prefix; the backing allocation never exceeds
+    /// the diagnostic byte cap and dropped bytes are not recoverable.
+    fn bytes(&self) -> &[u8] {
+        &self.retained
+    }
+}
+
+/// Drain only the bounded nonblocking helper diagnostic stream; a full or
+/// unreadable stream switches to discard mode but never affects ACK or cleanup
+/// ownership.
+fn drain_fixture_diagnostics(reader: &mut dyn Read, output: &mut FixtureDiagnosticBuffer) -> bool {
+    output.drain(reader)
+}
+
+/// Forward only proof/reap diagnostic fields through the production allowlist;
+/// control/status noise and malformed input are discarded without influencing
+/// the result of the stdout ACK state machine.
+fn forward_fixture_diagnostics(output: &[u8]) {
+    forward_fixture_diagnostics_with(output, |stage, code| {
+        emit_cleanup_diagnostic_line(stage, code);
+    });
+}
+
+/// Parse complete newline-terminated diagnostic records with a sink seam so
+/// tests can prove redaction without capturing process-global stderr output.
+fn forward_fixture_diagnostics_with<F>(output: &[u8], mut sink: F)
+where
+    F: FnMut(&str, &str),
+{
+    let Ok(text) = std::str::from_utf8(output) else {
+        return;
+    };
+    for record in text.split_inclusive('\n') {
+        let Some(line) = record.strip_suffix('\n') else {
+            continue;
+        };
+        let Some(rest) = line.strip_prefix("SANDBOX-MARKER-QUERY: stage=") else {
+            continue;
+        };
+        let Some((stage, code)) = rest.split_once(" code=") else {
+            continue;
+        };
+        if !matches!(
+            stage,
+            "post-signal-proof"
+                | "post-signal-identity"
+                | "post-signal-reap"
+                | "post-signal-pgid"
+                | "ack-write"
+        ) {
+            continue;
+        }
+        sink(
+            cleanup_diagnostic_stage(stage),
+            cleanup_diagnostic_code(code),
+        );
+    }
 }
 
 /// Accept only the one-line acknowledgement emitted after target direct reap
@@ -2412,13 +2656,15 @@ fn remove_fixture_root(root: PathBuf) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FixtureAckProof, FixtureControlEvent, FixtureEvidenceFault, FixtureFailureContext,
+        FIXTURE_DIAGNOSTIC_BYTES, FIXTURE_DIAGNOSTIC_DRAIN_BUDGET, FixtureAckProof,
+        FixtureControlEvent, FixtureDiagnosticBuffer, FixtureEvidenceFault, FixtureFailureContext,
         GroupSignalRelease, PostSignalProof, ProcessIdentity, accept_launcher_identity,
         classify_fixture_control, complete_fixture_reap_handshake, control_setup_state,
-        decode_post_signal_proof, finish_fixture_failure_with, fixture_cleanup_failure_category,
-        fixture_group_failure_reason, fixture_paths, is_fixture_reap_ack,
-        persist_fixture_failure_pair_until, read_fixture_post_signal_proof,
-        reap_fixture_child_after_group_signal, wait_child_exit_until,
+        decode_post_signal_proof, drain_fixture_diagnostics, finish_fixture_failure_with,
+        fixture_cleanup_failure_category, fixture_group_failure_reason, fixture_paths,
+        forward_fixture_diagnostics_with, is_fixture_reap_ack, persist_fixture_failure_pair_until,
+        read_fixture_post_signal_proof, reap_fixture_child_after_group_signal,
+        wait_child_exit_until, wait_fixture_reap_ack_with_diagnostics,
         write_fixture_failure_evidence_until, write_fixture_failure_evidence_with_fault,
         write_fixture_reap_ack_until,
     };
@@ -2427,7 +2673,7 @@ mod tests {
     };
     use crate::spawn_grouped;
     use std::fs;
-    use std::io::{self, BufReader, Cursor, Write};
+    use std::io::{self, BufReader, Cursor, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::DirBuilderExt;
     use std::path::Path;
@@ -2538,6 +2784,228 @@ mod tests {
 
         let mut closed = io::sink();
         assert!(write_fixture_reap_ack_until(&mut closed, Instant::now()).is_err());
+    }
+
+    /// Prove stderr is observability-only: a valid stdout ACK remains a success
+    /// when the child emits oversized, malformed, or unreadable diagnostics.
+    #[test]
+    fn fixture_reap_ack_ignores_diagnostic_faults() {
+        struct ErrorReader {
+            failed: bool,
+        }
+
+        impl Read for ErrorReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                if !self.failed {
+                    self.failed = true;
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "diagnostic fault",
+                    ))
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+
+        let cases = [
+            "printf 'target-reaped=true\\n'; printf '%05000d\\n' 0 >&2",
+            "printf 'target-reaped=true\\n'; printf 'secret=/private/not-forwarded\\n' >&2",
+        ];
+        for script in cases {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = spawn_grouped(&mut command).expect("spawn diagnostic ACK child");
+            let process_group = i32::try_from(child.id())
+                .ok()
+                .filter(|value| *value > 1)
+                .expect("diagnostic ACK process group");
+            let stdout = child.stdout.take().expect("diagnostic ACK stdout");
+            let stderr = child.stderr.take().expect("diagnostic ACK stderr");
+            set_nonblocking(&stdout).expect("diagnostic ACK stdout nonblocking");
+            set_nonblocking(&stderr).expect("diagnostic ACK stderr nonblocking");
+            let mut output = BufReader::new(stdout);
+            let mut diagnostics = stderr;
+            let result = wait_fixture_reap_ack_with_diagnostics(
+                &mut output,
+                &mut child,
+                Some(&mut diagnostics),
+                Instant::now() + Duration::from_secs(2),
+            );
+            assert_eq!(result, Ok(()));
+            assert_eq!(group_state(process_group), ProcessState::Empty);
+        }
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "printf 'target-reaped=true\\n'"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = spawn_grouped(&mut command).expect("spawn read-error ACK child");
+        let process_group = i32::try_from(child.id())
+            .ok()
+            .filter(|value| *value > 1)
+            .expect("read-error ACK process group");
+        let stdout = child.stdout.take().expect("read-error ACK stdout");
+        set_nonblocking(&stdout).expect("read-error ACK stdout nonblocking");
+        let mut output = BufReader::new(stdout);
+        let mut diagnostics = ErrorReader { failed: false };
+        assert_eq!(
+            wait_fixture_reap_ack_with_diagnostics(
+                &mut output,
+                &mut child,
+                Some(&mut diagnostics),
+                Instant::now() + Duration::from_secs(2),
+            ),
+            Ok(())
+        );
+        assert_eq!(group_state(process_group), ProcessState::Empty);
+    }
+
+    /// Prove a normal diagnostic stream cannot make an invalid ACK succeed;
+    /// stdout grammar and child exit status remain the only authorization.
+    #[test]
+    fn fixture_reap_ack_rejects_invalid_stdout_with_valid_diagnostics() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf 'target-reaped=false\\n'; printf 'SANDBOX-MARKER-QUERY: stage=post-signal-reap code=ok\\n' >&2",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = spawn_grouped(&mut command).expect("spawn invalid ACK child");
+        let process_group = i32::try_from(child.id())
+            .ok()
+            .filter(|value| *value > 1)
+            .expect("invalid ACK process group");
+        let stdout = child.stdout.take().expect("invalid ACK stdout");
+        let stderr = child.stderr.take().expect("invalid ACK stderr");
+        set_nonblocking(&stdout).expect("invalid ACK stdout nonblocking");
+        set_nonblocking(&stderr).expect("invalid ACK stderr nonblocking");
+        let mut output = BufReader::new(stdout);
+        let mut diagnostics = stderr;
+        assert_eq!(
+            wait_fixture_reap_ack_with_diagnostics(
+                &mut output,
+                &mut child,
+                Some(&mut diagnostics),
+                Instant::now() + Duration::from_secs(2),
+            ),
+            Err("fixture-helper-ack")
+        );
+        reap_child_group_bounded(
+            &mut child,
+            process_group,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("invalid ACK cleanup");
+    }
+
+    /// Bound continuous diagnostic output per poll and retain no more than the
+    /// fixed prefix; subsequent bytes are consumed and discarded.
+    #[test]
+    fn fixture_diagnostic_drain_is_bounded_and_discarding() {
+        struct ContinuousReader {
+            bytes_read: usize,
+        }
+
+        impl Read for ContinuousReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.bytes_read += buffer.len();
+                buffer.fill(b'x');
+                Ok(buffer.len())
+            }
+        }
+
+        let mut reader = ContinuousReader { bytes_read: 0 };
+        let mut diagnostics = FixtureDiagnosticBuffer::default();
+        assert!(drain_fixture_diagnostics(&mut reader, &mut diagnostics));
+        assert_eq!(reader.bytes_read, FIXTURE_DIAGNOSTIC_DRAIN_BUDGET);
+        assert_eq!(diagnostics.bytes().len(), FIXTURE_DIAGNOSTIC_DRAIN_BUDGET);
+        assert!(!diagnostics.drop_mode);
+        let mut rounds = 1;
+        while !diagnostics.drop_mode {
+            assert!(drain_fixture_diagnostics(&mut reader, &mut diagnostics));
+            rounds += 1;
+            assert!(rounds <= 8);
+        }
+        assert_eq!(diagnostics.bytes().len(), FIXTURE_DIAGNOSTIC_BYTES);
+        assert_eq!(reader.bytes_read, FIXTURE_DIAGNOSTIC_DRAIN_BUDGET * rounds);
+        assert!(drain_fixture_diagnostics(&mut reader, &mut diagnostics));
+        assert_eq!(diagnostics.bytes().len(), FIXTURE_DIAGNOSTIC_BYTES);
+        assert_eq!(
+            reader.bytes_read,
+            FIXTURE_DIAGNOSTIC_DRAIN_BUDGET * (rounds + 1)
+        );
+    }
+
+    /// Prove read errors switch to discard mode and a later recovered read
+    /// cannot grow the retained buffer or change ACK-relevant state.
+    #[test]
+    fn fixture_diagnostic_read_error_is_best_effort() {
+        struct ErrorThenData {
+            failed: bool,
+        }
+
+        impl Read for ErrorThenData {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if !self.failed {
+                    self.failed = true;
+                    return Err(io::Error::other("diagnostic fault"));
+                }
+                buffer[..4].copy_from_slice(b"tail");
+                Ok(4)
+            }
+        }
+
+        let mut reader = ErrorThenData { failed: false };
+        let mut diagnostics = FixtureDiagnosticBuffer::default();
+        assert!(!drain_fixture_diagnostics(&mut reader, &mut diagnostics));
+        assert!(diagnostics.drop_mode);
+        assert!(drain_fixture_diagnostics(&mut reader, &mut diagnostics));
+        assert!(diagnostics.bytes().is_empty());
+    }
+
+    /// Only complete proof/reap records reach the sink; unknown stages are
+    /// dropped and unknown codes are normalized without exposing raw values.
+    #[test]
+    fn fixture_diagnostic_forwarding_is_redacted_and_subsetted() {
+        let input = b"SANDBOX-MARKER-QUERY: stage=post-signal-proof code=begin\n\
+SANDBOX-MARKER-QUERY: stage=supervisor-status code=ok\n\
+SANDBOX-MARKER-QUERY: stage=post-signal-pgid code=secret=/private/path\n\
+SANDBOX-MARKER-QUERY: stage=post-signal-reap code=fixture-helper-reap\n\
+SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
+        let mut seen = Vec::new();
+        forward_fixture_diagnostics_with(input, |stage, code| {
+            seen.push((stage.to_owned(), code.to_owned()));
+        });
+        assert_eq!(
+            seen,
+            [
+                ("post-signal-proof".to_owned(), "begin".to_owned()),
+                ("post-signal-pgid".to_owned(), "unknown".to_owned()),
+                (
+                    "post-signal-reap".to_owned(),
+                    "fixture-helper-reap".to_owned()
+                ),
+            ]
+        );
+
+        let mut invalid_utf8 = b"SANDBOX-MARKER-QUERY: stage=post-signal-proof code=ok".to_vec();
+        invalid_utf8.push(0xff);
+        invalid_utf8.push(b'\n');
+        let mut invalid_seen = Vec::new();
+        forward_fixture_diagnostics_with(&invalid_utf8, |stage, code| {
+            invalid_seen.push((stage.to_owned(), code.to_owned()));
+        });
+        assert!(invalid_seen.is_empty());
     }
 
     /// Prove the production proof slot is single-use and rejects a second
