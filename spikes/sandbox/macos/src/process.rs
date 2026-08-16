@@ -73,7 +73,7 @@ fn spawn_internal(command: &mut Command, new_process_group: bool) -> io::Result<
 /// Signal only a validated process group; values 0, 1 and -1 are never
 /// passed to the kernel because they have process-wide or session-wide scope.
 pub fn safe_signal_group(process_group: i32, signal: i32) -> io::Result<()> {
-    if process_group <= 1 {
+    if process_group <= 1 || process_group == current_process_group() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "reserved process group",
@@ -90,7 +90,7 @@ pub fn safe_signal_group(process_group: i32, signal: i32) -> io::Result<()> {
 /// Signal only a validated direct PID; the reserved boundary is checked at
 /// every call site because PID reuse must never widen a cleanup operation.
 pub fn safe_signal_pid(pid: i32, signal: i32) -> io::Result<()> {
-    if pid <= 1 {
+    if pid <= 1 || u32::try_from(pid).ok() == Some(std::process::id()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "reserved process id",
@@ -391,6 +391,13 @@ fn set_nonblocking<T: AsRawFd>(file: &T) -> io::Result<()> {
 unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
     fn fcntl(fd: i32, command: i32, ...) -> i32;
+    fn getpgrp() -> i32;
+}
+
+/// Read the host process group so a forged marker cannot turn a negative PID
+/// into a signal against the supervising process itself.
+fn current_process_group() -> i32 {
+    unsafe { getpgrp() }
 }
 
 #[cfg(test)]
@@ -405,5 +412,7 @@ mod tests {
             assert!(safe_signal_pid(value, 0).is_err());
             assert!(safe_signal_group(value, 0).is_err());
         }
+        assert!(safe_signal_pid(std::process::id() as i32, 0).is_err());
+        assert!(safe_signal_group(super::current_process_group(), 0).is_err());
     }
 }

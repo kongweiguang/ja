@@ -29,11 +29,33 @@ pub(super) enum ProcessState {
     Other(i32),
 }
 
+/// Capture both kernel liveness probes under one caller-owned deadline so a
+/// cleaned marker is garbage-collected only after PID and PGID both report
+/// the exact ESRCH state.
+pub(super) fn probe_pid_group_until(
+    pid: u32,
+    process_group: i32,
+    deadline: Instant,
+) -> Result<(ProcessState, ProcessState), &'static str> {
+    let pid = i32::try_from(pid).map_err(|_| "marker-owner-mismatch")?;
+    if pid <= 1
+        || process_group <= 1
+        || u32::try_from(pid).ok() == Some(current_pid())
+        || process_group == current_pgid()
+    {
+        return Err("marker-owner-mismatch");
+    }
+    let direct = pid_state_until(pid, deadline)?;
+    let group = group_state_until(process_group, deadline)?;
+    Ok((direct, group))
+}
+
 /// Minimal identity data used to prevent PID reuse before a group signal.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct ProcessIdentity {
     pub(super) pid: u32,
     pub(super) pgid: i32,
+    pub(super) uid: u32,
     pub(super) comm: String,
     pub(super) start_identity: String,
 }
@@ -54,6 +76,12 @@ pub(super) fn current_pgid() -> i32 {
     unsafe { getpgrp() }
 }
 
+/// Return the host process identity so cleanup can never signal its own PID or
+/// process group even when a forged marker supplies otherwise valid numbers.
+pub(super) fn current_pid() -> u32 {
+    std::process::id()
+}
+
 /// Read the current uid for descriptor-bound marker ownership checks.
 pub(super) fn current_uid() -> u32 {
     unsafe { geteuid() }
@@ -61,21 +89,34 @@ pub(super) fn current_uid() -> u32 {
 
 /// Probe an exact PID or process group using kernel errno semantics.
 pub(super) fn pid_state(pid: i32) -> ProcessState {
-    if pid <= 1 {
+    if pid <= 1 || u32::try_from(pid).ok() == Some(current_pid()) {
         return ProcessState::Other(22);
     }
     classify_kill_result(unsafe { kill(pid, 0) })
 }
 
-/// Query process group/name/start identity through a supervised bounded `ps`.
+/// Query process group, owner UID, name and start identity through one
+/// supervised bounded `ps` invocation; the shared deadline prevents a marker
+/// set from multiplying the per-query timeout.
 pub(super) fn query_identity(pid: u32) -> Result<ProcessIdentity, &'static str> {
-    if pid <= 1 {
+    query_identity_until(pid, Instant::now() + QUERY_DEADLINE)
+}
+
+/// Query one identity without extending a caller-owned cleanup deadline.
+pub(super) fn query_identity_until(
+    pid: u32,
+    deadline: Instant,
+) -> Result<ProcessIdentity, &'static str> {
+    if pid <= 1 || pid == current_pid() {
         return Err("marker-owner-mismatch");
+    }
+    if Instant::now() >= deadline {
+        return Err("marker-query-unreaped");
     }
     let mut command = Command::new("/bin/ps");
     let pid_argument = pid.to_string();
     command
-        .args(["-o", "pgid=,comm=,lstart=", "-p", &pid_argument])
+        .args(["-o", "uid=,pgid=,comm=,lstart=", "-p", &pid_argument])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -83,9 +124,9 @@ pub(super) fn query_identity(pid: u32) -> Result<ProcessIdentity, &'static str> 
     // macOS PIDs are bounded by pid_t/i32; validate the conversion and reserve
     // PID/group values before any negative process-group operation is formed.
     let process_group = match i32::try_from(child.id()).ok().filter(|value| *value > 1) {
-        Some(process_group) => process_group,
-        None => {
-            if !reap_child_without_group(&mut child) {
+        Some(process_group) if process_group != current_pgid() => process_group,
+        Some(_) | None => {
+            if !reap_child_without_group_until(&mut child, deadline) {
                 abort_unreaped_query("invalid-process-group");
             }
             return Err("marker-owner-mismatch");
@@ -93,18 +134,17 @@ pub(super) fn query_identity(pid: u32) -> Result<ProcessIdentity, &'static str> 
     };
     let mut stdout = match child.stdout.take() {
         Some(stdout) => stdout,
-        None => return query_failure(&mut child, process_group),
+        None => return query_failure(&mut child, process_group, deadline),
     };
     let mut stderr = match child.stderr.take() {
         Some(stderr) => stderr,
-        None => return query_failure(&mut child, process_group),
+        None => return query_failure(&mut child, process_group, deadline),
     };
     if set_nonblocking(&stdout).is_err() || set_nonblocking(&stderr).is_err() {
         drop(stdout);
         drop(stderr);
-        return query_failure(&mut child, process_group);
+        return query_failure(&mut child, process_group, deadline);
     }
-    let deadline = Instant::now() + QUERY_DEADLINE;
     let mut output = Vec::new();
     let mut stdout_bytes = 0;
     let mut stderr_bytes = 0;
@@ -128,12 +168,12 @@ pub(super) fn query_identity(pid: u32) -> Result<ProcessIdentity, &'static str> 
     drop(stderr);
     let status = match status {
         Some(status) => status,
-        None => return query_failure(&mut child, process_group),
+        None => return query_failure(&mut child, process_group, deadline),
     };
     if !status.success() || !pipes_ok {
-        return query_failure(&mut child, process_group);
+        return query_failure(&mut child, process_group, deadline);
     }
-    let identity = terminate_query(&mut child, process_group, Some(output))?;
+    let identity = terminate_query(&mut child, process_group, Some(output), deadline)?;
     let mut identity = parse_identity(&identity)?;
     identity.pid = pid_from_argument(&pid_argument)?;
     Ok(identity)
@@ -173,10 +213,13 @@ pub(super) fn reap_child_group_bounded(
     process_group: i32,
     deadline: Instant,
 ) -> Result<(), &'static str> {
-    if process_group <= 1 {
+    if process_group <= 1 || process_group == current_pgid() {
         return Err("marker-owner-mismatch");
     }
-    let signal_result = signal_group(process_group);
+    if Instant::now() >= deadline {
+        return Err("marker-residual");
+    }
+    let signal_result = signal_group(process_group, deadline);
     let reap_result = finalize_child(child, process_group, deadline, "fixture-unreaped");
     let group_result = require_group_empty(process_group, deadline);
     match (signal_result, reap_result, group_result) {
@@ -187,8 +230,12 @@ pub(super) fn reap_child_group_bounded(
 
 /// Reap a failed query child before returning a fixed identity error; this
 /// prevents an early pipe/status branch from dropping a live supervisor.
-fn query_failure(child: &mut Child, process_group: i32) -> Result<ProcessIdentity, &'static str> {
-    match terminate_query(child, process_group, None) {
+fn query_failure(
+    child: &mut Child,
+    process_group: i32,
+    deadline: Instant,
+) -> Result<ProcessIdentity, &'static str> {
+    match terminate_query(child, process_group, None, deadline) {
         Ok(_) => Err("marker-owner-mismatch"),
         Err(category) => Err(category),
     }
@@ -197,8 +244,13 @@ fn query_failure(child: &mut Child, process_group: i32) -> Result<ProcessIdentit
 /// Reap a query child without ever forming a dangerous negative process-group
 /// target when the kernel returns an invalid/reserved child PID.
 pub(super) fn reap_child_without_group(child: &mut Child) -> bool {
+    reap_child_without_group_until(child, Instant::now() + QUERY_DEADLINE)
+}
+
+/// Reap a child without creating a fresh timeout window for a caller-owned
+/// cleanup operation whose global deadline has already been established.
+pub(super) fn reap_child_without_group_until(child: &mut Child, deadline: Instant) -> bool {
     let _ = child.kill();
-    let deadline = Instant::now() + QUERY_DEADLINE;
     while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_)) => return true,
@@ -215,21 +267,27 @@ pub(super) fn terminate_group(
     captured: &ProcessIdentity,
     deadline: Instant,
 ) -> Result<(), &'static str> {
-    validate_captured_identity(captured)?;
-    let group_signal = signal_group_captured(captured)?;
+    validate_captured_identity(captured, deadline)?;
+    let group_signal = signal_group_captured(captured, deadline)?;
     if group_signal == ProcessState::Empty {
         // The group disappearing before the direct signal is a PID-reuse
         // boundary: never send a signal to a new process that inherited the
         // old numeric PID after the validated group vanished.
-        return match pid_state(i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?) {
+        return match pid_state_until(
+            i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?,
+            deadline,
+        )? {
             ProcessState::Empty => Ok(()),
             ProcessState::PermissionDenied => Err("marker-eperm"),
             ProcessState::Present => Err("marker-identity-lost"),
             ProcessState::Other(_) => Err("marker-process-probe-failed"),
         };
     }
-    let direct = pid_state(i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?);
-    let group = group_state(captured.pgid);
+    let direct = pid_state_until(
+        i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?,
+        deadline,
+    )?;
+    let group = group_state_until(captured.pgid, deadline)?;
     match (direct, group) {
         (ProcessState::Empty, ProcessState::Empty) => return Ok(()),
         (ProcessState::PermissionDenied, _) | (_, ProcessState::PermissionDenied) => {
@@ -250,13 +308,16 @@ pub(super) fn terminate_group(
     }
     // The group signal may have raced with exit/reuse.  A fresh full identity
     // query is mandatory before direct PID signalling can be attempted.
-    if validate_captured_identity(captured).is_err() {
+    if validate_captured_identity(captured, deadline).is_err() {
         return wait_after_group_signal(captured, deadline);
     }
-    signal_pid(captured.pid)?;
+    signal_pid(captured.pid, deadline)?;
     loop {
-        let direct = pid_state(i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?);
-        let group = group_state(captured.pgid);
+        let direct = pid_state_until(
+            i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?,
+            deadline,
+        )?;
+        let group = group_state_until(captured.pgid, deadline)?;
         match (direct, group) {
             (ProcessState::Empty, ProcessState::Empty) => return Ok(()),
             (ProcessState::PermissionDenied, _) | (_, ProcessState::PermissionDenied) => {
@@ -271,6 +332,94 @@ pub(super) fn terminate_group(
     }
 }
 
+/// Recover a group-signal `EPERM` only with a complete, caller-supplied set of
+/// identity-checked members.  This is deliberately fail-closed for an
+/// incomplete set: every known PID must disappear and the kernel must also
+/// report the PGID empty, so an unknown same-group process can never be
+/// mistaken for successful cleanup.
+pub(super) fn terminate_group_with_identity_fallback(
+    captured: &ProcessIdentity,
+    peers: &[ProcessIdentity],
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    match terminate_group(captured, deadline) {
+        Ok(()) => Ok(()),
+        Err("marker-eperm") => {
+            let mut targets: Vec<&ProcessIdentity> = Vec::with_capacity(peers.len());
+            for peer in peers {
+                if peer.pid <= 1
+                    || peer.pgid <= 1
+                    || peer.pid == current_pid()
+                    || peer.pgid == current_pgid()
+                    || peer.pgid != captured.pgid
+                    || peer.uid != current_uid()
+                {
+                    return Err("marker-owner-mismatch");
+                }
+                if let Some(existing) = targets.iter().find(|target| target.pid == peer.pid) {
+                    if *existing != peer {
+                        return Err("marker-identity-lost");
+                    }
+                    continue;
+                }
+                targets.push(peer);
+            }
+            if !targets.iter().any(|target| target.pid == captured.pid) {
+                return Err("marker-owner-mismatch");
+            }
+            // An EPERM group probe may already have killed a member.  Query
+            // each remaining member before its direct signal, and never use a
+            // stale numeric PID merely because it appeared in a marker.
+            for target in &targets {
+                let pid = i32::try_from(target.pid).map_err(|_| "marker-owner-mismatch")?;
+                match pid_state_until(pid, deadline)? {
+                    ProcessState::Empty => {}
+                    ProcessState::PermissionDenied => return Err("marker-eperm"),
+                    ProcessState::Other(_) => return Err("marker-process-probe-failed"),
+                    ProcessState::Present => {
+                        validate_captured_identity(target, deadline)?;
+                        signal_pid(target.pid, deadline)?;
+                    }
+                }
+            }
+            wait_after_identity_group(&targets, captured.pgid, deadline)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Wait for every trusted member and the complete group to disappear after a
+/// direct fallback.  The group check remains mandatory because the marker set
+/// may not describe an untrusted extra descendant.
+fn wait_after_identity_group(
+    targets: &[&ProcessIdentity],
+    process_group: i32,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    loop {
+        let mut all_direct_empty = true;
+        for target in targets {
+            match pid_state_until(
+                i32::try_from(target.pid).map_err(|_| "marker-owner-mismatch")?,
+                deadline,
+            )? {
+                ProcessState::Empty => {}
+                ProcessState::PermissionDenied => return Err("marker-eperm"),
+                ProcessState::Other(_) => return Err("marker-process-probe-failed"),
+                ProcessState::Present => all_direct_empty = false,
+            }
+        }
+        match group_state_until(process_group, deadline)? {
+            ProcessState::Empty if all_direct_empty => return Ok(()),
+            ProcessState::PermissionDenied => return Err("marker-eperm"),
+            ProcessState::Other(_) => return Err("marker-process-probe-failed"),
+            ProcessState::Empty => return Err("marker-identity-lost"),
+            ProcessState::Present if Instant::now() >= deadline => return Err("marker-residual"),
+            ProcessState::Present => thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
 /// After a validated group SIGKILL, wait only for kernel disappearance.  This
 /// avoids a stale direct-PID signal when macOS briefly exposes a zombie or the
 /// identity helper cannot observe a just-killed process.
@@ -279,8 +428,11 @@ fn wait_after_group_signal(
     deadline: Instant,
 ) -> Result<(), &'static str> {
     loop {
-        let direct = pid_state(i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?);
-        let group = group_state(captured.pgid);
+        let direct = pid_state_until(
+            i32::try_from(captured.pid).map_err(|_| "marker-owner-mismatch")?,
+            deadline,
+        )?;
+        let group = group_state_until(captured.pgid, deadline)?;
         match (direct, group) {
             (ProcessState::Empty, ProcessState::Empty) => return Ok(()),
             (ProcessState::PermissionDenied, _) | (_, ProcessState::PermissionDenied) => {
@@ -298,11 +450,20 @@ fn wait_after_group_signal(
 
 /// Re-query every immutable field captured before cleanup; a PID or PGID
 /// mismatch is an identity-loss failure and never authorizes a signal.
-fn validate_captured_identity(captured: &ProcessIdentity) -> Result<(), &'static str> {
-    if captured.pid <= 1 || captured.pgid <= 1 {
+fn validate_captured_identity(
+    captured: &ProcessIdentity,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    if captured.pid <= 1
+        || captured.pgid <= 1
+        || captured.pid == current_pid()
+        || captured.pgid == current_pgid()
+        || captured.uid != current_uid()
+    {
         return Err("marker-owner-mismatch");
     }
-    let current = query_identity(captured.pid).map_err(|_| "marker-identity-lost")?;
+    let current =
+        query_identity_until(captured.pid, deadline).map_err(|_| "marker-identity-lost")?;
     if !same_captured_identity(captured, &current) {
         return Err("marker-identity-lost");
     }
@@ -311,19 +472,22 @@ fn validate_captured_identity(captured: &ProcessIdentity) -> Result<(), &'static
 
 /// Signal a captured identity's group only after the complete identity has
 /// been refreshed immediately before the kernel operation.
-fn signal_group_captured(captured: &ProcessIdentity) -> Result<ProcessState, &'static str> {
-    validate_captured_identity(captured)?;
-    signal_group(captured.pgid)
+fn signal_group_captured(
+    captured: &ProcessIdentity,
+    deadline: Instant,
+) -> Result<ProcessState, &'static str> {
+    validate_captured_identity(captured, deadline)?;
+    signal_group(captured.pgid, deadline)
 }
 
 /// Keep the direct Child alive until it is reaped, then require its captured
 /// group to disappear; this helper deliberately sends no stale group signal.
 fn require_group_empty(process_group: i32, deadline: Instant) -> Result<(), &'static str> {
-    if process_group <= 1 {
+    if process_group <= 1 || process_group == current_pgid() {
         return Err("marker-owner-mismatch");
     }
     loop {
-        match group_state(process_group) {
+        match group_state_until(process_group, deadline)? {
             ProcessState::Empty => return Ok(()),
             ProcessState::PermissionDenied => return Err("marker-eperm"),
             ProcessState::Other(_) => return Err("marker-process-probe-failed"),
@@ -362,36 +526,80 @@ fn terminate_group_backend<B: GroupCleanupBackend>(
 
 /// Probe a process group exactly; `PermissionDenied` is never treated as gone.
 pub(super) fn group_state(process_group: i32) -> ProcessState {
-    if process_group <= 1 {
+    if process_group <= 1 || process_group == current_pgid() {
         return ProcessState::Other(22);
     }
     classify_kill_result(unsafe { kill(-process_group, 0) })
 }
 
+/// Poll one PID while refusing to report a terminal state after the shared
+/// deadline; a late `ESRCH` must not turn an over-budget cleanup into success.
+fn pid_state_until(pid: i32, deadline: Instant) -> Result<ProcessState, &'static str> {
+    if Instant::now() >= deadline {
+        return Err("marker-residual");
+    }
+    let state = pid_state(pid);
+    if Instant::now() >= deadline {
+        Err("marker-residual")
+    } else {
+        Ok(state)
+    }
+}
+
+/// Poll one PGID under the same before/after deadline gate used by direct PID
+/// checks, so group disappearance is not accepted after the budget expires.
+fn group_state_until(process_group: i32, deadline: Instant) -> Result<ProcessState, &'static str> {
+    if Instant::now() >= deadline {
+        return Err("marker-residual");
+    }
+    let state = group_state(process_group);
+    if Instant::now() >= deadline {
+        Err("marker-residual")
+    } else {
+        Ok(state)
+    }
+}
+
 /// Send SIGKILL only to a previously validated exact process group.
-fn signal_group(process_group: i32) -> Result<ProcessState, &'static str> {
-    if process_group <= 1 {
+fn signal_group(process_group: i32, deadline: Instant) -> Result<ProcessState, &'static str> {
+    if process_group <= 1 || process_group == current_pgid() {
         return Err("marker-owner-mismatch");
     }
-    match safe_signal_group(process_group, SIGKILL) {
+    if Instant::now() >= deadline {
+        return Err("marker-residual");
+    }
+    let result = match safe_signal_group(process_group, SIGKILL) {
         Ok(()) => Ok(ProcessState::Present),
         Err(error) if error.raw_os_error() == Some(ESRCH) => Ok(ProcessState::Empty),
         Err(error) if error.raw_os_error() == Some(EPERM) => Err("marker-eperm"),
         Err(_) => Err("marker-signal-failed"),
+    };
+    if Instant::now() >= deadline {
+        Err("marker-residual")
+    } else {
+        result
     }
 }
 
 /// Send SIGKILL only to the validated direct PID after the group signal.
-fn signal_pid(pid: u32) -> Result<(), &'static str> {
+fn signal_pid(pid: u32, deadline: Instant) -> Result<(), &'static str> {
     let pid = i32::try_from(pid).map_err(|_| "marker-owner-mismatch")?;
-    if pid <= 1 {
+    if pid <= 1 || u32::try_from(pid).ok() == Some(current_pid()) {
         return Err("marker-owner-mismatch");
     }
-    match safe_signal_pid(pid, SIGKILL) {
+    if Instant::now() >= deadline {
+        return Err("marker-residual");
+    }
+    let result = match safe_signal_pid(pid, SIGKILL) {
         Ok(()) => Ok(()),
         Err(error) if error.raw_os_error() == Some(ESRCH) => Ok(()),
         Err(error) if error.raw_os_error() == Some(EPERM) => Err("marker-eperm"),
         Err(_) => Err("marker-signal-failed"),
+    };
+    if Instant::now() >= deadline {
+        Err("marker-residual")
+    } else {
+        result
     }
 }
 
@@ -444,10 +652,21 @@ impl QueryChildBackend for RealQueryChild<'_> {
 
 /// Keep a Child-owned backend through every bounded poll; callers may only
 /// return after `Reaped`, otherwise they must enter the explicit abort path.
+#[cfg(test)]
 fn bounded_reap_backend<B: QueryChildBackend>(
     backend: &mut B,
     deadline: Instant,
     retry_window: Duration,
+) -> bool {
+    bounded_reap_backend_until(backend, deadline, Instant::now() + retry_window)
+}
+
+/// Reap using an absolute retry deadline so a caller-owned global budget is
+/// never extended by a second cleanup phase after a poll error or timeout.
+fn bounded_reap_backend_until<B: QueryChildBackend>(
+    backend: &mut B,
+    deadline: Instant,
+    retry_deadline: Instant,
 ) -> bool {
     loop {
         match backend.poll() {
@@ -459,7 +678,6 @@ fn bounded_reap_backend<B: QueryChildBackend>(
         }
     }
     backend.force_kill();
-    let retry_deadline = Instant::now() + retry_window;
     loop {
         match backend.poll() {
             QueryPoll::Reaped => return true,
@@ -480,8 +698,8 @@ fn finalize_child(
     deadline: Instant,
     reason: &'static str,
 ) -> Result<(), &'static str> {
-    if process_group <= 1 {
-        if !reap_child_without_group(child) {
+    if process_group <= 1 || process_group == current_pgid() {
+        if !reap_child_without_group_until(child, deadline) {
             abort_unreaped_query(reason);
         }
         // A reaped child is not enough when its group identity is unsafe: a
@@ -490,9 +708,7 @@ fn finalize_child(
         abort_unreaped_query("group-unsafe");
     }
     let mut backend = RealQueryChild { child };
-    if !bounded_reap_backend(&mut backend, deadline, QUERY_DEADLINE)
-        && !bounded_reap_backend(&mut backend, Instant::now(), QUERY_DEADLINE)
-    {
+    if !bounded_reap_backend_until(&mut backend, deadline, deadline) {
         abort_unreaped_query(reason);
     }
     Ok(())
@@ -511,15 +727,10 @@ fn terminate_query(
     child: &mut Child,
     process_group: i32,
     output: Option<Vec<u8>>,
+    deadline: Instant,
 ) -> Result<Vec<u8>, &'static str> {
-    finalize_child(
-        child,
-        process_group,
-        Instant::now() + QUERY_DEADLINE,
-        "query-unreaped",
-    )?;
-    require_group_empty(process_group, Instant::now() + QUERY_DEADLINE)
-        .map_err(|_| "marker-query-group-residual")?;
+    finalize_child(child, process_group, deadline, "query-unreaped")?;
+    require_group_empty(process_group, deadline).map_err(|_| "marker-query-group-residual")?;
     output.ok_or("marker-owner-mismatch")
 }
 
@@ -527,21 +738,27 @@ fn terminate_query(
 fn parse_identity(output: &[u8]) -> Result<ProcessIdentity, &'static str> {
     let text = std::str::from_utf8(output).map_err(|_| "marker-owner-mismatch")?;
     let fields: Vec<&str> = text.split_whitespace().collect();
-    if fields.len() < 7 {
+    if fields.len() < 8 {
         return Err("marker-owner-mismatch");
     }
-    let pgid = fields[0]
+    let uid = fields[0]
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value == current_uid())
+        .ok_or("marker-owner-mismatch")?;
+    let pgid = fields[1]
         .parse::<i32>()
         .ok()
         .filter(|value| *value > 1)
         .ok_or("marker-owner-mismatch")?;
-    let comm = fields[1].to_owned();
-    let start_identity = fields[2..].join(" ");
+    let comm = fields[2].to_owned();
+    let start_identity = fields[3..].join(" ");
     Ok(ProcessIdentity {
         // The query caller fills the already validated target PID after the
         // helper output is parsed, so an untrusted `ps` row cannot choose it.
         pid: 0,
         pgid,
+        uid,
         comm,
         start_identity,
     })
@@ -553,8 +770,12 @@ fn parse_identity(output: &[u8]) -> Result<ProcessIdentity, &'static str> {
 fn same_captured_identity(expected: &ProcessIdentity, current: &ProcessIdentity) -> bool {
     expected.pid > 1
         && expected.pgid > 1
+        && expected.pid != current_pid()
+        && expected.pgid != current_pgid()
+        && expected.uid == current_uid()
         && current.pid == expected.pid
         && current.pgid == expected.pgid
+        && current.uid == expected.uid
         && current.comm == expected.comm
         && current.start_identity == expected.start_identity
 }
@@ -680,6 +901,7 @@ mod tests {
         let captured = ProcessIdentity {
             pid: 42,
             pgid: 43,
+            uid: current_uid(),
             comm: "ja-sandbox-worker".to_owned(),
             start_identity: "Mon Jan 1 00:00:00 2026".to_owned(),
         };
@@ -700,11 +922,29 @@ mod tests {
                 start_identity: "Tue Jan 2 00:00:00 2026".to_owned(),
                 ..captured.clone()
             },
+            ProcessIdentity {
+                uid: current_uid().saturating_add(1),
+                ..captured.clone()
+            },
         ];
         for reused in cases {
             assert!(!same_captured_identity(&captured, &reused));
         }
         assert!(same_captured_identity(&captured, &captured));
+        assert!(!same_captured_identity(
+            &ProcessIdentity {
+                pid: current_pid(),
+                ..captured.clone()
+            },
+            &captured
+        ));
+        assert!(!same_captured_identity(
+            &ProcessIdentity {
+                pgid: current_pgid(),
+                ..captured.clone()
+            },
+            &captured
+        ));
     }
 
     struct FakeGroupBackend {

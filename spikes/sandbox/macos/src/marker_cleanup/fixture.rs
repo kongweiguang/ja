@@ -5,11 +5,11 @@
 
 use super::marker::write_fixture_marker;
 use super::process::{
-    EPERM, ProcessIdentity, ProcessState, abort_unreaped_query, classify_errno, current_pgid,
-    current_uid, group_state, pid_state, query_identity, reap_child_bounded,
-    reap_child_group_bounded, reap_child_without_group, set_nonblocking, terminate_group,
+    EPERM, ProcessIdentity, abort_unreaped_query, classify_errno, current_pgid, current_uid,
+    query_identity_until, reap_child_bounded, reap_child_group_bounded,
+    reap_child_without_group_until, set_nonblocking, terminate_group_with_identity_fallback,
 };
-use super::{MARKER_MODE, O_CLOEXEC_FLAG, O_NOFOLLOW_FLAG, cleanup_markers};
+use super::{MARKER_MODE, O_CLOEXEC_FLAG, O_NOFOLLOW_FLAG, cleanup_markers_until};
 use crate::spawn_grouped;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -18,22 +18,27 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const FIXTURE_CLEANUP_DEADLINE: Duration = Duration::from_secs(8);
+
 /// Run forged, pending, residual-descendant and exact-EPERM cases using the
 /// same scan/signal implementation that production workflow cleanup invokes.
 pub(super) fn run() -> Result<(), &'static str> {
+    // One deadline covers every fixture phase so a slow or wedged earlier case
+    // cannot silently grant a fresh cleanup window to a later case.
+    let deadline = Instant::now() + FIXTURE_CLEANUP_DEADLINE;
     if classify_errno(EPERM) != super::process::ProcessState::PermissionDenied {
         return Err("fixture-eperm-classification");
     }
-    forged_case()?;
-    pending_case()?;
-    residual_group_case()?;
-    descendant_case()?;
+    forged_case(deadline)?;
+    pending_case(deadline)?;
+    residual_group_case(deadline)?;
+    descendant_case(deadline)?;
     println!("marker-cleanup-fixtures=pass");
     Ok(())
 }
 
 /// Prove a forged owner field is rejected before the production code signals.
-fn forged_case() -> Result<(), &'static str> {
+fn forged_case(deadline: Instant) -> Result<(), &'static str> {
     let (root, report) = fixture_paths("forged");
     let path = root.join(format!(
         "ja-sandbox-log-helper-{}-11.marker",
@@ -43,7 +48,7 @@ fn forged_case() -> Result<(), &'static str> {
         &path,
         "owner_pid=999999\nnonce=11\npid=999999\npgid=999999\nstart_identity=forged\nexecutable_kind=log\nstate=active\n",
     )?;
-    if cleanup_markers(&root, &report, false).is_ok()
+    if cleanup_markers_until(&root, &report, false, deadline).is_ok()
         || !report_contains(&report, "marker-owner-mismatch=true")?
     {
         return Err("fixture-forged-marker");
@@ -52,7 +57,7 @@ fn forged_case() -> Result<(), &'static str> {
 }
 
 /// Prove pending activation is reported and removed without any signal path.
-fn pending_case() -> Result<(), &'static str> {
+fn pending_case(deadline: Instant) -> Result<(), &'static str> {
     let (root, report) = fixture_paths("pending");
     let path = root.join(format!(
         ".ja-sandbox-log-helper-{}-12.marker.pending",
@@ -68,7 +73,7 @@ fn pending_case() -> Result<(), &'static str> {
     file.write_all(b"pending")
         .map_err(|_| "fixture-pending-write")?;
     file.sync_all().map_err(|_| "fixture-pending-write")?;
-    if cleanup_markers(&root, &report, false).is_ok()
+    if cleanup_markers_until(&root, &report, false, deadline).is_ok()
         || !report_contains(&report, "marker-pending=true")?
     {
         return Err("fixture-pending-marker");
@@ -78,7 +83,7 @@ fn pending_case() -> Result<(), &'static str> {
 
 /// Prove a marker naming the cleanup process group is retained and reported
 /// as residual/unsafe instead of ever signalling the workflow itself.
-fn residual_group_case() -> Result<(), &'static str> {
+fn residual_group_case(deadline: Instant) -> Result<(), &'static str> {
     let (root, report) = fixture_paths("residual");
     let pid = std::process::id();
     let process_group = current_pgid();
@@ -92,7 +97,7 @@ fn residual_group_case() -> Result<(), &'static str> {
             "owner_pid={pid}\nnonce=13\npid={pid}\npgid={process_group}\nstart_identity=fixture\nexecutable_kind=fixture\nstate=active\n"
         ),
     )?;
-    if cleanup_markers(&root, &report, true).is_ok()
+    if cleanup_markers_until(&root, &report, true, deadline).is_ok()
         || !report_contains(&report, "marker-group-unsafe=true")?
         || !path.exists()
     {
@@ -106,7 +111,7 @@ fn residual_group_case() -> Result<(), &'static str> {
 
 /// Spawn a real descendant group, write a fixture marker, then let production
 /// cleanup signal and verify both direct PID and group reach exact ESRCH.
-fn descendant_case() -> Result<(), &'static str> {
+fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
     let (root, report) = fixture_paths("descendant");
     let mut command = Command::new("/bin/sh");
     command
@@ -121,15 +126,19 @@ fn descendant_case() -> Result<(), &'static str> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut launcher = spawn_grouped(&mut command).map_err(|_| "fixture-helper-spawn")?;
+    // The caller's deadline is shared with the preceding fixture cases; every
+    // query, signal, reap and report must consume that same absolute budget.
+    let fixture_deadline = deadline;
     let process_group = match i32::try_from(launcher.id()) {
         Ok(process_group) if process_group > 1 => process_group,
         _ => {
-            let evidence_result = persist_fixture_failure_without_group(
+            let evidence_result = persist_fixture_failure_without_group_until(
                 &root,
                 launcher.id(),
                 "fixture-invalid-process-group",
+                fixture_deadline,
             );
-            let reaped = reap_child_without_group(&mut launcher);
+            let reaped = reap_child_without_group_until(&mut launcher, fixture_deadline);
             if evidence_result.is_err() {
                 abort_unreaped_query("fixture-failure-evidence");
             }
@@ -144,20 +153,23 @@ fn descendant_case() -> Result<(), &'static str> {
     };
     // Capture the launcher identity while it is still alive so an early pipe
     // or parsing fault can still use the same identity-checked group cleanup.
-    let launcher_identity =
-        match accept_launcher_identity(query_identity(launcher.id()), launcher.id(), process_group)
-        {
-            Ok(identity) => Some(identity),
-            Err(category) => {
-                return finish_launcher_failure(
-                    &root,
-                    &mut launcher,
-                    process_group,
-                    None,
-                    category,
-                );
-            }
-        };
+    let launcher_identity = match accept_launcher_identity(
+        query_identity_until(launcher.id(), fixture_deadline),
+        launcher.id(),
+        process_group,
+    ) {
+        Ok(identity) => Some(identity),
+        Err(category) => {
+            return finish_launcher_failure(
+                &root,
+                &mut launcher,
+                process_group,
+                None,
+                fixture_deadline,
+                category,
+            );
+        }
+    };
     let mut stdout = match launcher.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -166,6 +178,7 @@ fn descendant_case() -> Result<(), &'static str> {
                 &mut launcher,
                 process_group,
                 launcher_identity.as_ref(),
+                fixture_deadline,
                 "fixture-helper-pipe",
             );
         }
@@ -177,14 +190,11 @@ fn descendant_case() -> Result<(), &'static str> {
             &mut launcher,
             process_group,
             launcher_identity.as_ref(),
+            fixture_deadline,
             "fixture-helper-pipe",
         );
     }
-    let output = match read_launcher_output(
-        &mut stdout,
-        &mut launcher,
-        Instant::now() + Duration::from_secs(2),
-    ) {
+    let output = match read_launcher_output(&mut stdout, &mut launcher, fixture_deadline) {
         Ok(output) => output,
         Err(error) => {
             drop(stdout);
@@ -193,6 +203,7 @@ fn descendant_case() -> Result<(), &'static str> {
                 &mut launcher,
                 process_group,
                 launcher_identity.as_ref(),
+                fixture_deadline,
                 error,
             );
         }
@@ -206,6 +217,7 @@ fn descendant_case() -> Result<(), &'static str> {
                 &mut launcher,
                 process_group,
                 launcher_identity.as_ref(),
+                fixture_deadline,
                 "fixture-helper-pid",
             );
         }
@@ -215,11 +227,12 @@ fn descendant_case() -> Result<(), &'static str> {
                 &mut launcher,
                 process_group,
                 launcher_identity.as_ref(),
+                fixture_deadline,
                 "fixture-helper-pid",
             );
         }
     };
-    let identity = match query_identity(pid) {
+    let identity = match query_identity_until(pid, fixture_deadline) {
         Ok(identity) => identity,
         Err(_) => {
             return finish_launcher_failure(
@@ -227,6 +240,7 @@ fn descendant_case() -> Result<(), &'static str> {
                 &mut launcher,
                 process_group,
                 launcher_identity.as_ref(),
+                fixture_deadline,
                 "fixture-helper-query",
             );
         }
@@ -237,6 +251,7 @@ fn descendant_case() -> Result<(), &'static str> {
             &mut launcher,
             process_group,
             launcher_identity.as_ref(),
+            fixture_deadline,
             "fixture-helper-identity",
         );
     }
@@ -248,6 +263,7 @@ fn descendant_case() -> Result<(), &'static str> {
                 &mut launcher,
                 process_group,
                 launcher_identity.as_ref(),
+                fixture_deadline,
                 "fixture-clock",
             );
         }
@@ -267,28 +283,86 @@ fn descendant_case() -> Result<(), &'static str> {
             &mut launcher,
             process_group,
             Some(&identity),
+            fixture_deadline,
             "fixture-marker-write",
         );
     }
-    let result = cleanup_markers(&root, &report, true);
+    let launcher_nonce = match nonce.checked_add(1) {
+        Some(value) => value,
+        None => {
+            return finish_launcher_failure(
+                &root,
+                &mut launcher,
+                process_group,
+                Some(&identity),
+                fixture_deadline,
+                "fixture-clock",
+            );
+        }
+    };
+    let launcher_marker = root.join(format!(
+        "ja-sandbox-log-helper-{}-{launcher_nonce}.marker",
+        std::process::id()
+    ));
+    let launcher_record = match launcher_identity.as_ref() {
+        Some(identity) => identity,
+        None => {
+            let _ = fs::remove_file(&path);
+            return finish_launcher_failure(
+                &root,
+                &mut launcher,
+                process_group,
+                Some(&identity),
+                fixture_deadline,
+                "fixture-helper-identity",
+            );
+        }
+    };
+    let launcher_contents = format!(
+        "owner_pid={}
+nonce={launcher_nonce}
+pid={}
+pgid={process_group}
+start_identity={}
+executable_kind=fixture
+state=active
+",
+        std::process::id(),
+        launcher_record.pid,
+        launcher_record.start_identity
+    );
+    // Register every known member before the group signal.  If Darwin returns
+    // EPERM for the aggregate target, production cleanup can still direct
+    // signal each identity while requiring the final PGID to report ESRCH;
+    // an incomplete marker set must never be interpreted as a clean group.
+    if write_fixture_marker(&launcher_marker, &launcher_contents).is_err() {
+        let _ = fs::remove_file(&path);
+        return finish_launcher_failure(
+            &root,
+            &mut launcher,
+            process_group,
+            Some(&identity),
+            fixture_deadline,
+            "fixture-marker-write",
+        );
+    }
+    let result = cleanup_markers_until(&root, &report, true, fixture_deadline);
     // Keep the launcher Child owned until production cleanup has observed and
     // terminated its real descendant; reaping before this point would make the
     // fixture prove only a helper exit, not the marker cleanup contract.
-    let launcher_result = reap_child_bounded(
-        &mut launcher,
-        process_group,
-        Instant::now() + Duration::from_secs(2),
-    );
+    let launcher_result = reap_child_bounded(&mut launcher, process_group, fixture_deadline);
     if result.is_err() {
         // Preserve only the production report's fixed category so a native
         // runner can distinguish residual, identity, query and signal faults
         // without exposing a PID, path, locale text or marker contents.
-        let category = fixture_cleanup_failure_category(&report);
+        let category = fixture_cleanup_failure_category_until(&report, fixture_deadline);
         return finish_descendant_failure(
             &root,
             launcher.id(),
             &identity,
+            launcher_identity.as_ref(),
             launcher_result,
+            fixture_deadline,
             category,
         );
     }
@@ -297,7 +371,9 @@ fn descendant_case() -> Result<(), &'static str> {
             &root,
             launcher.id(),
             &identity,
+            launcher_identity.as_ref(),
             Err(error),
+            fixture_deadline,
             "fixture-launcher-cleanup",
         );
     }
@@ -312,28 +388,33 @@ fn finish_launcher_failure(
     launcher: &mut std::process::Child,
     process_group: i32,
     identity: Option<&ProcessIdentity>,
+    deadline: Instant,
     category: &'static str,
 ) -> Result<(), &'static str> {
-    let evidence_result =
-        persist_fixture_failure(root, launcher.id(), process_group, identity, category);
+    let evidence_result = persist_fixture_failure_until(
+        root,
+        launcher.id(),
+        process_group,
+        identity,
+        category,
+        deadline,
+    );
     let identity_result = identity
-        .map(|identity| terminate_group(identity, Instant::now() + Duration::from_secs(2)))
+        .map(|identity| {
+            terminate_group_with_identity_fallback(
+                identity,
+                std::slice::from_ref(identity),
+                deadline,
+            )
+        })
         .unwrap_or(Ok(()));
     let reap_result = if identity.is_some() {
-        reap_child_bounded(
-            launcher,
-            process_group,
-            Instant::now() + Duration::from_secs(2),
-        )
+        reap_child_bounded(launcher, process_group, deadline)
     } else {
         // The direct Child remains unreaped, so its PID anchors this newly
         // created group even when identity inspection failed.  Kill the whole
         // group before bounded direct-child reap rather than leaking a helper.
-        reap_child_group_bounded(
-            launcher,
-            process_group,
-            Instant::now() + Duration::from_secs(2),
-        )
+        reap_child_group_bounded(launcher, process_group, deadline)
     };
     match (evidence_result, identity_result, reap_result) {
         (Ok(()), Ok(()), Ok(())) => Err(category),
@@ -349,21 +430,27 @@ fn finish_descendant_failure(
     root: &Path,
     launcher_pid: u32,
     identity: &ProcessIdentity,
+    launcher_identity: Option<&ProcessIdentity>,
     launcher_result: Result<(), &'static str>,
+    deadline: Instant,
     category: &'static str,
 ) -> Result<(), &'static str> {
-    let evidence_result =
-        persist_fixture_failure(root, launcher_pid, identity.pgid, Some(identity), category);
-    let identity_result = match terminate_group(identity, Instant::now() + Duration::from_secs(2)) {
-        Ok(()) => Ok(()),
-        Err(_error)
-            if pid_state(i32::try_from(identity.pid).unwrap_or(-1)) == ProcessState::Empty
-                && group_state(identity.pgid) == ProcessState::Empty =>
-        {
-            Ok(())
+    let evidence_result = persist_fixture_failure_until(
+        root,
+        launcher_pid,
+        identity.pgid,
+        Some(identity),
+        category,
+        deadline,
+    );
+    let mut peers = vec![identity.clone()];
+    if let Some(launcher_identity) = launcher_identity {
+        if launcher_identity.pgid != identity.pgid {
+            abort_fixture_group("marker-owner-mismatch");
         }
-        Err(error) => Err(error),
-    };
+        peers.push(launcher_identity.clone());
+    }
+    let identity_result = terminate_group_with_identity_fallback(identity, &peers, deadline);
     match (evidence_result, launcher_result, identity_result) {
         (Ok(()), Ok(()), Ok(())) => Err(category),
         (_, Err(error), _) | (_, _, Err(error)) => abort_fixture_group(error),
@@ -384,7 +471,9 @@ fn accept_launcher_identity(
             if identity.pid == launcher_pid
                 && identity.pid > 1
                 && identity.pgid == process_group
-                && identity.pgid > 1 =>
+                && identity.pgid > 1
+                && identity.pid != std::process::id()
+                && identity.uid == current_uid() =>
         {
             Ok(identity)
         }
@@ -396,32 +485,40 @@ fn accept_launcher_identity(
 const FIXTURE_FAILURE_EVIDENCE: &str = "ja-sandbox-fixture-failure.evidence";
 const FIXTURE_FAILURE_EVIDENCE_BYTES: usize = 4096;
 
-/// Persist the usable group/identity facts before any abort or cleanup error
-/// can erase the only explanation for an untrusted fixture launcher state.
-/// Values originating in process inspection are reduced to bounded ASCII so
-/// paths, locale text and injected lines cannot enter the evidence channel.
-fn persist_fixture_failure(
+/// Build and persist failure evidence under the same absolute deadline used
+/// by group cleanup; a late report must never erase the already durable
+/// process/group facts that explain why cleanup failed.
+fn persist_fixture_failure_until(
     root: &Path,
     launcher_pid: u32,
     process_group: i32,
     identity: Option<&ProcessIdentity>,
     category: &'static str,
+    deadline: Instant,
 ) -> Result<(), &'static str> {
+    if Instant::now() >= deadline {
+        return Err("fixture-failure-evidence");
+    }
     if launcher_pid <= 1
         || process_group <= 1
         || !is_fixture_failure_category(category)
         || identity.is_some_and(|identity| {
-            identity.pid <= 1 || identity.pgid <= 1 || identity.pgid != process_group
+            identity.pid <= 1
+                || identity.pgid <= 1
+                || identity.pgid != process_group
+                || identity.pid == std::process::id()
+                || identity.uid != current_uid()
         })
     {
         return Err("fixture-failure-evidence");
     }
-    let (identity_state, identity_pid, identity_pgid, identity_comm, identity_start) =
+    let (identity_state, identity_pid, identity_pgid, identity_uid, identity_comm, identity_start) =
         match identity {
             Some(identity) => (
                 "known",
                 identity.pid.to_string(),
                 identity.pgid.to_string(),
+                identity.uid.to_string(),
                 evidence_value(&identity.comm),
                 evidence_value(&identity.start_identity),
             ),
@@ -429,38 +526,50 @@ fn persist_fixture_failure(
                 "unavailable",
                 "unknown".to_owned(),
                 "unknown".to_owned(),
+                "unknown".to_owned(),
                 "redacted".to_owned(),
                 "redacted".to_owned(),
             ),
         };
     let contents = format!(
-        "fixture-failure-version=1\ncategory={category}\nlauncher-pid={launcher_pid}\nprocess-group={process_group}\nidentity-state={identity_state}\nidentity-pid={identity_pid}\nidentity-pgid={identity_pgid}\nidentity-comm={identity_comm}\nidentity-start={identity_start}\n"
+        "fixture-failure-version=1\ncategory={category}\nlauncher-pid={launcher_pid}\nprocess-group={process_group}\nidentity-state={identity_state}\nidentity-pid={identity_pid}\nidentity-pgid={identity_pgid}\nidentity-uid={identity_uid}\nidentity-comm={identity_comm}\nidentity-start={identity_start}\n"
     );
     if contents.len() > FIXTURE_FAILURE_EVIDENCE_BYTES || !contents.is_ascii() {
         return Err("fixture-failure-evidence");
     }
-    write_fixture_failure_evidence(root, &contents)
+    write_fixture_failure_evidence_until(root, &contents, deadline)
 }
 
-/// Keep the invalid-PID conversion branch diagnosable even though no safe
-/// numeric PGID exists; the evidence records that limitation explicitly.
-fn persist_fixture_failure_without_group(
+/// Preserve the no-group branch's bounded evidence semantics without
+/// inventing an unsafe process-group identifier for the recovery path.
+fn persist_fixture_failure_without_group_until(
     root: &Path,
     launcher_pid: u32,
     category: &'static str,
+    deadline: Instant,
 ) -> Result<(), &'static str> {
+    if Instant::now() >= deadline {
+        return Err("fixture-failure-evidence");
+    }
     if launcher_pid <= 1 || !is_fixture_failure_category(category) {
         return Err("fixture-failure-evidence");
     }
     let contents = format!(
         "fixture-failure-version=1\ncategory={category}\nlauncher-pid={launcher_pid}\nprocess-group=unavailable\nidentity-state=unavailable\nidentity-pid=unknown\nidentity-pgid=unknown\nidentity-comm=redacted\nidentity-start=redacted\n"
     );
-    write_fixture_failure_evidence(root, &contents)
+    write_fixture_failure_evidence_until(root, &contents, deadline)
 }
 
-/// Publish one owner-only failure record with no-follow/create-new semantics;
-/// the parent directory sync makes the evidence durable before abort.
-fn write_fixture_failure_evidence(root: &Path, contents: &str) -> Result<(), &'static str> {
+/// Write owner-only evidence with checks around every filesystem operation;
+/// no deadline failure removes or truncates an earlier primary/fallback file.
+fn write_fixture_failure_evidence_until(
+    root: &Path,
+    contents: &str,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    if Instant::now() >= deadline {
+        return Err("fixture-failure-evidence");
+    }
     if contents.len() > FIXTURE_FAILURE_EVIDENCE_BYTES || !contents.is_ascii() {
         return Err("fixture-failure-evidence");
     }
@@ -472,7 +581,13 @@ fn write_fixture_failure_evidence(root: &Path, contents: &str) -> Result<(), &'s
         .custom_flags(O_NOFOLLOW_FLAG | O_CLOEXEC_FLAG)
         .open(&path)
         .map_err(|_| "fixture-failure-evidence")?;
+    if Instant::now() >= deadline {
+        return Err("fixture-failure-evidence");
+    }
     let metadata = file.metadata().map_err(|_| "fixture-failure-evidence")?;
+    if Instant::now() >= deadline {
+        return Err("fixture-failure-evidence");
+    }
     if !metadata.file_type().is_file()
         || metadata.uid() != current_uid()
         || metadata.nlink() != 1
@@ -480,12 +595,25 @@ fn write_fixture_failure_evidence(root: &Path, contents: &str) -> Result<(), &'s
     {
         return Err("fixture-failure-evidence");
     }
+    if Instant::now() >= deadline {
+        return Err("fixture-failure-evidence");
+    }
     file.write_all(contents.as_bytes())
         .map_err(|_| "fixture-failure-evidence")?;
+    if Instant::now() >= deadline {
+        return Err("fixture-failure-evidence");
+    }
     file.sync_all().map_err(|_| "fixture-failure-evidence")?;
+    if Instant::now() >= deadline {
+        return Err("fixture-failure-evidence");
+    }
     File::open(root)
         .and_then(|directory| directory.sync_all())
-        .map_err(|_| "fixture-failure-evidence")
+        .map_err(|_| "fixture-failure-evidence")?;
+    if Instant::now() >= deadline {
+        return Err("fixture-failure-evidence");
+    }
+    Ok(())
 }
 
 /// Keep process-derived evidence fields line-safe and bounded; an invalid
@@ -562,7 +690,10 @@ const CLEANUP_REPORT_CATEGORIES: [&str; 15] = [
 /// Convert a production cleanup report only after validating its complete,
 /// bounded ASCII grammar.  Every category/count is unique and the count is
 /// final, so a partial prefix can never hide an injected or conflicting line.
-fn fixture_cleanup_failure_category(report: &Path) -> &'static str {
+fn fixture_cleanup_failure_category_until(report: &Path, deadline: Instant) -> &'static str {
+    if Instant::now() >= deadline {
+        return "fixture-descendant-cleanup-report";
+    }
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW_FLAG | O_CLOEXEC_FLAG)
@@ -571,6 +702,9 @@ fn fixture_cleanup_failure_category(report: &Path) -> &'static str {
         Ok(file) => file,
         Err(_) => return "fixture-descendant-cleanup-report",
     };
+    if Instant::now() >= deadline {
+        return "fixture-descendant-cleanup-report";
+    }
     let mut contents = Vec::new();
     let bytes = match file
         .take((CLEANUP_REPORT_MAX_BYTES + 1) as u64)
@@ -579,6 +713,9 @@ fn fixture_cleanup_failure_category(report: &Path) -> &'static str {
         Ok(bytes) => bytes,
         Err(_) => return "fixture-descendant-cleanup-report",
     };
+    if Instant::now() >= deadline {
+        return "fixture-descendant-cleanup-report";
+    }
     if bytes > CLEANUP_REPORT_MAX_BYTES
         || contents.is_empty()
         || !contents.is_ascii()
@@ -660,6 +797,13 @@ fn fixture_cleanup_failure_category(report: &Path) -> &'static str {
         // defensive if the fixed vocabulary grows without a mapping.
         "fixture-descendant-cleanup-unknown"
     }
+}
+
+/// Keep parser unit tests concise while production passes its existing shared
+/// fixture deadline through report classification.
+#[cfg(test)]
+fn fixture_cleanup_failure_category(report: &Path) -> &'static str {
+    fixture_cleanup_failure_category_until(report, Instant::now() + Duration::from_secs(2))
 }
 
 /// Convert every group cleanup failure to a stable, path-free fail-closed
@@ -768,10 +912,11 @@ fn remove_fixture_root(root: PathBuf) -> Result<(), &'static str> {
 mod tests {
     use super::{
         ProcessIdentity, accept_launcher_identity, finish_fixture_failure_with,
-        fixture_cleanup_failure_category, fixture_group_failure_reason, persist_fixture_failure,
+        fixture_cleanup_failure_category, fixture_group_failure_reason,
+        persist_fixture_failure_until,
     };
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     /// Exercise every early launcher category through the shared finalizer
     /// adapter, ensuring a failure can never bypass group cleanup ordering.
@@ -934,6 +1079,7 @@ mod tests {
         let valid = ProcessIdentity {
             pid: 42,
             pgid: 43,
+            uid: super::current_uid(),
             comm: "sh".to_owned(),
             start_identity: "Mon Jan 1 00:00:00 2026".to_owned(),
         };
@@ -971,8 +1117,15 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir(&root).expect("failure root");
-        persist_fixture_failure(&root, 42, 43, None, "fixture-helper-query")
-            .expect("failure evidence");
+        persist_fixture_failure_until(
+            &root,
+            42,
+            43,
+            None,
+            "fixture-helper-query",
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("failure evidence");
         let contents = fs::read_to_string(root.join(super::FIXTURE_FAILURE_EVIDENCE))
             .expect("failure evidence contents");
         assert!(contents.contains("category=fixture-helper-query\n"));

@@ -435,6 +435,9 @@ fn run_overflow_case(
     let report = workspace.join("overflow.report");
     let child_report = workspace.join("overflow-child.report");
     let release = workspace.join("overflow.release");
+    // Start the descendant before waiting on output and exercise the worker's
+    // production 64 KiB collector cap; a test-only lower limit would not prove
+    // the actual host overflow contract.
     let mut child = child_for(
         root,
         workspace,
@@ -447,6 +450,7 @@ fn run_overflow_case(
         false,
         scope,
     )?;
+    wait_for_file(&child_report, Duration::from_secs(2))?;
     let result = child.wait_with_output(Duration::from_secs(5));
     if !matches!(result, Err(SandboxError::OutputOverflow)) {
         return Err("output overflow did not fail closed".into());

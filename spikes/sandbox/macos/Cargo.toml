@@ -10,6 +10,9 @@ license = "GPL-3.0-or-later"
 publish = false
 description = "macOS Seatbelt and process-group sandbox probe for JA tool workers"
 
+[dependencies]
+libc = "=0.2.189"
+
 [lib]
 name = "ja_macos_sandbox_spike"
 path = "src/lib.rs"

@@ -57,13 +57,47 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   外部存储的更强保证。workflow 以 20 秒短窗口校验文件名、全部身份字段和 stat 属性，
   并调用与探针相同的 `marker_cleanup` Rust 实现；它从内核 errno 严格区分 `ESRCH`
   （已消失）与 `EPERM`（权限异常），绝不把任意非零结果当作清理成功。只清理 exact
-  group/direct PID，且只有 direct reap 与 group `ESRCH` 同时成立才删除三份 evidence。
-  marker cleanup 的每个身份查询 stdout/stderr 共享 1 秒绝对 deadline，各自 4 KiB 上限；
+  group/direct PID，且只有 direct reap 与 group `ESRCH` 同时成立才把 active marker
+  转入 cleaned/recovery 状态；预存在的恢复 evidence 仍由同一有界 GC 负责。
+  marker cleanup 会先打开并校验 owner-private root directory，再通过持有的
+  Darwin `fdopendir/readdir` 扫描和 `openat` 重新打开 marker，删除则使用同一个
+  dirfd 的 `renameat/unlinkat`；因此授权扫描、marker open 与删除不会各自解析一份
+  可替换的 root pathname。active marker 会先在该目录内原子改名为
+  `.ja-sandbox-cleaned.*`，并在同一目录内写入 `.ja-sandbox-recovery.*` 原始镜像后
+  fsync；同一轮保持完整 backup 直到 recovery 的最终 unlink 与目录 fsync 都成功，
+  然后才删除 backup，所以成功的 active cleanup 不留下 cleaned/recovery evidence。
+  任一最终 unlink 后的
+  fstat、root revalidate、directory sync 或 deadline 失败，都会用持有的完整 image
+  通过 O_EXCL 恢复原 recovery 名称或可识别的 cleaned 别名；两者都无法恢复时固定
+  fail-closed abort，不能把证据丢失当成普通成功。恢复候选在另一份完整 image
+  已通过 regular-file/0600/uid/nlink、rootfd identity 和 parent-directory sync 前
+  不会被删除；两份候选都失败时保留现有最可信 inode 并 abort。下一轮 cleanup 仍能
+  识别恢复出的有限状态证据。若首候选短写或候选 unlink/postcheck 失败，扫描会把
+  它标记为受控 basename 下的 damaged sibling；只有重新打开、完整重解析并同步
+  有效 sibling 后，才允许 fd-relative 隔离该 inode。无有效配对证明的
+  `marker-stat-invalid` 永远保留并使 gate 失败，不会被“清理”吞掉。workflow 最终要求 unresolved evidence 为零，扫描和
+  pending 数量仍受 64 项上限约束。不会把 active marker 清零却丢掉唯一可恢复证据。
+  `.marker.pending`、`.fallback.pending` 和 `.emergency.pending` 使用独立的有限状态机：
+  先在 rootfd 下发布并同步 `.ja-sandbox-recovery.<pending>` 或
+  `.ja-sandbox-cleaned.<pending>`，再删除原 pending，最后删除保留副本。任何写入、
+  unlink、postcheck、root revalidate 或目录 fsync 失败都会通过同一 rootfd 事务把
+  最后一份完整 image 重新以 O_EXCL 发布，留下这两个固定 grammar 可识别的状态；不会
+  把嵌套 pending 名称送入 active marker 的 `recovery_backup_names`，也不会放宽 active
+  basename grammar。只有最后一次删除及其 root/目录 durable postcondition 全部成功时才
+  返回零 unresolved；正常完成同轮删除所有 pending alias，重启扫描可继续收口。
+  每次 cleanup 从扫描前创建一个 monotonic 20 秒 deadline，并贯穿 root metadata、目录
+  entry、每个身份查询 stdout/stderr、signal/wait、marker unlink、目录 sync 和最终
+  report；不为每个 marker 或 fixture cleanup phase 重启窗口。身份查询 stdout/stderr
+  共享 1 秒绝对 deadline，各自 4 KiB 上限；
   query helper 的 `Child` 所有权在 direct reap 被确认前不会释放，try_wait 错误或
   bounded reap 失败会继续 kill/reap，仍无法证明时显式 fail-closed abort。fixture
   launcher 的 pipe、输出、PID 解析和后续 `?` 传播也统一经过同一个有界 Child
   finalizer；二次 reap 仍失败时固定输出安全类别并 abort，不让 live Child 进入 Drop。
-  fixture 的 descendant group 在每个早期失败返回前再执行两次有界 SIGKILL/ESRCH
+  所有 native fixture 从 `run_fixture` 入口创建同一个 8 秒 monotonic budget；forged、
+  pending、residual、descendant 的 pipe 读取、身份查询、failure evidence、生产 cleanup、
+  launcher reap 与错误 finalizer 全部共享它；临近 deadline 时不再删除 marker/evidence，最终 report 也可能来不及
+  写入，但已有 primary/fallback/emergency 或 fixture failure evidence 会保留供恢复。
+  fixture 的 descendant group 在每个早期失败返回前再执行有界 SIGKILL/ESRCH
   收口；launcher 身份查询失败时仍以未释放的 Child 句柄锚定新建 PGID，先持久化
   脱敏的 group/identity/failure evidence，再执行整组有界回收；residual、EPERM 或
   其他 probe 错误固定映射为 abort 类别，不能依赖尚未创建的 marker 或 workflow glob
@@ -77,8 +111,18 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   读取错误会清空已收集的 signal target 并报告固定 `marker-entry-invalid`，不会静默
   忽略不完整扫描。group cleanup 最长 20 秒，workflow 外层还设置 2 分钟 timeout，不能
   把 timeout 当作已确认的 reap 或 `ESRCH`。
-  当前 `EPERM` fixture 验证的是 errno 分类和 fail-closed 语义，不声称已构造真实
-  signal 权限拒绝场景；真实权限行为仍由原生 runner 观察。
+  一次 marker cleanup 共享一个 monotonic 20 秒 deadline，并在扫描阶段限制最多 128 个
+  directory entries，最终最多处理 64 个 active marker、每组 32 个 PID、64 个 pending
+  marker；不会为每个 marker 重新开启 20 秒窗口。
+  marker 去重键包含 owner/nonce、PID/PGID、suffix 和打开时的 inode identity，避免不同
+  后缀或替换 inode 被误跳过。每次 signal 前还校验 PID/PGID、start identity、comm 和
+  当前 UID；保留值、当前 supervisor PID/PGID 以及其他 UID 一律 fail-closed，root
+  也不能向其他 UID 发 signal。
+  marker-cleanup descendant fixture 在原生 macOS runner 上保留真实 launcher/descendant
+  peer 全集；若 group signal 返回 `EPERM`，生产 fallback 会逐个重新校验 UID、PID、
+  PGID、comm 和 start identity 后 direct-signal，并要求每个 peer 与最终 PGID 都报告
+  `ESRCH`，随后才删除全部 marker。runner 未产生 `EPERM` 时，仍由 errno fault table
+  保持 fail-closed 回归，不把成功 group signal 冒充 fallback 覆盖。
   marker 激活失败会保留可用的 fallback/emergency evidence，并让 job 失败；
   若所有安全文件通道均不可用，probe 仍先在进程内 bounded cleanup，无法确认时显式
   abort，外层不得声称已完成精确清理。残留、无效或 owner 不匹配证据也使 job 失败。
@@ -196,11 +240,15 @@ cleanup 和 process-table residual gate 使用 `always()` 继续执行，最终�
 - 同一普通用户在 profile/path preflight 之后主动竞态创建 symlink/hardlink 的攻击
   不被这个 spike 完整覆盖；正式写回必须携带 expected hash/revision，写前再次校验
   inode、mode、xattr 和内容，并由固定签名 worker resource 执行。
-- marker/scope 的实现只在打开 descriptor 后以 `fstat`，并在 unlink 前立即以
-  `fstat`+`lstat` 比较 `st_dev/st_ino/nlink/mode/uid`，随后同步父目录；这不是对同一
+- marker cleanup 会持有已校验的私有 root directory descriptor，以 `unlinkat` 锚定目录，
+  并在 unlink 前立即以 `fstat`+`lstat` 比较 `st_dev/st_ino/nlink/mode/uid`，随后同步父目录；
+  这不是对同一
   UID 外部进程纳秒级 path swap 的完整防护，也不使用危险的无条件 `unlink` hack。其
   管理父目录必须保持应用私有 `0700`，Seatbelt child 无权访问；若部署改变这一权限或
-  profile allowlist，必须重新审计，而不能把 descriptor 检查描述为同 UID 隔离。
+  profile allowlist，必须重新审计，而不能把 descriptor 检查描述为同 UID 隔离。macOS
+  没有 pidfd 式的 query→signal 原子承诺，因此同一 UID 恶意宿主在最后身份复核后仍
+  可能制造理论 PID 复用；这里仅以 UID、start identity、comm、PGID、signal 前复核、
+  unknown peer fail-closed、数量上限和统一 deadline 缓解，不能宣称绝对防护。
 - Seatbelt 不是 kernel/VBS 级恶意代码隔离，也不替代签名、公证、依赖供应链审计、
   Tauri capability 或 Java provider Secret 隔离。Java core 仍不应整体放进 workspace
   sandbox，只有 Java-owned Tool Worker 进入该边界。

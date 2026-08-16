@@ -799,6 +799,14 @@ mod tests {
                 Err(SandboxError::InvalidConfig("reserved process group"))
             ));
         }
+        assert!(matches!(
+            process_is_alive(std::process::id() as i32),
+            Err(SandboxError::InvalidConfig("reserved process id"))
+        ));
+        assert!(matches!(
+            process_group_is_gone(unsafe { super::getpgrp() }),
+            Err(SandboxError::InvalidConfig("reserved process group"))
+        ));
     }
 }
 
@@ -860,7 +868,7 @@ fn literal(path: &Path) -> Result<String, SandboxError> {
 /// Query a PID without process-name matching; the probe uses this to prove
 /// that a reported grandchild really left the system after group cleanup.
 pub fn process_is_alive(pid: i32) -> Result<bool, SandboxError> {
-    if pid <= 1 {
+    if pid <= 1 || u32::try_from(pid).ok() == Some(std::process::id()) {
         return Err(SandboxError::InvalidConfig("reserved process id"));
     }
     let result = unsafe { kill(pid, 0) };
@@ -872,7 +880,7 @@ pub fn process_is_alive(pid: i32) -> Result<bool, SandboxError> {
 /// Distinguish an absent group from an inaccessible group; EPERM is never
 /// treated as proof that a child group was cleaned up.
 pub fn process_group_is_gone(process_group: i32) -> Result<bool, SandboxError> {
-    if process_group <= 1 {
+    if process_group <= 1 || process_group == unsafe { getpgrp() } {
         return Err(SandboxError::InvalidConfig("reserved process group"));
     }
     if unsafe { kill(-process_group, 0) } == 0 {
@@ -887,4 +895,5 @@ unsafe extern "C" {
     fn fcntl(fd: i32, command: i32, ...) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
     fn __error() -> *mut i32;
+    fn getpgrp() -> i32;
 }

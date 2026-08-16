@@ -422,15 +422,17 @@ fn escape_evidence_contents(
     {
         return Err("escape evidence identity invalid".into());
     }
-    let (pid, pgid, start_identity, comm) = match identity {
+    let (pid, pgid, uid, start_identity, comm) = match identity {
         Some(identity) if identity.pid > 1 && identity.pgid > 1 => (
             identity.pid.to_string(),
             identity.pgid.to_string(),
+            identity.uid.to_string(),
             identity.start_identity.clone(),
             identity.comm.clone(),
         ),
         Some(_) => return Err("escape descendant identity reserved".into()),
         None => (
+            "unknown".into(),
             "unknown".into(),
             "unknown".into(),
             "unknown".into(),
@@ -441,6 +443,7 @@ fn escape_evidence_contents(
         let checked = ControlledProcessIdentity {
             pid: pid.parse().map_err(|_| "escape pid invalid")?,
             pgid: pgid.parse().map_err(|_| "escape pgid invalid")?,
+            uid: uid.parse().map_err(|_| "escape uid invalid")?,
             start_identity,
             comm,
         };
@@ -452,7 +455,7 @@ fn escape_evidence_contents(
             return Err("escape failure category invalid".into());
         }
         return Ok(format!(
-            "escape-version=1\noperation_id={operation_id}\nparent_pid={parent_pid}\nparent_pgid={parent_pgid}\nnonce={nonce}\nstate={state}\ndescendant_pid={pid}\ndescendant_pgid={pgid}\ndescendant_start_identity={}\ndescendant_comm={}\nfailure={failure}\n",
+            "escape-version=1\noperation_id={operation_id}\nparent_pid={parent_pid}\nparent_pgid={parent_pgid}\nnonce={nonce}\nstate={state}\ndescendant_pid={pid}\ndescendant_pgid={pgid}\ndescendant_uid={uid}\ndescendant_start_identity={}\ndescendant_comm={}\nfailure={failure}\n",
             checked.start_identity, checked.comm
         ));
     }
@@ -461,7 +464,7 @@ fn escape_evidence_contents(
         return Err("escape failure category invalid".into());
     }
     Ok(format!(
-        "escape-version=1\noperation_id={operation_id}\nparent_pid={parent_pid}\nparent_pgid={parent_pgid}\nnonce={nonce}\nstate={state}\ndescendant_pid=unknown\ndescendant_pgid=unknown\ndescendant_start_identity=unknown\ndescendant_comm=unknown\nfailure={failure}\n"
+        "escape-version=1\noperation_id={operation_id}\nparent_pid={parent_pid}\nparent_pgid={parent_pgid}\nnonce={nonce}\nstate={state}\ndescendant_pid=unknown\ndescendant_pgid=unknown\ndescendant_uid=unknown\ndescendant_start_identity=unknown\ndescendant_comm=unknown\nfailure={failure}\n"
     ))
 }
 
@@ -838,7 +841,13 @@ fn remove_scope_path_if_identity(path: &Path, expected: ScopeFileIdentity) -> Re
 /// Keep process identities field-safe so scope parsing rejects delimiters,
 /// newlines and Unicode look-alikes before they reach the evidence file.
 fn valid_scope_identity(identity: &ControlledProcessIdentity) -> bool {
-    valid_scope_start(&identity.start_identity) && valid_scope_atom(&identity.comm)
+    identity.pid > 1
+        && identity.pgid > 1
+        && identity.pid != std::process::id()
+        && identity.pgid != unsafe { getpgrp() }
+        && identity.uid == unsafe { geteuid() }
+        && valid_scope_start(&identity.start_identity)
+        && valid_scope_atom(&identity.comm)
 }
 
 /// Accept only the printable ASCII `lstart` grammar so delimiter injection or
@@ -1711,6 +1720,7 @@ mod scope_lifecycle_tests {
         let valid = ControlledProcessIdentity {
             pid: 42,
             pgid: 42,
+            uid: unsafe { geteuid() },
             start_identity: "Mon Jan 1 00:00:00 2026".into(),
             comm: "ja-sandbox-worker".into(),
         };
@@ -1762,6 +1772,7 @@ mod scope_lifecycle_tests {
         let identity = ControlledProcessIdentity {
             pid: 44,
             pgid: 45,
+            uid: unsafe { geteuid() },
             comm: "ja-sandbox-worker".into(),
             start_identity: "Mon Jan 1 00:00:00 2026".into(),
         };

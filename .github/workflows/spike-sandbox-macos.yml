@@ -87,6 +87,7 @@ jobs:
             spikes/sandbox/macos/src/macos.rs \
             spikes/sandbox/macos/src/process.rs \
             spikes/sandbox/macos/src/marker_cleanup/mod.rs \
+            spikes/sandbox/macos/src/marker_cleanup/fd.rs \
             spikes/sandbox/macos/src/marker_cleanup/marker.rs \
             spikes/sandbox/macos/src/marker_cleanup/process.rs \
             spikes/sandbox/macos/src/marker_cleanup/process_scan.rs \
@@ -227,6 +228,11 @@ jobs:
           residual_markers=("$private_root"/ja-sandbox-log-helper-*.marker "$private_root"/ja-sandbox-log-helper-*.fallback "$private_root"/ja-sandbox-log-helper-*.emergency "$private_root"/.ja-sandbox-log-helper-*.marker.pending "$private_root"/.ja-sandbox-log-helper-*.fallback.pending "$private_root"/.ja-sandbox-log-helper-*.emergency.pending)
           if (( ${#residual_markers[@]} > 0 )); then
             echo "JA sandbox marker residue detected" >&2
+            exit 1
+          fi
+          cleaned_evidence=("$private_root"/.ja-sandbox-cleaned.* "$private_root"/.ja-sandbox-recovery.*)
+          if (( ${#cleaned_evidence[@]} > 0 )); then
+            echo "JA sandbox unresolved cleaned/recovery marker evidence remained after production cleanup" >&2
             exit 1
           fi
 
