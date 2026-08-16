@@ -97,6 +97,97 @@ class HandshakeProtocolTest {
         assertCode(JaErrorCode.HANDSHAKE_FAILED, () -> new HandshakeJsonlCodec(history).encode(oldValue, LIMITS));
     }
 
+    /**
+     * Verifies only the client initialize request can cross the NEW-state
+     * admission boundary through both production JSONL entry points.
+     */
+    @Test
+    void admitsClientInitializeRequestBeforeReadyThroughDecodeAndReadFrame() throws Exception {
+        byte[] frame = appendLf(jsonBytes(RpcRequest.client("c:initialize", "initialize",
+                JsonNodes.object().put("protocolMajor", 1)).toJson()));
+
+        HandshakeStateMachine decodeState = new HandshakeStateMachine(
+                new ServerInstanceId("srv_initialize_decode"));
+        RpcRequest decoded = assertInstanceOf(RpcRequest.class,
+                new HandshakeJsonlCodec(decodeState).decode(frame, RpcDirection.CLIENT_TO_SERVER, LIMITS));
+        assertEquals("initialize", decoded.method());
+        assertEquals(HandshakeStateMachine.State.NEW, decodeState.state());
+
+        HandshakeStateMachine readState = new HandshakeStateMachine(
+                new ServerInstanceId("srv_initialize_read"));
+        RpcRequest read = assertInstanceOf(RpcRequest.class,
+                new HandshakeJsonlCodec(readState).readFrame(
+                        new ByteArrayInputStream(frame), RpcDirection.CLIENT_TO_SERVER, LIMITS)
+                        .orElseThrow());
+        assertEquals("initialize", read.method());
+        assertEquals(HandshakeStateMachine.State.NEW, readState.state());
+    }
+
+    /**
+     * Verifies the NEW exception is limited to one request shape and that
+     * invalid frames cannot use it to bypass raw or envelope validation.
+     */
+    @Test
+    void preReadyAdmissionRejectsOtherDirectionsKindsAndMalformedInitialize() throws Exception {
+        assertCode(JaErrorCode.NOT_INITIALIZED, () -> decodeNew(
+                new RpcNotification("initialize", JsonNodes.object(), RpcDirection.CLIENT_TO_SERVER),
+                RpcDirection.CLIENT_TO_SERVER));
+        assertCode(JaErrorCode.NOT_INITIALIZED, () -> decodeNew(
+                RpcRequest.server("s:initialize", "initialize", JsonNodes.object()),
+                RpcDirection.SERVER_TO_CLIENT));
+        assertCode(JaErrorCode.NOT_INITIALIZED, () -> decodeNew(
+                RpcResponse.success("s:initialize-response", JsonNodes.object()),
+                RpcDirection.CLIENT_TO_SERVER));
+        assertCode(JaErrorCode.NOT_INITIALIZED, () -> decodeNew(
+                RpcRequest.client("c:version", "version", JsonNodes.object()),
+                RpcDirection.CLIENT_TO_SERVER));
+        assertCode(JaErrorCode.NOT_INITIALIZED, () -> decodeNew(
+                RpcRequest.client("c:shutdown", "shutdown", JsonNodes.object()),
+                RpcDirection.CLIENT_TO_SERVER));
+        assertCode(JaErrorCode.NOT_INITIALIZED, () -> decodeNew(
+                RpcRequest.client("c:approx", "initialize/extra", JsonNodes.object()),
+                RpcDirection.CLIENT_TO_SERVER));
+
+        HandshakeStateMachine initializedState = new HandshakeStateMachine(
+                new ServerInstanceId("srv_initialize_not_ready"));
+        initializedState.acceptInitialized(initialized(TOKEN));
+        byte[] initializeFrame = appendLf(jsonBytes(RpcRequest.client("c:after-challenge", "initialize",
+                JsonNodes.object()).toJson()));
+        assertCode(JaErrorCode.NOT_INITIALIZED, () -> new HandshakeJsonlCodec(initializedState).decode(
+                initializeFrame, RpcDirection.CLIENT_TO_SERVER, LIMITS));
+
+        String tokenBypass = "{\"jsonrpc\":\"2.0\",\"id\":\"c:token-bypass\","
+                + "\"method\":\"initialize\",\"params\":{\"readyToken\":\""
+                + TOKEN + "\"}}\n";
+        HandshakeStateMachine malformedState = new HandshakeStateMachine(
+                new ServerInstanceId("srv_initialize_token_bypass"));
+        assertCode(JaErrorCode.HANDSHAKE_FAILED, () -> new HandshakeJsonlCodec(malformedState).decode(
+                tokenBypass.getBytes(StandardCharsets.UTF_8), RpcDirection.CLIENT_TO_SERVER, LIMITS));
+        assertEquals(HandshakeStateMachine.State.FAILED, malformedState.state());
+
+        String invalidParams = "{\"jsonrpc\":\"2.0\",\"id\":\"c:invalid-params\","
+                + "\"method\":\"initialize\",\"params\":null}\n";
+        assertCode(JaErrorCode.INVALID_FRAME, () -> new HandshakeJsonlCodec(
+                new HandshakeStateMachine(new ServerInstanceId("srv_initialize_invalid_params"))).decode(
+                invalidParams.getBytes(StandardCharsets.UTF_8), RpcDirection.CLIENT_TO_SERVER, LIMITS));
+    }
+
+    /**
+     * Verifies a ready connection forwards duplicate initialize to the
+     * application layer, where ALREADY_INITIALIZED remains a use-case result.
+     */
+    @Test
+    void readyConnectionDoesNotFabricateDuplicateInitializeError() throws Exception {
+        HandshakeStateMachine state = readyState("srv_initialize_duplicate");
+        RpcRequest request = assertInstanceOf(RpcRequest.class,
+                new HandshakeJsonlCodec(state).decode(
+                        appendLf(jsonBytes(RpcRequest.client("c:duplicate-initialize", "initialize",
+                                JsonNodes.object()).toJson())),
+                        RpcDirection.CLIENT_TO_SERVER, LIMITS));
+        assertEquals("initialize", request.method());
+        assertEquals(HandshakeStateMachine.State.READY, state.state());
+    }
+
     /** Verifies arbitrary nested result data and readyToken keys cannot cross the guarded writer. */
     @Test
     void wholeFrameRedactionRejectsNestedTokenKeysAndValues() {
@@ -274,6 +365,15 @@ class HandshakeProtocolTest {
     private static RpcNotification initialized(String token) {
         return new RpcNotification("initialized", JsonNodes.object().put("readyToken", token),
                 RpcDirection.CLIENT_TO_SERVER);
+    }
+
+    /** Decodes a fresh NEW-state frame so one negative admission cannot affect another. */
+    private static RpcEnvelope decodeNew(RpcEnvelope envelope, RpcDirection direction) {
+        HandshakeStateMachine state = new HandshakeStateMachine(
+                new ServerInstanceId("srv_initialize_negative_" + direction + "_"
+                        + envelope.getClass().getSimpleName()));
+        return new HandshakeJsonlCodec(state).decode(
+                appendLf(jsonBytes(envelope.toJson())), direction, LIMITS);
     }
 
     /** Creates a ready state for one independent production codec assertion. */

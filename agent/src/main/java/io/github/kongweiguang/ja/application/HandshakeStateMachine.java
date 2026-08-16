@@ -15,6 +15,7 @@ import io.github.kongweiguang.ja.protocol.ReadyToken;
 import io.github.kongweiguang.ja.protocol.RpcDirection;
 import io.github.kongweiguang.ja.protocol.RpcEnvelope;
 import io.github.kongweiguang.ja.protocol.RpcNotification;
+import io.github.kongweiguang.ja.protocol.RpcRequest;
 import io.github.kongweiguang.ja.protocol.RuntimeStatus;
 import io.github.kongweiguang.ja.protocol.RuntimeStatusChangedParams;
 import io.github.kongweiguang.ja.protocol.UnicodeChecks;
@@ -160,6 +161,9 @@ public final class HandshakeStateMachine {
                 acceptInitialized(notification);
                 return notification;
             }
+            if (isPreReadyInitialize(envelope)) {
+                return envelope;
+            }
             if (envelope instanceof RpcNotification notification
                     && "runtime/statusChanged".equals(notification.method())) {
                 RuntimeStatusChangedParams status = RuntimeStatusChangedParams.fromJson(notification.params());
@@ -181,6 +185,19 @@ public final class HandshakeStateMachine {
             }
             throw exception;
         }
+    }
+
+    /**
+     * Admits only the client's application initialize request before ready.
+     * The transport state machine deliberately does not transition here:
+     * InitializeUseCase owns compatibility and duplicate-initialize semantics,
+     * while this guard only protects the challenge/ready boundary.
+     */
+    private boolean isPreReadyInitialize(RpcEnvelope envelope) {
+        return state == State.NEW
+                && envelope instanceof RpcRequest request
+                && request.direction() == RpcDirection.CLIENT_TO_SERVER
+                && "initialize".equals(request.method());
     }
 
     /**
