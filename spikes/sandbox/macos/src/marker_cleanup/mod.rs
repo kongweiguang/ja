@@ -204,11 +204,20 @@ fn cleanup_diagnostic_code(code: &str) -> &'static str {
 }
 
 /// Keep marker-removal diagnostics narrower than the general fixture vocabulary;
-/// a malformed or path-bearing substep is dropped before it reaches any hook.
+/// phase-specific names distinguish equivalent safety checks without exposing
+/// a path, identity, or platform error to the fixture observer.
 fn marker_remove_diagnostic_code(code: &str) -> Option<&'static str> {
     match code {
         "open-parent" => Some("open-parent"),
+        "marker-name" => Some("marker-name"),
         "revalidate" => Some("revalidate"),
+        "entry-identity" => Some("entry-identity"),
+        "evidence-identity" => Some("evidence-identity"),
+        "last-copy-identity" => Some("last-copy-identity"),
+        "tombstone-name" => Some("tombstone-name"),
+        "tombstone-identity" => Some("tombstone-identity"),
+        "postcheck-identity" => Some("postcheck-identity"),
+        "recovery-name" => Some("recovery-name"),
         "rename" => Some("rename"),
         "dir-sync" => Some("dir-sync"),
         "evidence-open" => Some("evidence-open"),
@@ -218,6 +227,9 @@ fn marker_remove_diagnostic_code(code: &str) -> Option<&'static str> {
         "unlink" => Some("unlink"),
         "postcheck" => Some("postcheck"),
         "evidence-close" => Some("evidence-close"),
+        "last-copy" => Some("last-copy"),
+        "close-evidence" => Some("close-evidence"),
+        "close-transaction" => Some("close-transaction"),
         "deadline" => Some("deadline"),
         _ => None,
     }
@@ -880,11 +892,10 @@ fn remove_identity_markers_with_diagnostics(
         let name = match marker_name(&record.path) {
             Ok(name) => name,
             Err(()) => {
-                // Marker-name validation is the first operation that can
-                // reject a snapshot before the fd-relative opener runs; use
-                // the fixed opener category so the fixture never falls back
-                // to a generic marker-remove failure line.
-                emit_marker_remove_stage(diagnostic, "open-parent");
+                // Marker-name validation is distinct from parent opening: a
+                // malformed basename must remain visible without exposing the
+                // rejected path or collapsing into a generic close failure.
+                emit_marker_remove_stage(diagnostic, "marker-name");
                 categories.insert("marker-remove-failed");
                 result = Err(());
                 continue;
@@ -915,7 +926,10 @@ fn remove_identity_markers_with_diagnostics(
         )
         .is_err()
         {
-            emit_marker_remove_stage(diagnostic, "evidence-close");
+            // The inner transaction already emitted its exact failing phase;
+            // this wrapper code records only that the active entry could not
+            // complete its final close, without hiding that phase.
+            emit_marker_remove_stage(diagnostic, "close-transaction");
             categories.insert("marker-remove-failed");
             result = Err(());
         }
@@ -1735,7 +1749,7 @@ fn unlink_cleaned_evidence_with_diagnostics(
     let name = match marker_name(path) {
         Ok(name) => name,
         Err(()) => {
-            emit_marker_remove_stage(diagnostic, "open-parent");
+            emit_marker_remove_stage(diagnostic, "marker-name");
             return Err(());
         }
     };
@@ -1756,7 +1770,7 @@ fn unlink_cleaned_evidence_with_diagnostics(
     };
     drop(file);
     if verify_root_path_until(root, root_identity, deadline).is_err() {
-        emit_marker_remove_stage(diagnostic, "revalidate");
+        emit_marker_remove_stage(diagnostic, "evidence-identity");
         return Err(());
     }
     // Publish a second complete image before removing the target pathname.
@@ -1801,7 +1815,7 @@ fn unlink_cleaned_evidence_with_diagnostics(
     // it safe to attempt the target unlink; the backup remains available if
     // any post-unlink check or restore write fails.
     if verify_root_path_until(root, root_identity, deadline).is_err() {
-        emit_marker_remove_stage(diagnostic, "revalidate");
+        emit_marker_remove_stage(diagnostic, "last-copy-identity");
         return Err(());
     }
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
@@ -1823,11 +1837,11 @@ fn unlink_cleaned_evidence_with_diagnostics(
                 deadline,
             )
             .unwrap_or_else(|_| {
-                emit_marker_remove_stage(diagnostic, "evidence-close");
+                emit_marker_remove_stage(diagnostic, "last-copy");
                 std::process::abort()
             });
             if !outcome.durable_survivor {
-                emit_marker_remove_stage(diagnostic, "evidence-close");
+                emit_marker_remove_stage(diagnostic, "last-copy");
                 std::process::abort();
             }
         }
@@ -1860,7 +1874,7 @@ fn unlink_cleaned_evidence_with_diagnostics(
         {
             return Ok(());
         }
-        emit_marker_remove_stage(diagnostic, "evidence-close");
+        emit_marker_remove_stage(diagnostic, "last-copy");
         if fd::fstatat_no_follow(root_directory.as_raw_fd(), &backup).is_ok() {
             return Err(());
         }
@@ -1882,7 +1896,7 @@ fn unlink_cleaned_evidence_with_diagnostics(
     ) {
         Ok(outcome) if outcome.durable_survivor => return Err(()),
         Ok(_) | Err(()) => {
-            emit_marker_remove_stage(diagnostic, "evidence-close");
+            emit_marker_remove_stage(diagnostic, "last-copy");
         }
     }
     std::process::abort()
@@ -2445,7 +2459,7 @@ fn unlink_verified_entry_with_diagnostics(
     let name = match marker_name(path) {
         Ok(name) => name,
         Err(()) => {
-            emit_marker_remove_stage(diagnostic, "open-parent");
+            emit_marker_remove_stage(diagnostic, "marker-name");
             return Err(());
         }
     };
@@ -2458,7 +2472,7 @@ fn unlink_verified_entry_with_diagnostics(
             }
         };
     if verify_root_path_until(root, root_identity, deadline).is_err() {
-        emit_marker_remove_stage(diagnostic, "revalidate");
+        emit_marker_remove_stage(diagnostic, "entry-identity");
         return Err(());
     }
     // Do not begin a destructive unlink when the shared budget is already at
@@ -2471,7 +2485,7 @@ fn unlink_verified_entry_with_diagnostics(
     let mut tombstone = b".ja-sandbox-cleaned.".to_vec();
     tombstone.extend_from_slice(name);
     if tombstone.len() > 255 {
-        emit_marker_remove_stage(diagnostic, "revalidate");
+        emit_marker_remove_stage(diagnostic, "tombstone-name");
         return Err(());
     }
     if fd::rename_at(root_directory.as_raw_fd(), name, &tombstone).is_err() {
@@ -2500,7 +2514,7 @@ fn unlink_verified_entry_with_diagnostics(
     let mut recovery = b".ja-sandbox-recovery.".to_vec();
     recovery.extend_from_slice(name);
     if recovery.len() > 255 {
-        emit_marker_remove_stage(diagnostic, "evidence-open");
+        emit_marker_remove_stage(diagnostic, "recovery-name");
         return Err(());
     }
     if Instant::now() >= deadline {
@@ -2583,7 +2597,7 @@ fn unlink_verified_entry_with_diagnostics(
             }
         };
     if verify_root_path_until(root, root_identity, deadline).is_err() {
-        emit_marker_remove_stage(diagnostic, "revalidate");
+        emit_marker_remove_stage(diagnostic, "tombstone-identity");
         return Err(());
     }
     if Instant::now() >= deadline {
@@ -2608,7 +2622,7 @@ fn unlink_verified_entry_with_diagnostics(
         return Err(());
     }
     if verify_root_path_until(root, root_identity, deadline).is_err() {
-        emit_marker_remove_stage(diagnostic, "revalidate");
+        emit_marker_remove_stage(diagnostic, "postcheck-identity");
         return Err(());
     }
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
@@ -2627,7 +2641,7 @@ fn unlink_verified_entry_with_diagnostics(
     let recovery_name = match std::str::from_utf8(&recovery) {
         Ok(name) => name,
         Err(_) => {
-            emit_marker_remove_stage(diagnostic, "evidence-open");
+            emit_marker_remove_stage(diagnostic, "recovery-name");
             return Err(());
         }
     };
@@ -2646,7 +2660,7 @@ fn unlink_verified_entry_with_diagnostics(
     )
     .is_err()
     {
-        emit_marker_remove_stage(diagnostic, "evidence-close");
+        emit_marker_remove_stage(diagnostic, "close-evidence");
         return Err(());
     }
     drop(file);
@@ -2850,7 +2864,15 @@ mod unit_tests {
     fn marker_remove_diagnostic_mapping_is_closed_and_hook_only() {
         for code in [
             "open-parent",
+            "marker-name",
             "revalidate",
+            "entry-identity",
+            "evidence-identity",
+            "last-copy-identity",
+            "tombstone-name",
+            "tombstone-identity",
+            "postcheck-identity",
+            "recovery-name",
             "rename",
             "dir-sync",
             "evidence-open",
@@ -2860,6 +2882,9 @@ mod unit_tests {
             "unlink",
             "postcheck",
             "evidence-close",
+            "last-copy",
+            "close-evidence",
+            "close-transaction",
             "deadline",
         ] {
             assert_eq!(marker_remove_diagnostic_code(code), Some(code));
