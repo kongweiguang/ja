@@ -97,11 +97,41 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   pending、residual、descendant 的 pipe 读取、身份查询、failure evidence、生产 cleanup、
   launcher reap 与错误 finalizer 全部共享它；临近 deadline 时不再删除 marker/evidence，最终 report 也可能来不及
   写入，但已有 primary/fallback/emergency 或 fixture failure evidence 会保留供恢复。
+  fixture failure evidence 也只通过已校验的 owner-private root fd 写入：先以
+  `O_EXCL|O_NOFOLLOW|0600` 创建 recovery 与 pending sibling，完整写入并 fsync，校验内容、
+  mode、uid、nlink 后原子 `renameatx_np(RENAME_EXCL)` 发布 final，再 fsync 同一目录；
+  目标已存在时不会覆盖 good final。write、file fsync、
+  rename 或目录 fsync 失败都保留可解析 sibling；重启时优先保留既有 good final，或从
+  pending/recovery 原子恢复 final，绝不覆盖 good final 或删除最后一份证据。
+  每份 evidence 必须是完整的 version-2 固定 14 行 grammar：version、允许的 category、
+  supervisor 的 state/pid/pgid/uid/comm/start，以及 target 的同一组字段，字段顺序固定且
+  不允许重复、未知、空值、缺行、尾随内容或截断。`known` 必须有当前 UID 和有效 PID/PGID；
+  `provisional` 只能保留大于 1 的 PID/PGID，并将 UID/comm/start 固定为 unknown/redacted；
+  `unavailable` 只能保留可验证的大于 1 direct PID 或全 unknown，不能伪造 PGID/身份。PID、
+  PGID 还必须互不冲突，且 supervisor PID↔target PGID、supervisor PGID↔target PID 两种交叉
+  相等也拒绝；同时拒绝当前进程/进程组和保留值。短或状态不一致的 final/pending/recovery
+  只保留为诊断证据，不能提升为 final；无效 ordinary final 会在同一 root-fd 下以
+  `renameatx_np(RENAME_EXCL)` 隔离到两个固定 bounded damaged 名称之一，既不覆盖已有 damaged
+  evidence，也不任意遍历新名称；随后 pending/recovery 只有完整 sibling 才能提升。两个 damaged
+  名称均被占用、隔离/目录 fsync 失败或没有完整 sibling 时保持 fail-closed。pending 无效但
+  recovery 完整时只提升完整 sibling，并保留无效 pending 供诊断。
   fixture 的 descendant group 在每个早期失败返回前再执行有界 SIGKILL/ESRCH
-  收口；launcher 身份查询失败时仍以未释放的 Child 句柄锚定新建 PGID，先持久化
-  脱敏的 group/identity/failure evidence，再执行整组有界回收；residual、EPERM 或
-  其他 probe 错误固定映射为 abort 类别，不能依赖尚未创建的 marker 或 workflow glob
-  推迟清理。descendant fixture 读取同一次生产 cleanup report 时要求完整、有界、ASCII
+  收口；fixture supervisor 通过同一 Rust binary 的受控模式持有 target Child，异常时先
+  发送固定控制字节让 supervisor 直接 kill+wait target，再由父进程以自己的 Child
+  ownership bounded reap supervisor，并独立复核 supervisor 的 PID/PGID 已消失。这样被
+  signal 的 target 不会因 launcher 同时死亡而留下未回收 zombie；控制 EOF、非 `q`、
+  读错或 nonblocking 设置失败也会先收口 target，再以固定非零/abort 结束，绝不当作
+  成功。supervisor/target 的身份与 PGID 分开记录，父端必须同时拥有 target 的外部
+  identity 与 supervisor 的独立 identity；缺少任一身份只保留 failure evidence 并
+  fail-closed，绝不把 supervisor 的 PID 当作 target marker。若 supervisor identity
+  查询失败，父端先读取 target 的 provisional PID/PGID 并持久化受限 evidence，发送 `q`
+  后只等待 supervisor 自然退出；只有 supervisor 成功状态（其内部已确认 target
+  direct reap+PGID empty）或 target 已取得外部 identity 后，才允许完成该失败分支的
+  bounded cleanup，绝不在 q 尚未消费前直接 kill supervisor。父端向控制管道写入 `q`
+  前先设置 nonblocking，并在同一 absolute deadline 内处理 `WouldBlock`，不使用无界
+  `write_all`/flush。控制管道、residual、EPERM
+  或其他 probe 错误固定映射为 abort 类别，不能依赖
+  尚未创建的 marker 或 workflow glob 推迟清理。descendant fixture 读取同一次生产 cleanup report 时要求完整、有界、ASCII
   且严格匹配 `category=true`（唯一、按生产顺序）和最后一个 `marker-count=<n>`；未知、
   路径、重复、冲突、`false`、空行、尾随内容、超限或缺失 count 都是
   `fixture-descendant-cleanup-report`，不会把具体 PID、路径或系统错误文本带入 CI。
@@ -118,11 +148,12 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   后缀或替换 inode 被误跳过。每次 signal 前还校验 PID/PGID、start identity、comm 和
   当前 UID；保留值、当前 supervisor PID/PGID 以及其他 UID 一律 fail-closed，root
   也不能向其他 UID 发 signal。
-  marker-cleanup descendant fixture 在原生 macOS runner 上保留真实 launcher/descendant
-  peer 全集；若 group signal 返回 `EPERM`，生产 fallback 会逐个重新校验 UID、PID、
-  PGID、comm 和 start identity 后 direct-signal，并要求每个 peer 与最终 PGID 都报告
-  `ESRCH`，随后才删除全部 marker。runner 未产生 `EPERM` 时，仍由 errno fault table
-  保持 fail-closed 回归，不把成功 group signal 冒充 fallback 覆盖。
+  marker-cleanup descendant fixture 在原生 macOS runner 上由 supervisor 创建一个独立
+  target PGID，并只为 target 保留真实 PID/PGID/comm/start identity marker；supervisor
+  留在自身 group 并负责 wait/reap target。若 group signal 返回 `EPERM`，生产 fallback
+  会逐个重新校验 UID、PID、PGID、comm 和 start identity 后 direct-signal，并要求 target
+  与最终 PGID 都报告 `ESRCH`，随后才删除 marker。runner 未产生 `EPERM` 时，仍由 errno
+  fault table 保持 fail-closed 回归，不把成功 group signal 冒充 fallback 覆盖。
   marker 激活失败会保留可用的 fallback/emergency evidence，并让 job 失败；
   若所有安全文件通道均不可用，probe 仍先在进程内 bounded cleanup，无法确认时显式
   abort，外层不得声称已完成精确清理。残留、无效或 owner 不匹配证据也使 job 失败。

@@ -6,6 +6,12 @@
 #[cfg(target_os = "macos")]
 fn main() {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--fixture-launcher")
+    {
+        ja_macos_sandbox_spike::marker_cleanup::run_fixture_launcher();
+    }
     if let Err(category) = ja_macos_sandbox_spike::marker_cleanup::run_cli(&arguments) {
         eprintln!("SANDBOX-MARKER-CLEANUP: {category}");
         std::process::exit(1);

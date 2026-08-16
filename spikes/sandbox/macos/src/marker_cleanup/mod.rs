@@ -396,6 +396,14 @@ pub fn run_fixture() -> Result<(), &'static str> {
     fixture::run()
 }
 
+/// Enter the macOS-only child supervisor used by the real descendant fixture;
+/// exposing this narrow mode keeps the launcher in the same audited binary and
+/// lets the parent reap the descendant after its private group is killed.
+#[cfg(target_os = "macos")]
+pub fn run_fixture_launcher() -> ! {
+    fixture::run_fixture_launcher()
+}
+
 /// Match the marker's immutable identity against one fresh process query;
 /// process-name and start-time checks prevent PID reuse from receiving a kill.
 fn identity_matches(record: &MarkerRecord, actual: &ProcessIdentity, allow_fixture: bool) -> bool {
