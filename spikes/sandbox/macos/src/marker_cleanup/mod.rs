@@ -18,7 +18,7 @@ use marker::{
 };
 use process::{
     ProcessIdentity, ProcessState, current_pgid, probe_pid_group_until, query_identity_until,
-    terminate_group_with_identity_fallback,
+    terminate_group_with_identity_fallback, terminate_group_with_identity_fallback_hook,
 };
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -133,6 +133,38 @@ pub(super) fn cleanup_markers_until(
     allow_fixture: bool,
     cleanup_deadline: Instant,
 ) -> Result<(), &'static str> {
+    cleanup_markers_until_impl(root, report, allow_fixture, cleanup_deadline, None)
+}
+
+/// Run cleanup with a bounded callback that is invoked immediately after a
+/// target group signal succeeds.  The descendant fixture uses this narrow
+/// handshake to let its supervisor reap a killed child before the production
+/// identity wait checks the direct PID; normal workflow callers pass no hook.
+pub(super) fn cleanup_markers_until_with_group_signal_hook(
+    root: &Path,
+    report: &Path,
+    allow_fixture: bool,
+    cleanup_deadline: Instant,
+    on_group_signal: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    cleanup_markers_until_impl(
+        root,
+        report,
+        allow_fixture,
+        cleanup_deadline,
+        Some(on_group_signal),
+    )
+}
+
+/// Keep the standard and fixture cleanup paths on one implementation so the
+/// callback cannot bypass root, identity, deadline or evidence invariants.
+fn cleanup_markers_until_impl(
+    root: &Path,
+    report: &Path,
+    allow_fixture: bool,
+    cleanup_deadline: Instant,
+    mut on_group_signal: Option<&mut dyn FnMut() -> Result<(), &'static str>>,
+) -> Result<(), &'static str> {
     let own_pgid = current_pgid();
     if own_pgid <= 1 {
         return write_failure_report(report, "marker-group-unsafe");
@@ -217,8 +249,20 @@ pub(super) fn cleanup_markers_until(
         if !group_valid || identities.is_empty() {
             continue;
         }
-        match terminate_group_with_identity_fallback(&identities[0], &identities, cleanup_deadline)
-        {
+        let termination = match on_group_signal.as_deref_mut() {
+            Some(hook) => terminate_group_with_identity_fallback_hook(
+                &identities[0],
+                &identities,
+                cleanup_deadline,
+                hook,
+            ),
+            None => terminate_group_with_identity_fallback(
+                &identities[0],
+                &identities,
+                cleanup_deadline,
+            ),
+        };
+        match termination {
             Ok(()) => {
                 if remove_identity_markers(
                     root,

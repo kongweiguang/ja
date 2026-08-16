@@ -267,8 +267,21 @@ pub(super) fn terminate_group(
     captured: &ProcessIdentity,
     deadline: Instant,
 ) -> Result<(), &'static str> {
+    let mut no_hook = || Ok(());
+    terminate_group_with_hook(captured, deadline, &mut no_hook)
+}
+
+/// Kill a captured group and notify an optional owner immediately after the
+/// group signal.  The hook runs before any direct-PID wait because a supervisor
+/// may be the only process able to reap a just-killed zombie child.
+fn terminate_group_with_hook(
+    captured: &ProcessIdentity,
+    deadline: Instant,
+    on_group_signal: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
     validate_captured_identity(captured, deadline)?;
-    let group_signal = signal_group_captured(captured, deadline)?;
+    let group_signal =
+        notify_after_group_signal(signal_group_captured(captured, deadline)?, on_group_signal)?;
     if group_signal == ProcessState::Empty {
         // The group may disappear before the direct child supervisor reaps
         // its zombie.  Keep the same identity-checked wait used after a
@@ -332,6 +345,16 @@ pub(super) fn terminate_group(
     }
 }
 
+/// Preserve the signal result while forcing the supervisor-release handshake
+/// to occur before any direct PID/group wait can block on a zombie child.
+fn notify_after_group_signal(
+    group_signal: ProcessState,
+    on_group_signal: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<ProcessState, &'static str> {
+    on_group_signal()?;
+    Ok(group_signal)
+}
+
 /// Recover a group-signal `EPERM` only with a complete, caller-supplied set of
 /// identity-checked members.  This is deliberately fail-closed for an
 /// incomplete set: every known PID must disappear and the kernel must also
@@ -342,50 +365,79 @@ pub(super) fn terminate_group_with_identity_fallback(
     peers: &[ProcessIdentity],
     deadline: Instant,
 ) -> Result<(), &'static str> {
+    let mut no_hook = || Ok(());
     match terminate_group(captured, deadline) {
         Ok(()) => Ok(()),
+        Err("marker-eperm") => terminate_group_after_eperm(captured, peers, deadline, &mut no_hook),
+        Err(error) => Err(error),
+    }
+}
+
+/// Run group cleanup with the same EPERM fallback while allowing the owner to
+/// release a supervisor-held zombie after each safe group/direct signal phase.
+pub(super) fn terminate_group_with_identity_fallback_hook(
+    captured: &ProcessIdentity,
+    peers: &[ProcessIdentity],
+    deadline: Instant,
+    on_group_signal: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    match terminate_group_with_hook(captured, deadline, on_group_signal) {
+        Ok(()) => Ok(()),
         Err("marker-eperm") => {
-            let mut targets: Vec<&ProcessIdentity> = Vec::with_capacity(peers.len());
-            for peer in peers {
-                if peer.pid <= 1
-                    || peer.pgid <= 1
-                    || peer.pid == current_pid()
-                    || peer.pgid == current_pgid()
-                    || peer.pgid != captured.pgid
-                    || peer.uid != current_uid()
-                {
-                    return Err("marker-owner-mismatch");
-                }
-                if let Some(existing) = targets.iter().find(|target| target.pid == peer.pid) {
-                    if *existing != peer {
-                        return Err("marker-identity-lost");
-                    }
-                    continue;
-                }
-                targets.push(peer);
-            }
-            if !targets.iter().any(|target| target.pid == captured.pid) {
-                return Err("marker-owner-mismatch");
-            }
-            // An EPERM group probe may already have killed a member.  Query
-            // each remaining member before its direct signal, and never use a
-            // stale numeric PID merely because it appeared in a marker.
-            for target in &targets {
-                let pid = i32::try_from(target.pid).map_err(|_| "marker-owner-mismatch")?;
-                match pid_state_until(pid, deadline)? {
-                    ProcessState::Empty => {}
-                    ProcessState::PermissionDenied => return Err("marker-eperm"),
-                    ProcessState::Other(_) => return Err("marker-process-probe-failed"),
-                    ProcessState::Present => {
-                        validate_captured_identity(target, deadline)?;
-                        signal_pid(target.pid, deadline)?;
-                    }
-                }
-            }
-            wait_after_identity_group(&targets, captured.pgid, deadline)
+            terminate_group_after_eperm(captured, peers, deadline, on_group_signal)
         }
         Err(error) => Err(error),
     }
+}
+
+/// Finish the EPERM direct-member fallback, then release the supervisor before
+/// the bounded group-empty wait; every member is still revalidated before its
+/// individual signal and an unknown peer remains a hard failure.
+fn terminate_group_after_eperm(
+    captured: &ProcessIdentity,
+    peers: &[ProcessIdentity],
+    deadline: Instant,
+    on_group_signal: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let mut targets: Vec<&ProcessIdentity> = Vec::with_capacity(peers.len());
+    for peer in peers {
+        if peer.pid <= 1
+            || peer.pgid <= 1
+            || peer.pid == current_pid()
+            || peer.pgid == current_pgid()
+            || peer.pgid != captured.pgid
+            || peer.uid != current_uid()
+        {
+            return Err("marker-owner-mismatch");
+        }
+        if let Some(existing) = targets.iter().find(|target| target.pid == peer.pid) {
+            if *existing != peer {
+                return Err("marker-identity-lost");
+            }
+            continue;
+        }
+        targets.push(peer);
+    }
+    if !targets.iter().any(|target| target.pid == captured.pid) {
+        return Err("marker-owner-mismatch");
+    }
+    // An EPERM group probe may already have killed a member.  Query each
+    // remaining member before its direct signal, and never use a stale numeric
+    // PID merely because it appeared in a marker.
+    for target in &targets {
+        let pid = i32::try_from(target.pid).map_err(|_| "marker-owner-mismatch")?;
+        match pid_state_until(pid, deadline)? {
+            ProcessState::Empty => {}
+            ProcessState::PermissionDenied => return Err("marker-eperm"),
+            ProcessState::Other(_) => return Err("marker-process-probe-failed"),
+            ProcessState::Present => {
+                validate_captured_identity(target, deadline)?;
+                signal_pid(target.pid, deadline)?;
+            }
+        }
+    }
+    on_group_signal()?;
+    wait_after_identity_group(&targets, captured.pgid, deadline)
 }
 
 /// Wait for every trusted member and the complete group to disappear after a
@@ -570,7 +622,10 @@ fn signal_group_captured(
 
 /// Keep the direct Child alive until it is reaped, then require its captured
 /// group to disappear; this helper deliberately sends no stale group signal.
-fn require_group_empty(process_group: i32, deadline: Instant) -> Result<(), &'static str> {
+pub(super) fn require_group_empty(
+    process_group: i32,
+    deadline: Instant,
+) -> Result<(), &'static str> {
     if process_group <= 1 || process_group == current_pgid() {
         return Err("marker-owner-mismatch");
     }
@@ -1123,6 +1178,26 @@ mod tests {
             );
             assert!(backend.signalled);
         }
+    }
+
+    /// Prove the post-signal handshake is mandatory for both a live and an
+    /// already-empty group, while a lost control pipe remains fail-closed.
+    #[test]
+    fn group_signal_handshake_is_bounded_and_ordered() {
+        for state in [ProcessState::Present, ProcessState::Empty] {
+            let mut calls = 0;
+            let mut hook = || {
+                calls += 1;
+                Ok(())
+            };
+            assert_eq!(notify_after_group_signal(state, &mut hook), Ok(state));
+            assert_eq!(calls, 1);
+        }
+        let mut hook = || Err("marker-query-unreaped");
+        assert_eq!(
+            notify_after_group_signal(ProcessState::Present, &mut hook),
+            Err("marker-query-unreaped")
+        );
     }
 
     /// Prove a direct-PID/group disagreement takes the identity revalidation

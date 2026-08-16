@@ -8,12 +8,16 @@ use super::marker::write_fixture_marker;
 use super::process::{
     EPERM, ProcessIdentity, abort_unreaped_query, classify_errno, current_pgid, current_uid,
     probe_pid_group_until, query_identity_until, reap_child_bounded, reap_child_group_bounded,
-    reap_child_without_group_until, set_nonblocking, terminate_group_with_identity_fallback,
+    reap_child_without_group_until, require_group_empty, set_nonblocking,
+    terminate_group_with_identity_fallback,
 };
-use super::{MARKER_MODE, O_CLOEXEC_FLAG, O_NOFOLLOW_FLAG, cleanup_markers_until};
+use super::{
+    MARKER_MODE, O_CLOEXEC_FLAG, O_NOFOLLOW_FLAG, cleanup_markers_until,
+    cleanup_markers_until_with_group_signal_hook,
+};
 use crate::spawn_grouped;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -21,6 +25,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FIXTURE_CLEANUP_DEADLINE: Duration = Duration::from_secs(8);
+const FIXTURE_ACK_BYTES: usize = 256;
 
 /// Run forged, pending, residual-descendant and exact-EPERM cases using the
 /// same scan/signal implementation that production workflow cleanup invokes.
@@ -111,9 +116,11 @@ fn residual_group_case(deadline: Instant) -> Result<(), &'static str> {
     remove_fixture_root(root)
 }
 
-/// Run the child-side fixture supervisor.  The supervisor owns the sleep
-/// process and waits for it, so a group kill cannot leave a zombie descendant
-/// for the parent fixture to mistake for PID reuse.
+/// Run the child-side fixture supervisor.  The supervisor waits for the
+/// explicit control byte before reaping its target so production cleanup can
+/// observe one stable target identity; polling `try_wait` here would race the
+/// parent and turn a transient zombie into an architecture-dependent identity
+/// failure.
 #[cfg(target_os = "macos")]
 pub(super) fn run_fixture_launcher() -> ! {
     let mut command = Command::new("/bin/sleep");
@@ -136,20 +143,6 @@ pub(super) fn run_fixture_launcher() -> ! {
         abort_unreaped_query("fixture-helper-control");
     }
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                // A natural target exit still needs the same group-empty
-                // proof as an explicit control request; otherwise an
-                // unobserved descendant could survive this helper.
-                terminate_fixture_child(&mut child, "fixture-helper-reap");
-                break;
-            }
-            Ok(None) => {}
-            Err(_) => {
-                terminate_fixture_child(&mut child, "fixture-helper-reap");
-                abort_unreaped_query("fixture-helper-reap");
-            }
-        }
         let mut command_byte = [0_u8; 1];
         let event = match control.read(&mut command_byte) {
             Ok(read) => classify_fixture_control(Ok(read), command_byte[0]),
@@ -158,6 +151,12 @@ pub(super) fn run_fixture_launcher() -> ! {
         match event {
             FixtureControlEvent::Command => {
                 terminate_fixture_child(&mut child, "fixture-helper-control");
+                if write_fixture_reap_ack().is_err() {
+                    // The target is already reaped, but without an explicit
+                    // acknowledgement the parent cannot safely distinguish a
+                    // completed supervisor transaction from a crashed one.
+                    abort_unreaped_query("fixture-helper-ack");
+                }
                 break;
             }
             FixtureControlEvent::Eof => {
@@ -234,6 +233,41 @@ fn terminate_fixture_child(child: &mut std::process::Child, reason: &'static str
     }
 }
 
+/// Publish the bounded target-reap acknowledgement only after the supervisor
+/// has proved direct reap and target PGID emptiness; the parent uses this line
+/// as the happens-before edge before it probes the marker identity again.
+#[cfg(target_os = "macos")]
+fn write_fixture_reap_ack() -> Result<(), &'static str> {
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    set_nonblocking(&stdout).map_err(|_| "fixture-helper-ack")?;
+    let ack = b"target-reaped=true\n";
+    // The acknowledgement is one short pipe write.  Refusing a partial or
+    // would-block write avoids starting a second timeout window in the child;
+    // the parent's single absolute deadline then records the missing ack.
+    if stdout.write(ack).ok() == Some(ack.len()) {
+        Ok(())
+    } else {
+        Err("fixture-helper-ack")
+    }
+}
+
+/// Keep the control-write and acknowledgement read in one bounded phase so a
+/// production group cleanup cannot begin direct PID probing between them.
+fn complete_fixture_reap_handshake<F>(deadline: Instant, handshake: F) -> Result<(), &'static str>
+where
+    F: FnOnce(Instant) -> Result<(), &'static str>,
+{
+    if Instant::now() >= deadline {
+        return Err("marker-query-unreaped");
+    }
+    handshake(deadline)?;
+    if Instant::now() >= deadline {
+        return Err("marker-query-unreaped");
+    }
+    Ok(())
+}
+
 /// Spawn a real descendant group, write a fixture marker, then let production
 /// cleanup signal and verify both direct PID and group reach exact ESRCH.
 fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
@@ -289,7 +323,7 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             );
         }
     };
-    let mut stdout = match launcher.stdout.take() {
+    let stdout = match launcher.stdout.take() {
         Some(stdout) => stdout,
         None => {
             return finish_launcher_failure(
@@ -321,10 +355,10 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             "fixture-helper-pipe",
         );
     }
-    let output = match read_launcher_output(&mut stdout, &mut launcher, fixture_deadline) {
+    let mut launcher_output = BufReader::new(stdout);
+    let output = match read_launcher_output(&mut launcher_output, &mut launcher, fixture_deadline) {
         Ok(output) => output,
         Err(error) => {
-            drop(stdout);
             return finish_launcher_failure(
                 &root,
                 &mut launcher,
@@ -339,7 +373,6 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             );
         }
     };
-    drop(stdout);
     let pid = match output.trim().parse::<u32>() {
         Ok(pid) if pid > 1 => pid,
         Err(_) => {
@@ -465,15 +498,51 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             "fixture-marker-write",
         );
     }
-    let result = cleanup_markers_until(&root, &report, true, fixture_deadline);
-    // Keep the launcher Child owned until production cleanup has observed and
-    // terminated its real descendant; reaping before this point would make the
-    // fixture prove only a helper exit, not the marker cleanup contract.
-    // The supervisor owns its own group; the target group was already handled
-    // by production marker cleanup.  Reaping with the target PGID would leave
-    // the live supervisor outside the identity proof and can strand it when
-    // the target exits normally.
-    let launcher_result = reap_child_bounded(&mut launcher, launcher_group, fixture_deadline);
+    let mut handshake_ok = false;
+    let result = {
+        let mut handshake_error = None;
+        let mut signal_hook = || {
+            if handshake_ok {
+                return Ok(());
+            }
+            if let Some(error) = handshake_error {
+                return Err(error);
+            }
+            let result = complete_fixture_reap_handshake(fixture_deadline, |deadline| {
+                request_fixture_launcher_shutdown(&mut launcher, deadline)?;
+                wait_fixture_reap_ack(&mut launcher_output, &mut launcher, deadline)
+            })
+            .map_err(|_| "marker-query-unreaped");
+            match result {
+                Ok(()) => {
+                    handshake_ok = true;
+                    Ok(())
+                }
+                Err(error) => {
+                    handshake_error = Some(error);
+                    Err(error)
+                }
+            }
+        };
+        cleanup_markers_until_with_group_signal_hook(
+            &root,
+            &report,
+            true,
+            fixture_deadline,
+            &mut signal_hook,
+        )
+    };
+    // Let the supervisor perform its own bounded target reap after production
+    // cleanup has finished.  A successful production pass already consumed the
+    // acknowledgement, so this phase only waits/reaps the supervisor; it never
+    // sends a second control byte that could hide a lost acknowledgement.
+    let launcher_result = shutdown_launcher_after_marker(
+        &mut launcher,
+        launcher_group,
+        &identity,
+        fixture_deadline,
+        handshake_ok,
+    );
     if result.is_err() {
         // Preserve only the production report's fixed category so a native
         // runner can distinguish residual, identity, query and signal faults
@@ -488,6 +557,16 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             category,
         );
     }
+    if !handshake_ok {
+        return finish_descendant_failure(
+            &root,
+            launcher_identity.as_ref(),
+            &identity,
+            Err("fixture-helper-ack"),
+            fixture_deadline,
+            "fixture-group-control",
+        );
+    }
     if let Err(error) = launcher_result {
         return finish_descendant_failure(
             &root,
@@ -497,6 +576,12 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
             fixture_deadline,
             "fixture-launcher-cleanup",
         );
+    }
+    // The supervisor's success proves it consumed the control request, but
+    // only an independent target PID/PGID probe proves that its descendant is
+    // actually gone before the fixture removes its evidence root.
+    if let Err(error) = verify_reaped_group(&identity, fixture_deadline) {
+        abort_fixture_group(error);
     }
     // The target marker cleanup and direct supervisor reap are independent
     // facts.  Verify the supervisor's own captured PID/PGID before declaring
@@ -510,6 +595,56 @@ fn descendant_case(deadline: Instant) -> Result<(), &'static str> {
         abort_fixture_group("fixture-helper-query");
     }
     remove_fixture_root(root)
+}
+
+/// Complete the supervisor/target teardown after the production marker pass.
+/// The control protocol is preferred because it lets the original supervisor
+/// reap its target; only a failed control or non-success exit enters the
+/// identity-checked fallback before the supervisor Child is reaped.
+fn shutdown_launcher_after_marker(
+    launcher: &mut std::process::Child,
+    launcher_group: i32,
+    target_identity: &ProcessIdentity,
+    deadline: Instant,
+    reap_acknowledged: bool,
+) -> Result<(), &'static str> {
+    let (control_sent, status_success) = if reap_acknowledged {
+        // The ACK reader already observed a successful terminal status while
+        // draining EOF; calling try_wait again could turn a valid reap into an
+        // ECHILD/query failure on platforms that do not cache that status.
+        (true, true)
+    } else {
+        let control_sent = request_fixture_launcher_shutdown(launcher, deadline).is_ok();
+        let status_success = control_sent
+            && wait_child_exit_until(launcher, deadline).is_some_and(|status| status.success());
+        (control_sent, status_success)
+    };
+    let status_failed = control_sent && !status_success;
+    let target_result = if status_success {
+        // The supervisor's successful exit is evidence that it ran its own
+        // target finalizer; the caller still performs the independent exact
+        // PID/PGID proof before accepting the fixture result.
+        Ok(())
+    } else {
+        match verify_reaped_group(target_identity, deadline) {
+            Ok(()) => Ok(()),
+            Err(_) => terminate_group_with_identity_fallback(
+                target_identity,
+                std::slice::from_ref(target_identity),
+                deadline,
+            ),
+        }
+    };
+    let supervisor_result = if status_success {
+        require_group_empty(launcher_group, deadline)
+    } else {
+        reap_child_bounded(launcher, launcher_group, deadline)
+    };
+    match (status_failed, target_result, supervisor_result) {
+        (false, Ok(()), Ok(())) => Ok(()),
+        (true, _, _) => Err("fixture-helper-control"),
+        (false, Err(error), _) | (false, _, Err(error)) => Err(error),
+    }
 }
 
 /// Ask the fixture supervisor to kill and reap its exact sleep child before the
@@ -537,6 +672,64 @@ fn request_fixture_launcher_shutdown(
     } else {
         Err("fixture-helper-control")
     }
+}
+
+/// Wait for the supervisor's exact acknowledgement line under the same
+/// deadline as the control write; a missing, malformed or premature ack keeps
+/// marker evidence alive and never permits production PID cleanup to proceed.
+fn wait_fixture_reap_ack(
+    reader: &mut impl Read,
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 128];
+    let mut terminal_status = None;
+    let mut eof = false;
+    while Instant::now() < deadline {
+        let mut progressed = false;
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                eof = true;
+                progressed = true;
+            }
+            Ok(read) => {
+                output.extend_from_slice(&buffer[..read]);
+                if output.len() > FIXTURE_ACK_BYTES {
+                    return Err("fixture-helper-ack");
+                }
+                progressed = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return Err("fixture-helper-ack"),
+        }
+        if terminal_status.is_none() {
+            terminal_status = child.try_wait().map_err(|_| "fixture-helper-ack")?;
+        }
+        if eof {
+            if let Some(status) = terminal_status {
+                let ack = std::str::from_utf8(&output)
+                    .ok()
+                    .is_some_and(is_fixture_reap_ack);
+                return if status.success() && ack {
+                    Ok(())
+                } else {
+                    Err("fixture-helper-ack")
+                };
+            }
+        }
+        if !progressed || (eof && terminal_status.is_none()) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    Err("marker-query-unreaped")
+}
+
+/// Accept only the one-line acknowledgement emitted after target direct reap
+/// and PGID emptiness; extra fields or missing newlines cannot authorize a
+/// parent-side identity probe.
+fn is_fixture_reap_ack(line: &str) -> bool {
+    line == "target-reaped=true\n"
 }
 
 /// Wait for an owned supervisor to report its terminal status without sending
@@ -1766,7 +1959,7 @@ fn read_launcher_output(
                     .map_err(|_| "fixture-helper-output")?
                     .is_some()
                 {
-                    continue;
+                    return Err("fixture-helper-output");
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -1816,16 +2009,18 @@ fn remove_fixture_root(root: PathBuf) -> Result<(), &'static str> {
 mod tests {
     use super::{
         FixtureControlEvent, FixtureEvidenceFault, FixtureFailureContext, ProcessIdentity,
-        accept_launcher_identity, classify_fixture_control, control_setup_state,
-        finish_fixture_failure_with, fixture_cleanup_failure_category,
-        fixture_group_failure_reason, fixture_paths, persist_fixture_failure_pair_until,
-        wait_child_exit_until, write_fixture_failure_evidence_until,
-        write_fixture_failure_evidence_with_fault,
+        accept_launcher_identity, classify_fixture_control, complete_fixture_reap_handshake,
+        control_setup_state, finish_fixture_failure_with, fixture_cleanup_failure_category,
+        fixture_group_failure_reason, fixture_paths, is_fixture_reap_ack,
+        persist_fixture_failure_pair_until, wait_child_exit_until,
+        write_fixture_failure_evidence_until, write_fixture_failure_evidence_with_fault,
     };
-    use crate::marker_cleanup::process::{ProcessState, group_state};
+    use crate::marker_cleanup::process::{
+        ProcessState, group_state, reap_child_group_bounded, set_nonblocking,
+    };
     use crate::spawn_grouped;
     use std::fs;
-    use std::io::Write;
+    use std::io::{BufReader, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::DirBuilderExt;
     use std::path::Path;
@@ -1884,6 +2079,127 @@ mod tests {
             FixtureControlEvent::SetupFailed
         );
         assert_eq!(control_setup_state(Ok(())), FixtureControlEvent::WouldBlock);
+    }
+
+    /// Keep the supervisor acknowledgement grammar closed: only the exact
+    /// target-reaped line can establish the happens-before edge for cleanup.
+    #[test]
+    fn fixture_reap_ack_requires_exact_line() {
+        for line in [
+            "target-reaped=true\n",
+            "target-reaped=true",
+            "target-reaped=false\n",
+            "target-reaped=true\nextra\n",
+            "target-reaped=true\r\n",
+        ] {
+            assert_eq!(is_fixture_reap_ack(line), line == "target-reaped=true\n");
+        }
+    }
+
+    /// Exercise the acknowledgement reader against real nonblocking pipes so
+    /// chunking, delayed tail bytes, missing/malformed/oversized output,
+    /// timeout and nonzero supervisor status cannot become a false success.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fixture_ack_pipe_cases_are_bounded_and_strict() {
+        let cases = [
+            (
+                "printf 'target-reaped=true\\n'",
+                true,
+                Duration::from_secs(2),
+            ),
+            (
+                "printf 'target-reaped='; /bin/sleep 0.05; printf 'true\\n'",
+                true,
+                Duration::from_secs(2),
+            ),
+            (
+                "printf 'target-reaped=true\\n'; /bin/sleep 0.05; printf 'extra\\n'",
+                false,
+                Duration::from_secs(2),
+            ),
+            ("printf 'target-reaped=true'", false, Duration::from_secs(2)),
+            (
+                "printf 'target-reaped=false\\n'",
+                false,
+                Duration::from_secs(2),
+            ),
+            ("printf '%300s' x", false, Duration::from_secs(2)),
+            ("/bin/sleep 2", false, Duration::from_millis(100)),
+            (
+                "printf 'target-reaped=true\\n'; exit 7",
+                false,
+                Duration::from_secs(2),
+            ),
+        ];
+        for (script, expected_success, budget) in cases {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let mut child = spawn_grouped(&mut command).expect("spawn ack pipe fixture");
+            let process_group = i32::try_from(child.id())
+                .ok()
+                .filter(|value| *value > 1)
+                .expect("ack pipe process group");
+            let stdout = child.stdout.take().expect("ack pipe stdout");
+            set_nonblocking(&stdout).expect("ack pipe nonblocking");
+            let mut reader = BufReader::new(stdout);
+            let result =
+                super::wait_fixture_reap_ack(&mut reader, &mut child, Instant::now() + budget);
+            if result.is_ok() != expected_success {
+                let _ = reap_child_group_bounded(
+                    &mut child,
+                    process_group,
+                    Instant::now() + Duration::from_secs(2),
+                );
+                panic!("unexpected acknowledgement result for script: {script}");
+            }
+            if result.is_err() {
+                reap_child_group_bounded(
+                    &mut child,
+                    process_group,
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .expect("failed ack fixture cleanup");
+            } else {
+                assert_eq!(group_state(process_group), ProcessState::Empty);
+            }
+        }
+    }
+
+    /// Exercise the complete q-plus-ack phase, including control loss, ack
+    /// loss and a deadline that expires before any child-side action.
+    #[test]
+    fn fixture_reap_handshake_faults_are_fail_closed() {
+        let mut phases = Vec::new();
+        assert_eq!(
+            complete_fixture_reap_handshake(Instant::now() + Duration::from_secs(1), |_| {
+                phases.push("q");
+                phases.push("ack");
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(phases, ["q", "ack"]);
+        assert_eq!(
+            complete_fixture_reap_handshake(Instant::now() + Duration::from_secs(1), |_| {
+                Err("fixture-helper-control")
+            }),
+            Err("fixture-helper-control")
+        );
+        assert_eq!(
+            complete_fixture_reap_handshake(Instant::now() + Duration::from_secs(1), |_| {
+                Err("fixture-helper-ack")
+            }),
+            Err("fixture-helper-ack")
+        );
+        assert_eq!(
+            complete_fixture_reap_handshake(Instant::now(), |_| Ok(())),
+            Err("marker-query-unreaped")
+        );
     }
 
     /// Exercise the bounded supervisor-status seam with both normal and crash

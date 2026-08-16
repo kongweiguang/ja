@@ -122,7 +122,16 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   fixture 的 descendant group 在每个早期失败返回前再执行有界 SIGKILL/ESRCH
   收口；fixture supervisor 通过同一 Rust binary 的受控模式持有 target Child，异常时先
   发送固定控制字节让 supervisor 直接 kill+wait target，再由父进程以自己的 Child
-  ownership bounded reap supervisor，并独立复核 supervisor 的 PID/PGID 已消失。这样被
+  ownership bounded reap supervisor，并独立复核 supervisor 的 PID/PGID 已消失。正常
+  descendant marker cleanup 在生产 group signal 成功后立即通过同一 absolute deadline
+  写入一次 `q`，并等待 supervisor 返回唯一的 `target-reaped=true` acknowledgement；
+  只有该 ack 明确证明 target direct reap 与 target PGID empty 后，production 才继续
+  direct-PID/PGID residual 复核。ack 缺失、格式错误、supervisor crash 或 query race 都
+  保留 marker/evidence 并 fail-closed；ACK reader 会在同一 deadline 内继续 drain 到
+  supervisor terminal/EOF，chunked 合法行才接受，任何第二行、尾随字节、超量输出或
+  nonzero status 都失败。父端随后只等待/reap supervisor 并再次独立复核
+  target/supervisor，绝不会在 ack 被消费前直接杀 supervisor。
+  这样被
   signal 的 target 不会因 launcher 同时死亡而留下未回收 zombie；控制 EOF、非 `q`、
   读错或 nonblocking 设置失败也会先收口 target，再以固定非零/abort 结束，绝不当作
   成功。supervisor/target 的身份与 PGID 分开记录，父端必须同时拥有 target 的外部
