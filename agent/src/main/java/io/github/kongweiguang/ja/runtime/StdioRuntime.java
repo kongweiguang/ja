@@ -5,6 +5,7 @@ package io.github.kongweiguang.ja.runtime;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.JsonNode;
+import io.agentscope.core.tool.Toolkit;
 import io.github.kongweiguang.ja.application.Capabilities;
 import io.github.kongweiguang.ja.application.HandshakeStateMachine;
 import io.github.kongweiguang.ja.application.InitializeUseCase;
@@ -18,7 +19,10 @@ import io.github.kongweiguang.ja.domain.EventId;
 import io.github.kongweiguang.ja.domain.ServerInstanceId;
 import io.github.kongweiguang.ja.model.AgentScopeModelFactory;
 import io.github.kongweiguang.ja.model.ModelHandle;
+import io.github.kongweiguang.ja.mcp.McpLimits;
+import io.github.kongweiguang.ja.mcp.McpProcessPort;
 import io.github.kongweiguang.ja.mcp.McpServerDefinition;
+import io.github.kongweiguang.ja.mcp.McpRuntime;
 import io.github.kongweiguang.ja.profiles.ModelProfile;
 import io.github.kongweiguang.ja.profiles.SecretAccessException;
 import io.github.kongweiguang.ja.profiles.SecretRef;
@@ -92,12 +96,15 @@ public final class StdioRuntime implements AutoCloseable {
     private final ModelBuilder modelBuilder;
     private final ExecutorService activationLane;
     private final AtomicBoolean activationInProgress = new AtomicBoolean();
+    private final AtomicReference<McpProbeAttempt> activeMcpProbe = new AtomicReference<>();
     private final AtomicLong secretRequestSequence = new AtomicLong();
     private volatile WorkspaceBinding workspaceBinding;
     private volatile SavedProfile savedProfile;
     private volatile String activeProfileRevision;
     /** Stores only this sidecar generation's MCP definitions; control-lane handlers are the sole writers. */
     private final LinkedHashMap<String, McpServerDefinition> mcpServers = new LinkedHashMap<>();
+    /** Stores only successful immutable probe projections; stale generations are never reused. */
+    private final LinkedHashMap<String, McpProbeSnapshot> mcpProbeSnapshots = new LinkedHashMap<>();
     private final ThreadPoolExecutor controlLane;
     private final CountDownLatch terminated = new CountDownLatch(1);
     private final AtomicBoolean readerStarted = new AtomicBoolean(false);
@@ -405,6 +412,14 @@ public final class StdioRuntime implements AutoCloseable {
             handleMcpDelete(request);
             return;
         }
+        if ("mcp/test".equals(request.method())) {
+            handleMcpTest(request);
+            return;
+        }
+        if ("mcp/tools/read".equals(request.method())) {
+            handleMcpToolsRead(request);
+            return;
+        }
         if ("version".equals(request.method())) {
             sendResponse(RpcResponse.success(request, versionResult()));
             return;
@@ -585,7 +600,7 @@ public final class StdioRuntime implements AutoCloseable {
                 mcpServers.put(candidate.revision(), candidate);
             }
             ObjectNode result = JsonNodes.object();
-            result.set("server", McpWireMapper.summary(created ? candidate : existing));
+            result.set("server", mcpSummary(created ? candidate : existing));
             result.put("created", created);
             sendResponse(RpcResponse.success(request, result));
         } catch (ProtocolException exception) {
@@ -595,12 +610,12 @@ public final class StdioRuntime implements AutoCloseable {
         }
     }
 
-    /** Returns the insertion-ordered generation snapshot without probing MCP servers. */
+    /** Returns the insertion-ordered generation snapshot and only the last real probe status. */
     private void handleMcpList(RpcRequest request) {
         try {
             ObjectNode result = JsonNodes.object();
             var servers = JsonNodes.array();
-            mcpServers.values().forEach(server -> servers.add(McpWireMapper.summary(server)));
+            mcpServers.values().forEach(server -> servers.add(mcpSummary(server)));
             result.set("servers", servers);
             sendResponse(RpcResponse.success(request, result));
         } catch (RuntimeException exception) {
@@ -623,6 +638,7 @@ public final class StdioRuntime implements AutoCloseable {
                 throw new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
             }
             mcpServers.remove(revision);
+            mcpProbeSnapshots.remove(revision);
             ObjectNode result = JsonNodes.object();
             result.put("accepted", true);
             result.put("mcpRevision", revision);
@@ -632,6 +648,281 @@ public final class StdioRuntime implements AutoCloseable {
         } catch (RuntimeException exception) {
             sendFailure(request, new ProtocolException(JaErrorCode.INVALID_PARAMS));
         }
+    }
+
+    /**
+     * Starts one bounded, side-effect-free MCP initialize/tools-list probe.
+     * The control lane only admits and correlates the operation; the existing
+     * activation lane performs blocking SDK work so health/read remains live.
+     */
+    private void handleMcpTest(RpcRequest request) {
+        McpProbeAttempt attempt = null;
+        try {
+            String revision = requiredIdentifier(request.params(), "mcpRevision", "mcp_");
+            McpServerDefinition definition = mcpServers.get(revision);
+            if (definition == null || !definition.enabled()) {
+                throw new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
+            }
+            WorkspaceBinding workspace = workspaceBinding;
+            if (workspace == null) {
+                throw new ProtocolException(JaErrorCode.INVALID_STATE);
+            }
+            String profileRevision;
+            if (definition.requiresSecret()) {
+                // Credential-bearing probes must carry the profile context explicitly; guessing
+                // the saved profile would let a caller silently change the secret authority.
+                if (!request.params().has("profileRevision")) {
+                    throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+                }
+                profileRevision = mcpProfileRevision(request.params(), definition);
+            } else if (request.params().has("profileRevision")) {
+                profileRevision = mcpProfileRevision(request.params(), definition);
+            } else {
+                profileRevision = null;
+            }
+            McpProbeAttempt candidate = new McpProbeAttempt(request, definition, workspace,
+                    profileRevision);
+            if (!activeMcpProbe.compareAndSet(null, candidate)) {
+                throw new ProtocolException(JaErrorCode.CONFLICT);
+            }
+            attempt = candidate;
+            // A new test invalidates the old discovery view immediately; a failed retry must not
+            // leave the UI displaying tools that were not observed in the current generation.
+            mcpProbeSnapshots.remove(revision);
+            if (!definition.requiresSecret()) {
+                submitMcpProbe(candidate, null);
+                return;
+            }
+            String secretRequestId = "s:mcp_secret_" + secretRequestSequence.incrementAndGet();
+            RpcRequest secretRequest = RpcRequest.server(secretRequestId, "secret/resolve",
+                    mcpSecretResolveParams(definition, profileRevision));
+            pendingRequests.register(secretRequest,
+                    response -> handleMcpSecretResponse(candidate, response));
+            scheduleMcpSecretDeadline(candidate, secretRequest.id());
+            sendResponse(secretRequest);
+        } catch (ProtocolException exception) {
+            if (attempt != null) {
+                activeMcpProbe.compareAndSet(attempt, null);
+            }
+            sendFailure(request, exception);
+        } catch (RuntimeException exception) {
+            if (attempt != null) {
+                activeMcpProbe.compareAndSet(attempt, null);
+            }
+            sendFailure(request, new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE));
+        }
+    }
+
+    /** Revalidates the control-owned generation before a secret can enter the provider probe. */
+    private void handleMcpSecretResponse(McpProbeAttempt attempt, RpcResponse response) {
+        if (activeMcpProbe.get() != attempt) {
+            return;
+        }
+        try {
+            ensureMcpAttemptCurrent(attempt);
+            submitMcpProbe(attempt, response);
+        } catch (ProtocolException exception) {
+            finishMcpProbeFailure(attempt, exception);
+        }
+    }
+
+    /**
+     * Reads only the last successful probe. Re-probing here would violate the
+     * settings method's read-only contract and could create a second child.
+     */
+    private void handleMcpToolsRead(RpcRequest request) {
+        try {
+            String revision = requiredIdentifier(request.params(), "mcpRevision", "mcp_");
+            McpServerDefinition definition = mcpServers.get(revision);
+            McpProbeSnapshot snapshot = mcpProbeSnapshots.get(revision);
+            if (definition == null || !definition.enabled() || snapshot == null) {
+                throw new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
+            }
+            ObjectNode result = JsonNodes.object();
+            result.put("mcpRevision", revision);
+            var tools = JsonNodes.array();
+            snapshot.tools().forEach(tool -> tools.add(tool.deepCopy()));
+            result.set("tools", tools);
+            sendResponse(RpcResponse.success(request, result));
+        } catch (ProtocolException exception) {
+            sendFailure(request, exception);
+        } catch (RuntimeException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE));
+        }
+    }
+
+    /** Schedules one blocking official SDK probe without creating another executor or registry. */
+    private void submitMcpProbe(McpProbeAttempt attempt, RpcResponse secretResponse) {
+        try {
+            activationLane.execute(() -> runMcpProbe(attempt, secretResponse));
+        } catch (RejectedExecutionException exception) {
+            finishMcpProbeFailure(attempt, new ProtocolException(JaErrorCode.SHUTTING_DOWN));
+        }
+    }
+
+    /**
+     * Runs initialize/tools-list through McpRuntime and closes that short-lived
+     * official client before projecting the result back on the control lane.
+     */
+    private void runMcpProbe(McpProbeAttempt attempt, RpcResponse secretResponse) {
+        try {
+            if (stopping.get()) {
+                throw new ProtocolException(JaErrorCode.SHUTTING_DOWN);
+            }
+            String secret = attempt.definition().requiresSecret()
+                    ? mcpSecretValue(secretResponse) : null;
+            McpRuntime.ProbeResult probe;
+            List<ObjectNode> tools;
+            String marker = "secret-ref://" + attempt.definition().credentialRef();
+            try (McpRuntime runtime = new McpRuntime(reference -> marker.equals(reference)
+                            ? secret : failMcpSecretReference(),
+                    McpProcessPort.restricted(attempt.workspace().rootPath()), new Toolkit(),
+                    McpLimits.DEFAULT)) {
+                // The wire name is a display label and may contain spaces; the upstream Harness
+                // config requires a short transport identifier. B1b probes one isolated client,
+                // so a private stable name avoids a second naming/namespace policy.
+                probe = runtime.probe("probe",
+                        attempt.definition().toConfig(),
+                        attempt.definition().protocolVersion());
+                if (probe.state() != McpRuntime.State.READY || probe.protocolVersion() == null) {
+                    throw new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
+                }
+                tools = McpWireMapper.toolProjections(attempt.definition().revision(), probe.tools());
+            }
+            enqueueControl(() -> completeMcpProbe(attempt, probe, tools), null);
+        } catch (ProtocolException exception) {
+            enqueueControl(() -> finishMcpProbeFailure(attempt, exception), null);
+        } catch (RuntimeException exception) {
+            enqueueControl(() -> finishMcpProbeFailure(attempt,
+                    new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE)), null);
+        }
+    }
+
+    /** Installs a successful projection only after the generation and auth profile are rechecked. */
+    private void completeMcpProbe(McpProbeAttempt attempt, McpRuntime.ProbeResult probe,
+                                  List<ObjectNode> tools) {
+        if (activeMcpProbe.get() != attempt) {
+            return;
+        }
+        try {
+            if (stopping.get()) {
+                return;
+            }
+            ensureMcpAttemptCurrent(attempt);
+            mcpProbeSnapshots.put(attempt.definition().revision(),
+                    new McpProbeSnapshot(attempt.definition().revision(), probe.protocolVersion(),
+                            tools));
+            ObjectNode result = JsonNodes.object();
+            result.put("mcpRevision", attempt.definition().revision());
+            result.put("status", "healthy");
+            result.put("protocolVersion", probe.protocolVersion());
+            result.put("toolCount", tools.size());
+            sendResponse(RpcResponse.success(attempt.request(), result));
+        } catch (ProtocolException exception) {
+            if (!stopping.get()) {
+                sendFailure(attempt.request(), exception);
+            }
+        } catch (RuntimeException exception) {
+            if (!stopping.get()) {
+                sendFailure(attempt.request(),
+                        new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE));
+            }
+        } finally {
+            activeMcpProbe.compareAndSet(attempt, null);
+        }
+    }
+
+    /** Completes one failed probe on the control lane so timeout/success cannot both answer. */
+    private void finishMcpProbeFailure(McpProbeAttempt attempt, ProtocolException failure) {
+        if (!activeMcpProbe.compareAndSet(attempt, null) || stopping.get()) {
+            return;
+        }
+        sendFailure(attempt.request(), failure);
+    }
+
+    /** Rejects an unexpected secret marker without retaining or echoing its value. */
+    private static String failMcpSecretReference() {
+        throw new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
+    }
+
+    /** Rejects a delayed result after its definition or credential profile changed. */
+    private void ensureMcpAttemptCurrent(McpProbeAttempt attempt) {
+        McpServerDefinition current = mcpServers.get(attempt.definition().revision());
+        if (current == null || !current.equals(attempt.definition()) || !current.enabled()) {
+            throw new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
+        }
+        WorkspaceBinding currentWorkspace = workspaceBinding;
+        if (currentWorkspace == null || !currentWorkspace.equals(attempt.workspace())) {
+            throw new ProtocolException(JaErrorCode.INVALID_STATE);
+        }
+        if (attempt.profileRevision() != null) {
+            SavedProfile profile = savedProfile;
+            if (profile == null || !attempt.profileRevision().equals(profile.wireRevision())
+                    || !profile.mcpRevisions().contains(attempt.definition().revision())) {
+                throw new ProtocolException(JaErrorCode.CONFLICT);
+            }
+        }
+    }
+
+    /** Validates the purpose-bound profile association before requesting a secret from Rust. */
+    private String mcpProfileRevision(ObjectNode params, McpServerDefinition definition) {
+        SavedProfile profile = savedProfile;
+        if (profile == null) {
+            throw new ProtocolException(JaErrorCode.CONFLICT);
+        }
+        String requested = params.has("profileRevision")
+                ? requiredIdentifier(params, "profileRevision", "profile_") : profile.wireRevision();
+        if (!requested.equals(profile.wireRevision())
+                || !profile.mcpRevisions().contains(definition.revision())) {
+            throw new ProtocolException(JaErrorCode.CONFLICT);
+        }
+        return requested;
+    }
+
+    /** Builds the exact MCP secret request shape and keeps the value out of all ordinary state. */
+    private static ObjectNode mcpSecretResolveParams(McpServerDefinition definition,
+                                                     String profileRevision) {
+        ObjectNode params = JsonNodes.object();
+        params.put("credentialRef", definition.credentialRef());
+        params.put("purpose", "mcp");
+        params.put("profileRevision", profileRevision);
+        params.put("mcpRevision", definition.revision());
+        return params;
+    }
+
+    /** Maps any malformed, denied, or late secret result to the frozen MCP unavailable error. */
+    private static String mcpSecretValue(RpcResponse response) {
+        if (response == null || response.error() != null || response.result() == null) {
+            throw new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
+        }
+        JsonNode value = response.result().get("secretValue");
+        if (value == null || !value.isTextual() || value.textValue().isEmpty()) {
+            throw new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
+        }
+        return value.textValue();
+    }
+
+    /** Bounds the MCP secret round-trip and classifies late responses as ignored by the registry. */
+    private void scheduleMcpSecretDeadline(McpProbeAttempt attempt, String requestId) {
+        CompletableFuture.delayedExecutor(SECRET_RESOLVE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                .execute(() -> {
+                    if (!pendingRequests.deadline(requestId)) {
+                        return;
+                    }
+                    enqueueControl(() -> finishMcpProbeFailure(attempt,
+                            new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE)), null);
+                });
+    }
+
+    /** Projects one summary without claiming health before a real initialize/tools-list probe. */
+    private ObjectNode mcpSummary(McpServerDefinition server) {
+        ObjectNode summary = McpWireMapper.summary(server);
+        McpProbeSnapshot snapshot = mcpProbeSnapshots.get(server.revision());
+        if (server.enabled() && snapshot != null) {
+            summary.put("status", "healthy");
+            summary.put("toolCount", snapshot.tools().size());
+        }
+        return summary;
     }
 
     /**
@@ -1095,6 +1386,7 @@ public final class StdioRuntime implements AutoCloseable {
         // late Rust response cannot revive an AgentScope tool during shutdown.
         pendingRequests.closeForRotation();
         activationInProgress.set(false);
+        activeMcpProbe.set(null);
         TurnRuntime runtime = activeTurnRuntime.get();
         if (runtime != null) {
             runtime.stopAccepting();
@@ -1196,13 +1488,14 @@ public final class StdioRuntime implements AutoCloseable {
     private static Capabilities capabilities() {
         List<String> methods = List.of("initialize", "version", "capabilities/read", "health/read", "shutdown",
                 "workspace/open", "profile/save", "profile/activate", "skill/list", "mcp/list",
-                "mcp/save", "mcp/delete", "turn/start");
+                "mcp/save", "mcp/delete", "mcp/test", "mcp/tools/read", "turn/start");
         return new Capabilities(methods,
                 List.of("runtime/statusChanged", "turn/started", "item/started", "item/delta",
                         "item/completed", "turn/completed"),
                 List.of("read_only", "workspace", "full_access"),
                 List.of("user_message", "agent_message", "commentary", "tool_call", "command", "file_change", "approval"),
-                McpCapabilities.empty());
+                new McpCapabilities(List.of("2024-11-05", "2025-03-26", "2025-06-18"),
+                        List.of("stdio", "streamable_http"), List.of("tools_list")));
     }
 
     /** Serializes the shared immutable capability offer without another mapper. */
@@ -1235,6 +1528,20 @@ public final class StdioRuntime implements AutoCloseable {
     /** Carries one activation request across the asynchronous secret/model construction lane. */
     private record ActivationAttempt(RpcRequest request, SavedProfile profile,
                                      WorkspaceBinding workspace, Path dataDirectory) {
+    }
+
+    /** Captures the exact definition/workspace/profile checked before a probe can publish. */
+    private record McpProbeAttempt(RpcRequest request, McpServerDefinition definition,
+                                   WorkspaceBinding workspace, String profileRevision) {
+    }
+
+    /** Immutable last-success projection; callers receive deep copies of its mutable JSON nodes. */
+    private record McpProbeSnapshot(String revision, String protocolVersion,
+                                    List<ObjectNode> tools) {
+        private McpProbeSnapshot {
+            tools = tools == null ? List.of()
+                    : List.copyOf(tools.stream().map(ObjectNode::deepCopy).toList());
+        }
     }
 
     /**

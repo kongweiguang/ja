@@ -913,7 +913,7 @@ def run_java(property_path: Path, digest: str, classification_digest: str, temp:
         [tool("mvn"), "-B", "-ntp", "-f", str(pom_file), "clean", "verify"],
         ROOT,
     )
-    require_marker("java-build", build_result.stdout + build_result.stderr, r"Tests run:\s*187, Failures:\s*0, Errors:\s*0")
+    require_marker("java-build", build_result.stdout + build_result.stderr, r"Tests run:\s*206, Failures:\s*0, Errors:\s*0")
     classpath_file = temp / "java-classpath.txt"
     run_command(
         "java-classpath",

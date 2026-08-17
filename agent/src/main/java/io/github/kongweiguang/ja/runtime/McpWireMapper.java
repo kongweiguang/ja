@@ -4,8 +4,11 @@
 package io.github.kongweiguang.ja.runtime;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.agentscope.core.tool.mcp.McpTool;
+import io.modelcontextprotocol.spec.McpSchema;
 import io.github.kongweiguang.ja.mcp.McpServerDefinition;
 import io.github.kongweiguang.ja.protocol.JaErrorCode;
 import io.github.kongweiguang.ja.protocol.JsonNodes;
@@ -26,6 +29,7 @@ import java.util.Set;
  * path from growing a second MCP configuration model.</p>
  */
 final class McpWireMapper {
+    private static final ObjectMapper JSON = new ObjectMapper();
     private static final Set<String> SERVER_FIELDS = Set.of(
             "mcpRevision", "name", "transport", "endpoint", "protocolVersion",
             "args", "env", "headers", "queryParams", "auth", "credentialRef", "enabled");
@@ -103,6 +107,54 @@ final class McpWireMapper {
         result.put("status", server.enabled() ? "unavailable" : "disabled");
         result.put("toolCount", 0);
         return result;
+    }
+
+    /**
+     * Projects only the frozen tool metadata needed by settings. AgentScope's
+     * schema converter remains authoritative for required/properties/$defs;
+     * this adapter deliberately drops provider title/meta/output hints and
+     * fixes policy to ask because B1b does not activate MCP tools.
+     */
+    static List<ObjectNode> toolProjections(String mcpRevision, List<McpSchema.Tool> tools) {
+        if (mcpRevision == null || mcpRevision.isBlank()) {
+            throw new IllegalArgumentException("mcp_tool_schema_invalid");
+        }
+        if (tools == null) {
+            throw new IllegalArgumentException("mcp_tool_schema_invalid");
+        }
+        List<ObjectNode> result = new ArrayList<>();
+        Set<String> rawNames = new java.util.HashSet<>();
+        Set<String> exposedNames = new java.util.HashSet<>();
+        for (McpSchema.Tool tool : tools) {
+            if (tool == null || tool.name() == null || tool.name().isBlank()
+                    || tool.inputSchema() == null) {
+                throw new IllegalArgumentException("mcp_tool_schema_invalid");
+            }
+            String rawName = tool.name();
+            String exposedName = "mcp:" + mcpRevision + "/" + rawName;
+            if (!rawNames.add(rawName) || !exposedNames.add(exposedName)) {
+                throw new IllegalArgumentException("mcp_tool_schema_invalid");
+            }
+            if (tool.description() != null
+                    && tool.description().codePointCount(0, tool.description().length()) > 4096) {
+                throw new IllegalArgumentException("mcp_tool_schema_too_large");
+            }
+            Map<String, Object> parameters = McpTool.convertMcpSchemaToParameters(
+                    tool.inputSchema(), Set.of());
+            JsonNode inputSchema = JSON.valueToTree(parameters);
+            if (inputSchema == null || !inputSchema.isObject()) {
+                throw new IllegalArgumentException("mcp_tool_schema_invalid");
+            }
+            ObjectNode projection = JsonNodes.object();
+            projection.put("name", exposedName);
+            if (tool.description() != null && !tool.description().isBlank()) {
+                projection.put("description", tool.description());
+            }
+            projection.set("inputSchema", inputSchema);
+            projection.put("policy", "ask");
+            result.add(projection);
+        }
+        return List.copyOf(result);
     }
 
     /** Converts one auth value without ever creating a secret-ref:// marker. */
