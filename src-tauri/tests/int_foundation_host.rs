@@ -254,15 +254,15 @@ fn join_with_deadline<T: Send + 'static>(
 }
 
 fn valid_turn(text: &str) -> TurnStartInput {
+    // Keep this fixture aligned with the public ja-rpc/v1 DTO so the host test
+    // catches contract drift instead of silently accepting legacy aliases.
     TurnStartInput {
         thread_id: "thr_host".to_owned(),
-        mode: "workspace".to_owned(),
-        permission_mode: "ask".to_owned(),
+        access_mode: "workspace".to_owned(),
         profile_revision: "profile_host".to_owned(),
         input: vec![TurnInputPart {
             kind: "text".to_owned(),
             text: Some(text.to_owned()),
-            attachment_id: None,
         }],
     }
 }
@@ -430,8 +430,7 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
             serde_json::json!({
                 "input": {
                     "threadId": "thr_host",
-                    "mode": "workspace",
-                    "permissionMode": "ask",
+                    "accessMode": "workspace",
                     "profileRevision": "profile_host",
                     "input": [{"type": "text", "text": "hello from Tauri mock command"}]
                 }

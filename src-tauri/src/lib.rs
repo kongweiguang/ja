@@ -3,12 +3,15 @@
 
 pub mod agent_process;
 pub mod app_runtime;
+pub mod preview;
+pub mod settings;
+pub mod terminal;
 
 use app_runtime::{
     EventEmitError, EventSink, RPC_FRAME_EVENT, RuntimeHost, cleanup_on_exit, prepare_run_dir,
-    register_commands,
 };
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, RunEvent};
 
 // Keep a single composition root so plugins, managed state, and shutdown
@@ -19,6 +22,10 @@ pub fn run() {
         let resource_dir = app.path().resource_dir()?;
         let run_dir = prepare_run_dir(app.path().app_data_dir()?.join("runtime"))?;
         let config = debug_or_bundled_launch_config(resource_dir, run_dir)?;
+        let settings_root = app.path().app_data_dir()?.join("settings");
+        let settings = settings::SettingsCommandHost::new(settings_root).map_err(|error| {
+            tauri::Error::Setup((Box::new(error) as Box<dyn std::error::Error>).into())
+        })?;
         let app_handle = app.handle().clone();
         let sink: EventSink = Arc::new(move |payload| {
             app_handle
@@ -29,25 +36,95 @@ pub fn run() {
         // can render a typed recovery screen instead of failing setup before
         // Tauri creates any UI surface.
         app.manage(RuntimeHost::new(config, sink));
+        // These managed hosts are the sole owners of PTY, preview model and
+        // settings resources; no command constructs a competing singleton.
+        app.manage(terminal::TerminalCommandHost::new());
+        app.manage(preview::PreviewCommandHost::default());
+        app.manage(settings);
         Ok(())
     });
-    let app = register_commands(builder)
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+    let app = builder
+        .invoke_handler(tauri::generate_handler![
+            app_runtime::ja_runtime_start,
+            app_runtime::ja_runtime_stop,
+            app_runtime::ja_runtime_state,
+            app_runtime::ja_runtime_recovery_state,
+            app_runtime::ja_runtime_acknowledge_recovery,
+            app_runtime::ja_turn_start,
+            terminal::commands::ja_terminal_configure,
+            terminal::commands::ja_terminal_open,
+            terminal::commands::ja_terminal_input,
+            terminal::commands::ja_terminal_resize,
+            terminal::commands::ja_terminal_poll,
+            terminal::commands::ja_terminal_scrollback,
+            terminal::commands::ja_terminal_close,
+            preview::commands::ja_preview_open,
+            preview::commands::ja_preview_navigate,
+            preview::commands::ja_preview_close,
+            preview::commands::ja_preview_events,
+            preview::commands::ja_preview_state,
+            settings::commands::ja_settings_load,
+            settings::commands::ja_settings_save,
+            settings::commands::ja_settings_set_credential,
+            settings::commands::ja_settings_delete_credential
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
     app.run(|app_handle, event| match event {
         RunEvent::ExitRequested { api, .. } => {
-            let host = app_handle.state::<RuntimeHost>();
-            handle_exit_requested(&host, &api);
+            handle_full_exit_requested(app_handle, &api);
         }
         RunEvent::Exit => {
             let host = app_handle.state::<RuntimeHost>();
-            if !host.exit_ready() {
+            let terminal = app_handle.state::<terminal::TerminalCommandHost>();
+            let preview = app_handle.state::<preview::PreviewCommandHost>();
+            let preview_empty = preview.manager().active_count().unwrap_or(usize::MAX) == 0;
+            if !host.exit_ready() || !terminal.is_empty() || !preview_empty {
                 host.record_forced_exit();
                 tracing::error!("runtime Exit reached before cleanup confirmation");
             }
         }
         _ => {}
     });
+}
+
+/// Closes all owned Rust resources before allowing the native event loop to
+/// exit; a failed cleanup keeps the app alive for a retry.
+fn handle_full_exit_requested<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    api: &tauri::ExitRequestApi,
+) {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(10));
+    let runtime = app_handle.state::<RuntimeHost>();
+    let terminal = app_handle.state::<terminal::TerminalCommandHost>();
+    let preview = app_handle.state::<preview::PreviewCommandHost>();
+    let terminal_result = terminal.shutdown_until(deadline);
+    let preview_result = preview.shutdown();
+    close_preview_windows(app_handle);
+    let runtime_result = cleanup_on_exit(&runtime);
+    if terminal_result.is_err() || preview_result.is_err() || runtime_result.is_err() {
+        tracing::error!("application cleanup did not complete before exit deadline");
+        api.prevent_exit();
+    }
+}
+
+/// Releases every child WebView whose label is owned by the preview command
+/// adapter, while leaving the main window lifecycle to Tauri.
+fn close_preview_windows<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
+    for (label, window) in app_handle.webview_windows() {
+        if label.starts_with("preview_") {
+            let _ = window.close();
+        }
+    }
 }
 
 /// Applies the same cleanup/prevent policy in production and MockRuntime

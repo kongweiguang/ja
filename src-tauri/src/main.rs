@@ -5,8 +5,8 @@
 // second console, while debug builds retain a console for local diagnostics.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-/// Delegates composition to the library so Tauri has one native entrypoint
-/// across desktop targets and future mobile-specific launch attributes.
+/// Delegates normal composition to the library so Tauri has one native
+/// entrypoint across desktop targets and future mobile-specific attributes.
 fn main() {
     ja_lib::run()
 }

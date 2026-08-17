@@ -59,6 +59,16 @@ sha2 = "=0.11.0"
 bytes = "=1.12.1"
 tokio = { version = "=1.53.1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["codec", "io-util"] }
+# Keep PTY ownership in a mature cross-platform implementation so terminal
+# sessions share ConPTY on Windows and Unix PTYs on macOS without custom FFI.
+portable-pty = { version = "=0.9.0", default-features = false }
+
+# Enforce one desktop instance without enabling deep-link integration, which
+# is outside the preview release scope and would widen the capability surface.
+tauri-plugin-single-instance = { version = "=2.4.3", default-features = false }
+# Persist provider credentials in the native Apple/Windows stores; the 3.x
+# feature names avoid keyring's Linux secret-service backends entirely.
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native"] }
 
 # Tracing is sent to stderr/files by the host and never to stdout, because
 # stdout is reserved for the full-duplex JSONL protocol.
