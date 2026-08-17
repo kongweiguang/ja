@@ -19,7 +19,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
@@ -40,7 +39,6 @@ class CapabilityProbeCacheTest {
     /** Times out a transport that cooperatively checks the absolute deadline and leaves no cache entry. */
     @Test
     void blockingTransportTimesOutAndClosesWorkers() throws Exception {
-        AtomicBoolean interrupted = new AtomicBoolean();
         CapabilityProbeTransport blocking = new CapabilityProbeTransport() {
             @Override public CapabilitySet probe(ModelProfile ignored, CapabilityProbeContext context) {
                 try {
@@ -49,7 +47,6 @@ class CapabilityProbeCacheTest {
                         Thread.sleep(10);
                     }
                 } catch (InterruptedException exception) {
-                    interrupted.set(true);
                     Thread.currentThread().interrupt();
                     throw new CancellationException("cancelled");
                 }
@@ -60,7 +57,10 @@ class CapabilityProbeCacheTest {
             assertEquals(CapabilityProbeStatus.TIMEOUT, result.status());
             assertEquals(CapabilityProbeFailureCode.TIMEOUT, result.failureCode());
             assertTrue(result.capabilities().supported().isEmpty());
-            assertTrue(interrupted.get());
+            // A Future may be cancelled before its worker reaches Thread.sleep; the contract is
+            // bounded cancellation and cleanup, not a promise that the provider observes interrupt.
+            assertEquals(0, cache.inFlightSize());
+            assertEquals(0, cache.size());
         }
         assertNoProbeThreads();
     }
