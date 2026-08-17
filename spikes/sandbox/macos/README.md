@@ -113,10 +113,11 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   launcher reap 与错误 finalizer 全部共享它；临近 deadline 时不再删除 marker/evidence，最终 report 也可能来不及
   写入，但已有 primary/fallback/emergency 或 fixture failure evidence 会保留供恢复。
   fixture failure evidence 也只通过已校验的 owner-private root fd 写入：先以
-  `O_EXCL|O_NOFOLLOW|0600` 创建 recovery 与 pending sibling，完整写入并 fsync，校验内容、
+  `O_EXCL|O_NOFOLLOW|0600` 创建 recovery 与 pending sibling，完整写入并 fsync，显式 close（close
+  失败也 fail-closed），校验内容、
   mode、uid、nlink 后原子 `renameatx_np(RENAME_EXCL)` 发布 final，再 fsync 同一目录；
   目标已存在时不会覆盖 good final。write、file fsync、
-  rename 或目录 fsync 失败都保留可解析 sibling；重启时优先保留既有 good final，或从
+  writer/readback close、rename 或目录 fsync 失败都保留可解析 sibling；重启时优先保留既有 good final，或从
   pending/recovery 原子恢复 final，绝不覆盖 good final 或删除最后一份证据。
   每份 evidence 必须是完整的 version-2 固定 14 行 grammar：version、允许的 category、
   supervisor 的 state/pid/pgid/uid/comm/start，以及 target 的同一组字段，字段顺序固定且

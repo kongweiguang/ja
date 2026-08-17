@@ -1779,6 +1779,8 @@ const FIXTURE_FAILURE_EVIDENCE_BYTES: usize = 4096;
 enum FixtureEvidenceFault {
     Write,
     FileSync,
+    WriterClose,
+    ReadbackClose,
     Rename,
     DirectorySync,
 }
@@ -2015,6 +2017,14 @@ fn write_fixture_failure_evidence_transaction(
         faults,
     );
     if recovery_result.is_err() || pending_result.is_err() {
+        // A failed first copy can leave the second copy complete.  Sync the
+        // parent before returning so a restart after a write/close/readback
+        // fault can still discover that complete directory entry; no copy is
+        // removed on this fail-closed path.
+        if Instant::now() >= deadline || faults.fail_once(FixtureEvidenceFault::DirectorySync) {
+            return Err("fixture-failure-evidence");
+        }
+        fd::sync_directory(&root_directory).map_err(|_| "fixture-failure-evidence")?;
         return Err("fixture-failure-evidence");
     }
     if Instant::now() >= deadline {
@@ -2043,6 +2053,7 @@ fn write_fixture_failure_evidence_transaction(
         FIXTURE_FAILURE_EVIDENCE.as_bytes(),
         Some(contents),
         deadline,
+        faults,
     )? {
         Some(true) => Ok(()),
         Some(false) | None => Err("fixture-failure-evidence"),
@@ -2302,6 +2313,7 @@ fn read_fixture_evidence_copy(
     name: &[u8],
     expected: Option<&str>,
     deadline: Instant,
+    faults: &mut FixtureEvidenceFaultPlan,
 ) -> Result<Option<bool>, &'static str> {
     if Instant::now() >= deadline {
         return Err("fixture-failure-evidence");
@@ -2310,30 +2322,39 @@ fn read_fixture_evidence_copy(
         return Ok(None);
     }
     fd::fstatat_no_follow(root_fd, name).map_err(|_| "fixture-failure-evidence")?;
-    let file = fd::open_at_file(root_fd, name).map_err(|_| "fixture-failure-evidence")?;
-    let metadata = file.metadata().map_err(|_| "fixture-failure-evidence")?;
-    if !metadata.file_type().is_file()
-        || metadata.uid() != current_uid()
-        || metadata.nlink() != 1
-        || metadata.permissions().mode() & 0o777 != MARKER_MODE
-    {
-        return Err("fixture-failure-evidence");
-    }
-    let mut bytes = Vec::new();
-    file.take((FIXTURE_FAILURE_EVIDENCE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "fixture-failure-evidence")?;
-    if bytes.is_empty() || bytes.len() > FIXTURE_FAILURE_EVIDENCE_BYTES || !bytes.is_ascii() {
-        return Err("fixture-failure-evidence");
-    }
-    let valid = validate_fixture_failure_evidence(&bytes).is_ok();
-    if let Some(expected) = expected {
-        if !valid || bytes != expected.as_bytes() {
+    let mut file = fd::open_at_file(root_fd, name).map_err(|_| "fixture-failure-evidence")?;
+    let read_result: Result<Option<bool>, &'static str> = (|| {
+        let metadata = file.metadata().map_err(|_| "fixture-failure-evidence")?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != current_uid()
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() & 0o777 != MARKER_MODE
+        {
             return Err("fixture-failure-evidence");
         }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take((FIXTURE_FAILURE_EVIDENCE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "fixture-failure-evidence")?;
+        if bytes.is_empty() || bytes.len() > FIXTURE_FAILURE_EVIDENCE_BYTES || !bytes.is_ascii() {
+            return Err("fixture-failure-evidence");
+        }
+        let valid = validate_fixture_failure_evidence(&bytes).is_ok();
+        if let Some(expected) = expected {
+            if !valid || bytes != expected.as_bytes() {
+                return Err("fixture-failure-evidence");
+            }
+        }
+        fd::fstatat_no_follow(root_fd, name).map_err(|_| "fixture-failure-evidence")?;
+        Ok(Some(valid))
+    })();
+    let close_result =
+        close_fixture_evidence_file(file, faults, FixtureEvidenceFault::ReadbackClose);
+    match (read_result, close_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        _ => Err("fixture-failure-evidence"),
     }
-    fd::fstatat_no_follow(root_fd, name).map_err(|_| "fixture-failure-evidence")?;
-    Ok(Some(valid))
 }
 
 /// Recover an already durable final/pending/recovery copy after a crash;
@@ -2346,8 +2367,13 @@ fn recover_existing_fixture_evidence(
     faults: &mut FixtureEvidenceFaultPlan,
 ) -> Result<bool, &'static str> {
     let mut invalid_final = false;
-    match read_fixture_evidence_copy(root_fd, FIXTURE_FAILURE_EVIDENCE.as_bytes(), None, deadline)?
-    {
+    match read_fixture_evidence_copy(
+        root_fd,
+        FIXTURE_FAILURE_EVIDENCE.as_bytes(),
+        None,
+        deadline,
+        faults,
+    )? {
         Some(true) => return Ok(true),
         Some(false) => {
             quarantine_invalid_fixture_evidence(root_directory, root_fd, deadline, faults)?;
@@ -2359,7 +2385,7 @@ fn recover_existing_fixture_evidence(
         FIXTURE_FAILURE_PENDING.as_bytes(),
         FIXTURE_FAILURE_RECOVERY.as_bytes(),
     ] {
-        if read_fixture_evidence_copy(root_fd, candidate, None, deadline)? == Some(true) {
+        if read_fixture_evidence_copy(root_fd, candidate, None, deadline, faults)? == Some(true) {
             if Instant::now() >= deadline || faults.fail_once(FixtureEvidenceFault::Rename) {
                 return Err("fixture-failure-evidence");
             }
@@ -2437,9 +2463,25 @@ fn validate_fixture_evidence_entry(
     fd::fstatat_no_follow(root_fd, name).map_err(|_| "fixture-failure-evidence")
 }
 
+/// Close an evidence descriptor through the explicit libc path and preserve the
+/// transaction's fail-closed result when either the real close or its injected
+/// fault seam reports failure; `File::drop` must never hide this boundary.
+fn close_fixture_evidence_file(
+    file: File,
+    faults: &mut FixtureEvidenceFaultPlan,
+    phase: FixtureEvidenceFault,
+) -> Result<(), &'static str> {
+    let injected = faults.fail_once(phase);
+    let closed = fd::close_file(file).is_ok();
+    if injected && closed {
+        return Err("fixture-failure-evidence");
+    }
+    closed.then_some(()).ok_or("fixture-failure-evidence")
+}
+
 /// Create and durably validate one complete sibling copy.  A simulated write
-/// fault leaves the first copy partial but still permits the second copy to
-/// become the recoverable full image.
+/// or explicit-close fault leaves the first copy partial/failed but still
+/// permits the second copy to become the recoverable full image.
 fn write_fixture_evidence_copy(
     root_fd: std::os::fd::RawFd,
     name: &[u8],
@@ -2452,26 +2494,34 @@ fn write_fixture_evidence_copy(
     }
     let mut file =
         fd::create_at_file(root_fd, name, MARKER_MODE).map_err(|_| "fixture-failure-evidence")?;
-    let metadata = file.metadata().map_err(|_| "fixture-failure-evidence")?;
-    if !metadata.file_type().is_file()
-        || metadata.uid() != current_uid()
-        || metadata.nlink() != 1
-        || metadata.permissions().mode() & 0o777 != MARKER_MODE
-    {
+    let write_result: Result<(), &'static str> = (|| {
+        let metadata = file.metadata().map_err(|_| "fixture-failure-evidence")?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != current_uid()
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() & 0o777 != MARKER_MODE
+        {
+            return Err("fixture-failure-evidence");
+        }
+        if faults.fail_once(FixtureEvidenceFault::Write) {
+            let partial = contents.len().max(1) / 2;
+            file.write_all(&contents.as_bytes()[..partial])
+                .map_err(|_| "fixture-failure-evidence")?;
+            return Err("fixture-failure-evidence");
+        }
+        file.write_all(contents.as_bytes())
+            .map_err(|_| "fixture-failure-evidence")?;
+        if faults.fail_once(FixtureEvidenceFault::FileSync) {
+            return Err("fixture-failure-evidence");
+        }
+        file.sync_all().map_err(|_| "fixture-failure-evidence")?;
+        Ok(())
+    })();
+    let close_result = close_fixture_evidence_file(file, faults, FixtureEvidenceFault::WriterClose);
+    if write_result.is_err() || close_result.is_err() {
         return Err("fixture-failure-evidence");
     }
-    if faults.fail_once(FixtureEvidenceFault::Write) {
-        let partial = contents.len().max(1) / 2;
-        let _ = file.write_all(&contents.as_bytes()[..partial]);
-        return Err("fixture-failure-evidence");
-    }
-    file.write_all(contents.as_bytes())
-        .map_err(|_| "fixture-failure-evidence")?;
-    if faults.fail_once(FixtureEvidenceFault::FileSync) {
-        return Err("fixture-failure-evidence");
-    }
-    file.sync_all().map_err(|_| "fixture-failure-evidence")?;
-    if read_fixture_evidence_copy(root_fd, name, Some(contents), deadline)? != Some(true) {
+    if read_fixture_evidence_copy(root_fd, name, Some(contents), deadline, faults)? != Some(true) {
         return Err("fixture-failure-evidence");
     }
     Ok(())
@@ -4100,10 +4150,15 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
     /// discoverable instead of silently losing provisional target evidence.
     #[test]
     fn fixture_evidence_faults_recover_after_restart() {
-        let contents = "fixture-failure-version=2\ncategory=fixture-helper-query\nsupervisor-state=unavailable\nsupervisor-pid=42\nsupervisor-pgid=43\nsupervisor-uid=unknown\nsupervisor-comm=redacted\nsupervisor-start=redacted\ntarget-state=provisional\ntarget-pid=44\ntarget-pgid=45\ntarget-uid=unknown\ntarget-comm=redacted\ntarget-start=redacted\n";
+        // The supervisor PID/PGID are retained as a provisional identity when
+        // its full query fails; `unavailable` would forbid the known PGID and
+        // reject the fixture before any filesystem fault is exercised.
+        let contents = "fixture-failure-version=2\ncategory=fixture-helper-query\nsupervisor-state=provisional\nsupervisor-pid=42\nsupervisor-pgid=43\nsupervisor-uid=unknown\nsupervisor-comm=redacted\nsupervisor-start=redacted\ntarget-state=provisional\ntarget-pid=44\ntarget-pgid=45\ntarget-uid=unknown\ntarget-comm=redacted\ntarget-start=redacted\n";
         for fault in [
             FixtureEvidenceFault::Write,
             FixtureEvidenceFault::FileSync,
+            FixtureEvidenceFault::WriterClose,
+            FixtureEvidenceFault::ReadbackClose,
             FixtureEvidenceFault::Rename,
             FixtureEvidenceFault::DirectorySync,
         ] {
