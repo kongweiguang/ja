@@ -7,7 +7,6 @@
         <target>System.err</target>
         <encoder>
             <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
-            <charset>UTF-8</charset>
         </encoder>
     </appender>
 

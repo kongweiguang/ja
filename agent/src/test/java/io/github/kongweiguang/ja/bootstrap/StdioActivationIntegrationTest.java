@@ -30,6 +30,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -38,6 +39,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertTimeout;
 
@@ -45,6 +47,50 @@ import static org.junit.jupiter.api.Assertions.assertTimeout;
 final class StdioActivationIntegrationTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String READY_TOKEN = "0123456789abcdef0123456789abcdef";
+
+    /** Verifies that the ASCII transport preserves Unicode paths and accepts both argv shapes. */
+    @Test
+    void decodesUnicodeDataDirectoryFromBase64Argv() {
+        String value = "数据 目录 🚀x";
+        String encoded = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(value.getBytes(StandardCharsets.UTF_8));
+        Path expected = Path.of(value).toAbsolutePath().normalize();
+
+        assertFalse(encoded.endsWith("="));
+        assertEquals(expected, SidecarConfiguration.fromArgs(
+                new String[]{"--data-dir-base64=" + encoded}).dataDirectory());
+        assertEquals(expected, SidecarConfiguration.fromArgs(
+                new String[]{"--data-dir-base64", encoded}).dataDirectory());
+    }
+
+    /** Verifies malformed transport and byte sequences fail before Path construction. */
+    @Test
+    void rejectsMalformedBase64AndUtf8DataDirectories() {
+        assertThrows(IllegalArgumentException.class, () -> SidecarConfiguration.fromArgs(
+                new String[]{"--data-dir-base64=not?base64"}));
+
+        String invalidUtf8 = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(new byte[]{(byte) 0xc3, 0x28});
+        assertThrows(IllegalArgumentException.class, () -> SidecarConfiguration.fromArgs(
+                new String[]{"--data-dir-base64=" + invalidUtf8}));
+
+        assertThrows(IllegalArgumentException.class, () -> SidecarConfiguration.fromArgs(
+                new String[]{"--data-dir-base64="}));
+        assertThrows(IllegalArgumentException.class, () -> SidecarConfiguration.fromArgs(
+                new String[]{"--data-dir-base64", "   "}));
+    }
+
+    /** Verifies the legacy plain-path flag remains source-compatible for launchers. */
+    @Test
+    void keepsLegacyDataDirectoryArg() {
+        String value = "legacy 数据 目录";
+        Path expected = Path.of(value).toAbsolutePath().normalize();
+
+        assertEquals(expected, SidecarConfiguration.fromArgs(
+                new String[]{"--data-dir=" + value}).dataDirectory());
+        assertEquals(expected, SidecarConfiguration.fromArgs(
+                new String[]{"--data-dir", value}).dataDirectory());
+    }
 
     /**
      * Uses a fake provider model only at the model seam; workspace/profile/activation and the turn

@@ -22,12 +22,17 @@ import io.agentscope.harness.agent.skill.SkillResources;
 import io.agentscope.harness.agent.skill.WorkspaceSkillRepository;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.EnumMap;
@@ -49,6 +54,9 @@ import java.util.Set;
  */
 public final class JaSkillSources implements AutoCloseable {
     private static final ObjectMapper JSON = new ObjectMapper();
+    private static final String BUILTIN_SKILL_NAME = "coding";
+    private static final String BUILTIN_SKILL_RESOURCE = "/skills/coding/SKILL.md";
+    private static final int MAX_BUILTIN_SKILL_BYTES = 1024 * 1024;
 
     /** Product source labels mirror the repository order consumed by Harness middleware. */
     public enum Source {
@@ -91,13 +99,14 @@ public final class JaSkillSources implements AutoCloseable {
     private boolean closed;
 
     /**
-     * Creates the built-in, user, and workspace mappings with upstream implementations. User
-     * files use non-lazy loading so resources are captured while an activation snapshot is made.
+     * Creates the built-in, user, and workspace mappings with upstream implementations. Built-in
+     * discovery stays on AgentScope's classpath repository and only materializes its exact resource
+     * when Native Image cannot provide the browsable directory URL.
      */
     public JaSkillSources(Path userSkillsRoot, Path workspaceRoot) throws IOException {
-        repositories.put(Source.BUILTIN, new ClasspathSkillRepository("skills", "builtin"));
-        if (userSkillsRoot != null) {
-            Path userRoot = ensureDirectory(userSkillsRoot, "user");
+        Path userRoot = userSkillsRoot == null ? null : ensureDirectory(userSkillsRoot, "user");
+        repositories.put(Source.BUILTIN, builtinRepository(userRoot));
+        if (userRoot != null) {
             repositories.put(Source.USER,
                     new FileSystemSkillRepository(userRoot, false, "user", false));
         }
@@ -106,6 +115,141 @@ public final class JaSkillSources implements AutoCloseable {
             LocalFilesystem filesystem = new LocalFilesystem(workspace);
             repositories.put(Source.WORKSPACE, new WorkspaceSkillRepository(
                     filesystem, "skills", RuntimeContext::empty, "workspace", false));
+        }
+    }
+
+    /**
+     * Probes the upstream classpath repository first; a Native Image resource can retain the
+     * individual SKILL.md bytes while losing the directory URL that AgentScope enumerates.
+     */
+    private static AgentSkillRepository builtinRepository(Path userRoot) throws IOException {
+        ClasspathSkillRepository classpath = null;
+        try {
+            classpath = new ClasspathSkillRepository("skills", "builtin");
+            boolean hasCoding = classpath.getAllSkills().stream()
+                    .anyMatch(skill -> skill != null && BUILTIN_SKILL_NAME.equals(skill.getName()));
+            if (hasCoding) {
+                return classpath;
+            }
+        } catch (Exception | LinkageError failure) {
+            // AgentScope wraps Native directory-list failures as RuntimeException; only this real
+            // classpath construction/enumeration boundary activates the byte-resource fallback.
+        }
+        closeQuietly(classpath);
+        return materializedBuiltinRepository(userRoot, readBuiltinResource());
+    }
+
+    /**
+     * Forces the production fallback for same-package tests without changing the classpath-first
+     * rule used by normal startup.
+     */
+    static AgentSkillRepository materializedBuiltinRepositoryForTest(Path userRoot)
+            throws IOException {
+        return materializedBuiltinRepository(userRoot, readBuiltinResource());
+    }
+
+    /** Reads the one built-in resource with a bounded stream; Markdown parsing remains upstream. */
+    private static byte[] readBuiltinResource() throws IOException {
+        try (InputStream input = JaSkillSources.class.getResourceAsStream(BUILTIN_SKILL_RESOURCE)) {
+            if (input == null) {
+                throw new IOException("builtin_skill_resource_missing");
+            }
+            byte[] content = input.readNBytes(MAX_BUILTIN_SKILL_BYTES + 1);
+            if (content.length == 0 || content.length > MAX_BUILTIN_SKILL_BYTES) {
+                throw new IOException("builtin_skill_size_invalid");
+            }
+            return content;
+        }
+    }
+
+    /**
+     * Publishes a content-addressed coding directory and delegates parsing/listing to AgentScope's
+     * read-only file repository. The sidecar is outside the user skill scan and workspace.
+     */
+    private static AgentSkillRepository materializedBuiltinRepository(Path userRoot, byte[] content)
+            throws IOException {
+        Path cacheRoot = builtinCacheRoot(userRoot);
+        Path versionRoot = cacheRoot.resolve(sha256(content));
+        Path skillRoot = versionRoot.resolve(BUILTIN_SKILL_NAME);
+        Files.createDirectories(skillRoot);
+        Path target = skillRoot.resolve("SKILL.md");
+        publishBuiltinFile(target, content);
+        return new FileSystemSkillRepository(versionRoot, false, "builtin", false);
+    }
+
+    /** Derives the stable sidecar path without adding a second settings or storage abstraction. */
+    private static Path builtinCacheRoot(Path userRoot) throws IOException {
+        if (userRoot != null) {
+            Path normalized = userRoot.toAbsolutePath().normalize();
+            Path parent = normalized.getParent();
+            Path name = normalized.getFileName();
+            if (parent == null || name == null) {
+                throw new IOException("builtin_skill_cache_root_invalid");
+            }
+            return parent.resolve("." + name + "-builtin");
+        }
+        String temporaryDirectory = System.getProperty("java.io.tmpdir");
+        if (temporaryDirectory == null || temporaryDirectory.isBlank()) {
+            throw new IOException("builtin_skill_temp_root_invalid");
+        }
+        return Path.of(temporaryDirectory).toAbsolutePath().normalize()
+                .resolve("ja-builtin-skills");
+    }
+
+    /**
+     * Writes through a same-directory temporary file, then verifies any pre-existing target by
+     * bounded byte equality instead of replacing it or implementing a second locking protocol.
+     */
+    private static void publishBuiltinFile(Path target, byte[] expected) throws IOException {
+        if (Files.exists(target)) {
+            verifyBuiltinFile(target, expected);
+            return;
+        }
+        Path temporary = Files.createTempFile(target.getParent(), ".SKILL.md-", ".tmp");
+        try {
+            Files.write(temporary, expected);
+            try {
+                Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException unsupported) {
+                try {
+                    Files.move(temporary, target);
+                } catch (FileAlreadyExistsException existing) {
+                    verifyBuiltinFile(target, expected);
+                }
+            } catch (FileAlreadyExistsException existing) {
+                verifyBuiltinFile(target, expected);
+            }
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
+    }
+
+    /** Validates a reused content-hash target without reading more than the bounded resource size. */
+    private static void verifyBuiltinFile(Path target, byte[] expected) throws IOException {
+        if (!Files.isRegularFile(target) || Files.size(target) != expected.length
+                || !Arrays.equals(Files.readAllBytes(target), expected)) {
+            throw new IOException("builtin_skill_cache_conflict");
+        }
+    }
+
+    /** Returns the lowercase content identity used for the immutable fallback directory. */
+    private static String sha256(byte[] content) throws IOException {
+        try {
+            return hex(MessageDigest.getInstance("SHA-256").digest(content));
+        } catch (NoSuchAlgorithmException exception) {
+            throw new IOException("sha256_unavailable", exception);
+        }
+    }
+
+    /** Closes a failed classpath probe without masking the fallback's own error. */
+    private static void closeQuietly(AgentSkillRepository repository) {
+        if (repository == null) {
+            return;
+        }
+        try {
+            repository.close();
+        } catch (RuntimeException ignored) {
+            // The fallback remains the authoritative result for the failed probe.
         }
     }
 

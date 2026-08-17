@@ -336,8 +336,14 @@
                         <configuration>
                             <imageName>${project.artifactId}</imageName>
                             <mainClass>${ja.main.class}</mainClass>
+                            <!-- Native Image must consume the normal classes directory; Solon repackage creates a boot jar whose BOOT-INF/classes layout is not a JVM classpath root. -->
+                            <classesDirectory>${project.build.outputDirectory}</classesDirectory>
                             <buildArgs>
                                 <buildArg>--no-fallback</buildArg>
+                                <!-- Keep Solon's Logback configuration in the PE so diagnostics stay off protocol stdout. -->
+                                <buildArg>-H:IncludeResources=.*logback.*</buildArg>
+                                <!-- Keep the built-in AgentScope coding skill available to the native classpath repository. -->
+                                <buildArg>-H:IncludeResources=.*skills.*</buildArg>
                             </buildArgs>
                             <!-- Use the vendor metadata repository; no project-local fake metadata is added. -->
                             <metadataRepository>

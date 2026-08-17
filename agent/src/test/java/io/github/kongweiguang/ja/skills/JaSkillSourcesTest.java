@@ -15,6 +15,7 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.skill.AgentSkill;
+import io.agentscope.core.skill.repository.AgentSkillRepository;
 import io.agentscope.core.tool.ToolCallParam;
 import io.agentscope.core.tool.Toolkit;
 import io.agentscope.harness.agent.middleware.HarnessSkillMiddleware;
@@ -61,6 +62,38 @@ class JaSkillSourcesTest {
             List<JaSkillSources.SkillView> second = sources.projection();
             assertTrue(second.stream().anyMatch(skill -> skill.name().equals("workspace-skill")
                     && skill.description().equals("updated summary")));
+        }
+    }
+
+    @Test
+    void materializedBuiltinFallbackUsesStableTempCacheWithoutUserRoot() throws Exception {
+        Path isolatedTemp = Files.createDirectories(tempDir.resolve("java-tmp"));
+        String previousTemp = System.getProperty("java.io.tmpdir");
+        System.setProperty("java.io.tmpdir", isolatedTemp.toString());
+        try {
+            Path cacheRoot = isolatedTemp.resolve("ja-builtin-skills");
+            try (AgentSkillRepository repository = JaSkillSources
+                    .materializedBuiltinRepositoryForTest(null)) {
+                assertEquals(List.of("coding"), repository.getAllSkillNames());
+                assertTrue(repository.getSkill("coding").getSkillContent().contains("coding"));
+            }
+
+            Path version = onlyBuiltinVersion(cacheRoot);
+            assertTrue(Files.isRegularFile(version.resolve("coding/SKILL.md")));
+            assertFalse(hasTemporaryFiles(cacheRoot));
+            try (AgentSkillRepository repository = JaSkillSources
+                    .materializedBuiltinRepositoryForTest(null)) {
+                assertEquals(List.of("coding"), repository.getAllSkillNames());
+                assertTrue(repository.getSkill("coding").getSkillContent().contains("coding"));
+            }
+            assertEquals(version, onlyBuiltinVersion(cacheRoot));
+            assertFalse(hasTemporaryFiles(cacheRoot));
+        } finally {
+            if (previousTemp == null) {
+                System.clearProperty("java.io.tmpdir");
+            } else {
+                System.setProperty("java.io.tmpdir", previousTemp);
+            }
         }
     }
 
@@ -268,6 +301,20 @@ class JaSkillSourcesTest {
     private static String revisionOf(JaSkillSources sources, String name) {
         return sources.projection().stream().filter(row -> row.name().equals(name))
                 .findFirst().orElseThrow().revision();
+    }
+
+    /** Finds the one content-addressed version created in the isolated fallback cache. */
+    private static Path onlyBuiltinVersion(Path cacheRoot) throws Exception {
+        try (var children = Files.list(cacheRoot)) {
+            return children.filter(Files::isDirectory).findFirst().orElseThrow();
+        }
+    }
+
+    /** Confirms the staging move left no temporary file for the next launch. */
+    private static boolean hasTemporaryFiles(Path cacheRoot) throws Exception {
+        try (var paths = Files.walk(cacheRoot)) {
+            return paths.anyMatch(path -> path.getFileName().toString().endsWith(".tmp"));
+        }
     }
 
     /** Uses AgentScope's documented scalar frontmatter shape instead of a JA parser fixture. */
