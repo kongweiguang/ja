@@ -775,10 +775,25 @@ mod tests {
             "(global-name \"com.apple.system.opendirectoryd.libinfo\")",
             "(global-name \"com.apple.secinitd\")",
             "(subpath \"/usr/bin\")",
-            "(subpath \"/System/Volumes/Data/Users\")",
         ] {
             assert!(profile.contains(rule), "missing startup rule: {rule}");
         }
+        // The firmlink root is needed only as an exact metadata traversal
+        // point.  A recursive Data/Users rule would expose every user's home
+        // metadata, including secrets and product databases, without helping
+        // the already-authorized worker/workspace literals below.
+        let exact_firmlink_metadata = "(allow file-read-metadata\n\
+  (literal \"/System/Volumes\")\n\
+  (literal \"/System/Volumes/Data\")\n\
+  (literal \"/System/Volumes/Data/Users\"))";
+        assert!(profile.contains(exact_firmlink_metadata));
+        assert!(!profile.contains("(subpath \"/System/Volumes/Data/Users\")"));
+        assert!(!profile.contains("(subpath \"/System/Volumes/Data\")"));
+        assert!(!profile.contains("(subpath \"/Users\")"));
+        assert!(!profile.contains("(literal \"/System/Volumes/Data/Users/runner\")"));
+        assert!(profile.contains("(allow file-read* (literal \"/private/var/tmp/worker\"))"));
+        assert!(profile.contains("(allow file-read* (subpath \"/private/var/tmp/workspace\"))"));
+        assert!(!profile.contains("/private/var/tmp/workspace-sibling"));
         assert!(!profile.contains("(allow file-map-executable (subpath \"/private"));
         assert!(!profile.contains("(allow file-read* (subpath \"/private/var/tmp\")"));
         assert!(!profile.contains("(allow network-outbound)"));
