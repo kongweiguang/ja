@@ -1414,8 +1414,8 @@ def run_typescript(property_path: Path, digest: str, classification_digest: str,
         ROOT,
         env=suite_env,
     )
-    require_marker("typescript-suite", suite.stdout + suite.stderr, r"Tests\s+140 passed\s+\(140\)")
-    print("TS_SUITE_OK tests=140")
+    require_marker("typescript-suite", suite.stdout + suite.stderr, r"Tests\s+147 passed\s+\(147\)")
+    print("TS_SUITE_OK tests=147")
     ts_filters = (
         ("nested-pending", "tracks server request pending IDs and rejects duplicate, unknown, and late responses"),
         ("cancel-race", "linearizes slow disconnect and reconnect so stale listeners cannot win"),
@@ -1443,7 +1443,7 @@ def run_typescript(property_path: Path, digest: str, classification_digest: str,
         require_marker(
             f"typescript-filter-{filter_id}",
             filtered.stdout + filtered.stderr,
-            r"Tests\s+1 passed(?:\s+\|\s+[0-9]+\s+skipped)?\s+\(140\)",
+            r"Tests\s+1 passed(?:\s+\|\s+[0-9]+\s+skipped)?\s+\(147\)",
         )
         print(f"TS_FILTER_OK id={filter_id}")
     contract_env = env.copy()
