@@ -85,10 +85,48 @@ fn pending_case(deadline: Instant) -> Result<(), &'static str> {
     file.write_all(b"pending")
         .map_err(|_| "fixture-pending-write")?;
     file.sync_all().map_err(|_| "fixture-pending-write")?;
-    if cleanup_markers_until(&root, &report, false, deadline).is_ok()
-        || !report_contains(&report, "marker-pending=true")?
-    {
-        return Err("fixture-pending-marker");
+    // Close the producer before opening the cleanup namespace and sync the
+    // parent directory so the fixture observes the same durable pending entry
+    // that a crashed worker would leave for the next cleanup pass.  Keeping a
+    // write descriptor open here can make the test depend on APFS directory
+    // visibility rather than exercising the production pending-state parser.
+    drop(file);
+    let root_directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW_FLAG | O_CLOEXEC_FLAG)
+        .open(&root)
+        .map_err(|_| "fixture-pending-create")?;
+    fd::sync_directory(&root_directory).map_err(|_| "fixture-pending-sync")?;
+    drop(root_directory);
+    // Use the fixture-only hook so a native run can distinguish a scanner
+    // miss from a pending-state transaction failure without exposing paths or
+    // OS errors; the signal callback is intentionally unreachable for this
+    // identity-free entry and fails closed if classification regresses.
+    let mut no_signal = |_identity: &ProcessIdentity| -> Result<GroupSignalRelease, &'static str> {
+        Err("fixture-pending-signal")
+    };
+    let mut diagnostic = |stage: &'static str, code: &'static str| {
+        emit_cleanup_diagnostic_line(stage, code);
+    };
+    let cleanup_result = cleanup_markers_until_with_group_signal_hook_and_diagnostics(
+        &root,
+        &report,
+        false,
+        deadline,
+        &mut no_signal,
+        &mut diagnostic,
+    );
+    if cleanup_result.is_ok() {
+        // A pending basename is not a successful cleanup state: it carries no
+        // trusted process identity and must remain visible until a later
+        // activation/recovery transaction can prove its complete image.
+        return Err("fixture-pending-accepted");
+    }
+    if !report_contains(&report, "marker-pending=true")? {
+        // Keep a stable distinction between an unreported pending marker and a
+        // pending marker that was incorrectly accepted; neither exposes the
+        // temporary path or platform error text to CI.
+        return Err("fixture-pending-unreported");
     }
     remove_fixture_root(root)
 }

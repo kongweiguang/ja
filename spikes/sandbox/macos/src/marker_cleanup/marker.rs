@@ -538,6 +538,53 @@ fn parse_marker_from_file(
     Ok(record)
 }
 
+/// Validate a pending activation image with the existing marker grammar before
+/// cleanup can publish a recovery alias.  A pending basename or recognized
+/// recovery alias carries the owner/nonce/suffix binding, while
+/// `parse_contents` keeps the exact field, duplicate, state, and
+/// executable-kind rules in one parser.
+pub(super) fn validate_pending_record_image(
+    name: &[u8],
+    display_path: &Path,
+    image: &[u8],
+    allow_fixture: bool,
+) -> Result<(), &'static str> {
+    if image.len() > 4096 {
+        return Err("marker-incomplete");
+    }
+    let name = std::str::from_utf8(name).map_err(|_| "marker-owner-mismatch")?;
+    // Keep the byte name used for the fd-relative read bound to the display
+    // path carried by the scan; otherwise a caller could validate one suffix
+    // and later report or transition a different basename.
+    let display_name = display_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("marker-owner-mismatch")?;
+    if display_name != name {
+        return Err("marker-owner-mismatch");
+    }
+    // Recovery/cleaned pending aliases are valid state-machine names, but the
+    // marker image is still bound to the nested base pending basename.  Reuse
+    // the finite alias parser instead of stripping a prefix, which would let
+    // an arbitrary nested name inherit a trusted owner/nonce pair.
+    let (owner_pid, nonce, suffix) =
+        if let Some((owner_pid, nonce, suffix)) = parse_pending_name_parts(name) {
+            (owner_pid, nonce, suffix)
+        } else {
+            let base_name = parse_pending_alias_name(name).ok_or("marker-owner-mismatch")?;
+            let (owner_pid, nonce, suffix) =
+                parse_pending_name_parts(base_name).ok_or("marker-owner-mismatch")?;
+            (owner_pid, nonce, suffix)
+        };
+    let contents = std::str::from_utf8(image).map_err(|_| "marker-incomplete")?;
+    let mut record = parse_contents(owner_pid, nonce, contents, allow_fixture)?;
+    // Keep the parsed basename binding observable to this validation helper;
+    // no caller may later substitute an active suffix or a different path.
+    record.path = display_path.to_owned();
+    record.suffix = suffix.to_owned();
+    Ok(())
+}
+
 /// Validate exactly seven fixed fields, rejecting duplicates, unknown keys,
 /// newlines in identity and fixture executable kinds in production mode.
 fn parse_contents(
@@ -753,28 +800,44 @@ pub(super) fn parse_pending_name_for_cleanup(name: &str) -> Option<()> {
 
 /// Parse pending owner/nonce names too; pending files carry no trusted
 /// process identity, but reserved owner values must still fail closed.
-fn parse_pending_name(name: &str) -> Option<(u32, u128)> {
+fn parse_pending_name_parts(name: &str) -> Option<(u32, u128, &'static str)> {
     let body = name.strip_prefix(".ja-sandbox-log-helper-")?;
     let mut ids = None;
-    for suffix in [".marker.pending", ".fallback.pending", ".emergency.pending"] {
-        if let Some(value) = body.strip_suffix(suffix) {
+    let mut active_suffix = None;
+    for (pending_suffix, suffix) in [
+        (".marker.pending", "marker"),
+        (".fallback.pending", "fallback"),
+        (".emergency.pending", "emergency"),
+    ] {
+        if let Some(value) = body.strip_suffix(pending_suffix) {
             ids = Some(value);
+            active_suffix = Some(suffix);
             break;
         }
     }
     let ids = ids?;
+    let active_suffix = active_suffix?;
     let (owner, nonce) = ids.split_once('-')?;
     Some((
         owner.parse::<u32>().ok().filter(|value| *value > 1)?,
         nonce.parse::<u128>().ok().filter(|value| *value > 0)?,
+        active_suffix,
     ))
+}
+
+/// Parse pending owner/nonce values while retaining the validated active
+/// suffix for callers that must bind an image to its exact basename.
+fn parse_pending_name(name: &str) -> Option<(u32, u128)> {
+    parse_pending_name_parts(name).map(|(owner, nonce, _)| (owner, nonce))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         parse_pending_alias_name, parse_pending_name, parse_positive_i32, parse_positive_u32,
+        validate_pending_record_image,
     };
+    use std::path::Path;
 
     /// Marker parsing rejects all reserved PID/PGID values before cleanup can
     /// derive a direct or negative process-group signal target.
@@ -826,5 +889,109 @@ mod tests {
             ".ja-sandbox-recovery..ja-sandbox-recovery.ja-sandbox-log-helper-42-12.marker.pending"
         )
         .is_none());
+    }
+
+    /// Reuse the production marker parser for pending images so truncated,
+    /// unknown, duplicate, or basename-mismatched bytes cannot reach alias
+    /// publication; each accepted suffix remains bound to the same image.
+    #[test]
+    fn pending_image_requires_complete_bound_marker_grammar() {
+        let valid = b"owner_pid=42\nnonce=12\npid=42\npgid=43\nstart_identity=fixture\nexecutable_kind=log\nstate=active\n";
+        let path = Path::new(".ja-sandbox-log-helper-42-12.marker.pending");
+        assert!(
+            validate_pending_record_image(
+                path.file_name()
+                    .expect("name")
+                    .to_str()
+                    .expect("utf8")
+                    .as_bytes(),
+                path,
+                valid,
+                false,
+            )
+            .is_ok()
+        );
+        let fallback = Path::new(".ja-sandbox-log-helper-42-12.fallback.pending");
+        assert!(
+            validate_pending_record_image(
+                fallback
+                    .file_name()
+                    .expect("name")
+                    .to_str()
+                    .expect("utf8")
+                    .as_bytes(),
+                fallback,
+                valid,
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_pending_record_image(
+                path.file_name()
+                    .expect("name")
+                    .to_str()
+                    .expect("utf8")
+                    .as_bytes(),
+                fallback,
+                valid,
+                false,
+            )
+            .is_err()
+        );
+        let recovery =
+            Path::new(".ja-sandbox-recovery..ja-sandbox-log-helper-42-12.marker.pending");
+        assert!(
+            validate_pending_record_image(
+                recovery
+                    .file_name()
+                    .expect("name")
+                    .to_str()
+                    .expect("utf8")
+                    .as_bytes(),
+                recovery,
+                valid,
+                false,
+            )
+            .is_ok()
+        );
+
+        let invalid_images = [
+            b"owner_pid=42\n".as_slice(),
+            b"owner_pid=42\nnonce=12\npid=42\npgid=43\nstart_identity=fixture\nexecutable_kind=log\nstate=active\nunknown=x\n".as_slice(),
+            b"owner_pid=42\nnonce=12\npid=42\npgid=43\nstart_identity=fixture\nexecutable_kind=log\nstate=active\nowner_pid=42\n".as_slice(),
+            b"owner_pid=43\nnonce=12\npid=42\npgid=43\nstart_identity=fixture\nexecutable_kind=log\nstate=active\n".as_slice(),
+            b"owner_pid=42\nnonce=13\npid=42\npgid=43\nstart_identity=fixture\nexecutable_kind=log\nstate=active\n".as_slice(),
+        ];
+        for image in invalid_images {
+            assert!(
+                validate_pending_record_image(
+                    path.file_name()
+                        .expect("name")
+                        .to_str()
+                        .expect("utf8")
+                        .as_bytes(),
+                    path,
+                    image,
+                    false,
+                )
+                .is_err()
+            );
+        }
+        let invalid_suffix = Path::new(".ja-sandbox-log-helper-42-12.invalid.pending");
+        assert!(
+            validate_pending_record_image(
+                invalid_suffix
+                    .file_name()
+                    .expect("name")
+                    .to_str()
+                    .expect("utf8")
+                    .as_bytes(),
+                invalid_suffix,
+                valid,
+                false,
+            )
+            .is_err()
+        );
     }
 }

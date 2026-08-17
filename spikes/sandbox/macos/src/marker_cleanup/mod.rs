@@ -1132,6 +1132,7 @@ fn remove_pending_marker(
             root_directory,
             root_identity,
             pending,
+            allow_fixture,
             deadline,
             &mut faults,
         )
@@ -1429,6 +1430,7 @@ fn remove_pending_evidence_with_fault<F: PendingFaultInjector>(
     root_directory: &File,
     root_identity: RootDirectoryIdentity,
     pending: &PendingMarker,
+    allow_fixture: bool,
     deadline: Instant,
     faults: &mut F,
 ) -> Result<PendingCleanupOutcome, ()> {
@@ -1439,7 +1441,12 @@ fn remove_pending_evidence_with_fault<F: PendingFaultInjector>(
         cleaned,
     } = pending_state_names(current)?;
     let is_base = current == base.as_slice();
-    if pending.pending_recovery == is_base {
+    // A pending alias may enter this function only through the exact finite
+    // recovery/cleaned names derived from its base; no prefix-only alias can
+    // borrow the base image's owner/nonce binding.
+    if (!is_base && current != recovery.as_slice() && current != cleaned.as_slice())
+        || pending.pending_recovery == is_base
+    {
         return Err(());
     }
     let (mut current_file, current_identity) = open_verified_marker_at(
@@ -1453,6 +1460,11 @@ fn remove_pending_evidence_with_fault<F: PendingFaultInjector>(
         (file, identity)
     })?;
     let current_image = read_marker_image(&mut current_file, deadline)?;
+    // A metadata-only pending entry is not enough to authorize alias creation:
+    // malformed/truncated bytes must remain at the original inode so a later
+    // activation pass can diagnose them instead of deleting untrusted evidence.
+    marker::validate_pending_record_image(current, &pending.path, &current_image, allow_fixture)
+        .map_err(|_| ())?;
     drop(current_file);
     if current_identity != pending.file_identity {
         return Err(());
@@ -2863,6 +2875,10 @@ fn argument_path(arguments: &[String], flag: &str) -> Result<PathBuf, &'static s
 mod unit_tests {
     use super::*;
     #[cfg(target_os = "macos")]
+    use std::io::Write;
+    #[cfg(target_os = "macos")]
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "macos")]
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, symlink};
     #[cfg(target_os = "macos")]
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2976,6 +2992,195 @@ mod unit_tests {
         assert!(verify_root_path_until(&root, &root_directory, root_identity, deadline).is_ok());
         fd::sync_directory(&root_directory).expect("directory sync");
         fs::remove_dir(&root).expect("root cleanup");
+    }
+
+    /// Keep an incomplete activation visible to the production scanner after
+    /// the producer closes and syncs it; accepting an untrusted pending entry
+    /// as an empty success would hide a worker crash before identity publish.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_activation_is_reported_not_accepted() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ja-pending-visible-{nonce}"));
+        fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let pending = b".ja-sandbox-log-helper-42-12.marker.pending";
+        let pending_path = root.join(std::str::from_utf8(pending).expect("pending name"));
+        let (root_directory, _root_identity) = open_verified_root_directory(&root).expect("open");
+        let mut file = fd::create_at_file(root_directory.as_raw_fd(), pending, MARKER_MODE)
+            .expect("pending create");
+        file.write_all(b"pending").expect("pending image");
+        file.sync_all().expect("pending sync");
+        drop(file);
+        fd::sync_directory(&root_directory).expect("pending directory sync");
+
+        let report = root.join("cleanup-report");
+        let result =
+            cleanup_markers_until(&root, &report, false, Instant::now() + CLEANUP_DEADLINE);
+        assert!(result.is_err(), "pending evidence was accepted as success");
+        let report_contents = fs::read_to_string(&report).expect("cleanup report");
+        assert!(
+            report_contents
+                .lines()
+                .any(|line| line == "marker-pending=true")
+        );
+        assert!(
+            pending_path.exists(),
+            "pending evidence was silently removed"
+        );
+
+        drop(root_directory);
+        fs::remove_file(report).expect("report cleanup");
+        fs::remove_file(pending_path).expect("pending cleanup");
+        fs::remove_dir(root).expect("root cleanup");
+    }
+
+    /// Snapshot only the finite recovery/cleaned namespace through the held
+    /// root descriptor so test assertions cannot mistake a pre-existing alias
+    /// for one created by the transaction.
+    #[cfg(target_os = "macos")]
+    fn pending_alias_identity_snapshot(
+        root: &Path,
+        root_directory: &File,
+    ) -> Vec<(Vec<u8>, marker::MarkerFileIdentity)> {
+        let mut snapshot = fs::read_dir(root)
+            .expect("read pending root")
+            .map(|entry| entry.expect("read pending entry"))
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_str().expect("alias name utf8");
+                if !(name.starts_with(".ja-sandbox-recovery.")
+                    || name.starts_with(".ja-sandbox-cleaned."))
+                {
+                    return None;
+                }
+                let name = name.as_bytes().to_vec();
+                let file = fd::open_at_file(root_directory.as_raw_fd(), &name).expect("open alias");
+                let identity = validate_recovery_image(&file).expect("alias identity");
+                Some((name, identity))
+            })
+            .collect::<Vec<_>>();
+        snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+        snapshot
+    }
+
+    /// Prove that a pending entry keeps its descriptor identity across a
+    /// rejected cleanup; path existence alone would miss inode replacement.
+    #[cfg(target_os = "macos")]
+    fn pending_identity_snapshot(root_directory: &File, name: &[u8]) -> marker::MarkerFileIdentity {
+        let file = fd::open_at_file(root_directory.as_raw_fd(), name).expect("open pending");
+        validate_recovery_image(&file).expect("pending identity")
+    }
+
+    /// Ensure cleanup never manufactures a recovery/cleaned alias that was
+    /// absent before the transaction; identity comparison catches replacement.
+    #[cfg(target_os = "macos")]
+    fn assert_no_new_pending_aliases(
+        before: &[(Vec<u8>, marker::MarkerFileIdentity)],
+        after: &[(Vec<u8>, marker::MarkerFileIdentity)],
+    ) {
+        assert!(
+            after
+                .iter()
+                .all(|candidate| before.iter().any(|known| known == candidate)),
+            "cleanup created or replaced a pending alias"
+        );
+    }
+
+    /// Drive the complete pending transaction with a bounded marker image so
+    /// only grammar-valid evidence may create an alias or remove the base.
+    #[cfg(target_os = "macos")]
+    fn run_pending_production_case(name: &[u8], image: &[u8], expect_success: bool) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ja-pending-production-{nonce}"));
+        fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let basename = std::str::from_utf8(name).expect("pending name");
+        let pending_path = root.join(basename);
+        let (root_directory, _root_identity) = open_verified_root_directory(&root).expect("open");
+        let mut file = fd::create_at_file(root_directory.as_raw_fd(), name, MARKER_MODE)
+            .expect("pending create");
+        file.write_all(image).expect("pending image");
+        file.sync_all().expect("pending sync");
+        drop(file);
+        fd::sync_directory(&root_directory).expect("pending directory sync");
+        let pending_identity_before = pending_identity_snapshot(&root_directory, name);
+        let aliases_before = pending_alias_identity_snapshot(&root, &root_directory);
+
+        let report = root.join("cleanup-report");
+        let result =
+            cleanup_markers_until(&root, &report, false, Instant::now() + CLEANUP_DEADLINE);
+        assert_eq!(result.is_ok(), expect_success, "pending transaction result");
+        let aliases_after = pending_alias_identity_snapshot(&root, &root_directory);
+        if expect_success {
+            assert!(!pending_path.exists(), "valid pending entry was retained");
+            assert_no_new_pending_aliases(&aliases_before, &aliases_after);
+        } else {
+            let report_contents = fs::read_to_string(&report).expect("cleanup report");
+            assert!(
+                report_contents
+                    .lines()
+                    .any(|line| line == "marker-pending=true")
+            );
+            assert!(pending_path.exists(), "invalid pending entry was removed");
+            assert_eq!(
+                pending_identity_snapshot(&root_directory, name),
+                pending_identity_before,
+                "invalid pending entry changed its inode identity"
+            );
+            assert_eq!(
+                aliases_before, aliases_after,
+                "invalid pending entry changed the alias identity set"
+            );
+        }
+
+        drop(root_directory);
+        fs::remove_file(report).expect("report cleanup");
+        if pending_path.exists() {
+            fs::remove_file(pending_path).expect("pending cleanup");
+        }
+        fs::remove_dir(root).expect("root cleanup");
+    }
+
+    /// Cover valid activation and every malformed content class through the
+    /// production scanner, retaining the original pending inode on failure.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_production_grammar_cases_are_fail_closed() {
+        let valid = b"owner_pid=42\nnonce=12\npid=42\npgid=43\nstart_identity=fixture\nexecutable_kind=log\nstate=active\n";
+        run_pending_production_case(b".ja-sandbox-log-helper-42-12.marker.pending", valid, true);
+        for suffix in ["fallback", "emergency"] {
+            let name = format!(".ja-sandbox-log-helper-42-12.{suffix}.pending",);
+            run_pending_production_case(name.as_bytes(), valid, true);
+        }
+        let recovery_name = ".ja-sandbox-recovery..ja-sandbox-log-helper-42-12.marker.pending";
+        run_pending_production_case(recovery_name.as_bytes(), valid, true);
+        run_pending_production_case(recovery_name.as_bytes(), b"owner_pid=42\n", false);
+        for image in [
+            b"owner_pid=42\n".as_slice(),
+            b"owner_pid=42\nnonce=12\npid=42\npgid=43\nstart_identity=fixture\nexecutable_kind=log\nstate=active\nunknown=x\n".as_slice(),
+            b"owner_pid=42\nnonce=12\npid=42\npgid=43\nstart_identity=fixture\nexecutable_kind=log\nstate=active\nowner_pid=42\n".as_slice(),
+            b"owner_pid=43\nnonce=12\npid=42\npgid=43\nstart_identity=fixture\nexecutable_kind=log\nstate=active\n".as_slice(),
+            b"owner_pid=42\nnonce=13\npid=42\npgid=43\nstart_identity=fixture\nexecutable_kind=log\nstate=active\n".as_slice(),
+        ] {
+            run_pending_production_case(
+                b".ja-sandbox-log-helper-42-12.marker.pending",
+                image,
+                false,
+            );
+        }
     }
 
     /// Keep the identity comparison strict so a forged fixture cannot reach a
@@ -3525,8 +3730,11 @@ mod unit_tests {
                     open_verified_root_directory(&root).expect("open root");
                 let mut file = fd::create_at_file(root_directory.as_raw_fd(), name, MARKER_MODE)
                     .expect("pending create");
-                file.write_all(b"partial pending image\n")
-                    .expect("pending image");
+                // Keep this image grammar-complete so the injected fault reaches
+                // the last-copy transaction; malformed-image coverage belongs
+                // to the production fail-closed cases above.
+                let image = b"owner_pid=42\nnonce=999991\npid=42\npgid=43\nstart_identity=fixture-start\nexecutable_kind=log\nstate=active\n";
+                file.write_all(image).expect("pending image");
                 file.sync_all().expect("pending sync");
                 let identity = validate_recovery_image(&file).expect("pending identity");
                 drop(file);
@@ -3546,6 +3754,7 @@ mod unit_tests {
                             &root_directory,
                             root_identity,
                             &pending,
+                            true,
                             Instant::now() + CLEANUP_DEADLINE,
                             &mut plan,
                         )
@@ -3559,6 +3768,7 @@ mod unit_tests {
                             &root_directory,
                             root_identity,
                             &pending,
+                            true,
                             Instant::now() + CLEANUP_DEADLINE,
                             &mut plan,
                         )
