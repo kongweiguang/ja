@@ -1,0 +1,52 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-composer {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.85rem;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-lg);
+  background: var(--ja-surface);
+  box-shadow: var(--ja-shadow-sm);
+}
+
+.ja-composer__input {
+  width: 100%;
+  min-height: 4.3rem;
+  resize: vertical;
+  padding: 0.7rem 0.75rem;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-md);
+  color: var(--ja-foreground);
+  background: var(--ja-background);
+  font: inherit;
+  line-height: 1.5;
+}
+
+.ja-composer__input:focus-visible,
+.ja-composer__mode:focus-visible,
+.ja-composer select:focus-visible { outline: 2px solid var(--ja-focus); outline-offset: 2px; }
+.ja-composer__input:disabled { cursor: not-allowed; opacity: 0.65; }
+.ja-composer__controls { display: flex; justify-content: space-between; align-items: end; gap: 0.75rem; }
+.ja-composer__settings { display: flex; flex-wrap: wrap; align-items: end; gap: 0.55rem; min-width: 0; }
+.ja-composer__select-label { display: grid; gap: 0.22rem; color: var(--ja-foreground-muted); font-size: 0.7rem; }
+.ja-composer select { min-height: 1.9rem; max-width: 12rem; padding: 0.2rem 1.6rem 0.2rem 0.45rem; border: 1px solid var(--ja-border); border-radius: var(--ja-radius-sm); color: var(--ja-foreground); background: var(--ja-background); font: inherit; font-size: 0.78rem; }
+.ja-composer__mode-fieldset { display: grid; gap: 0.22rem; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ja-composer__mode-fieldset legend { padding: 0; color: var(--ja-foreground-muted); font-size: 0.7rem; }
+.ja-composer__mode-fieldset [data-orientation="horizontal"] { display: flex; gap: 0.15rem; }
+.ja-composer__mode { min-height: 1.9rem; padding: 0.25rem 0.45rem; border: 1px solid var(--ja-border); color: var(--ja-foreground-muted); background: transparent; font: inherit; font-size: 0.76rem; cursor: pointer; }
+.ja-composer__mode:first-child { border-radius: var(--ja-radius-sm) 0 0 var(--ja-radius-sm); }
+.ja-composer__mode:last-child { border-radius: 0 var(--ja-radius-sm) var(--ja-radius-sm) 0; }
+.ja-composer__mode[data-state="on"] { color: var(--ja-accent-foreground); background: var(--ja-accent); border-color: var(--ja-accent); }
+.ja-composer__mode:disabled { cursor: not-allowed; opacity: 0.55; }
+.ja-composer__current-mode { display: none; }
+.ja-composer__actions { display: flex; gap: 0.4rem; }
+.ja-composer__hint { margin: 0; color: var(--ja-foreground-muted); font-size: 0.7rem; }
+.ja-composer__error { margin: 0; color: var(--ja-danger); font-size: 0.78rem; }
+
+@media (max-width: 560px) {
+  .ja-composer__controls { align-items: stretch; flex-direction: column; }
+  .ja-composer__actions { justify-content: flex-end; }
+}
+

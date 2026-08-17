@@ -1,0 +1,18 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-search-panel { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 0.65rem; padding: 0.7rem; }
+.ja-search-input-wrap { display: flex; min-height: 2.15rem; align-items: center; gap: 0.45rem; border: 1px solid var(--ja-border); border-radius: var(--ja-radius-md); padding: 0 0.6rem; color: var(--ja-foreground-muted); background: var(--ja-background); }
+.ja-search-input-wrap:focus-within { border-color: var(--ja-focus); outline: 2px solid color-mix(in srgb, var(--ja-focus) 25%, transparent); outline-offset: 1px; }
+.ja-search-input-wrap svg { width: 0.9rem; height: 0.9rem; flex: 0 0 auto; }
+.ja-search-input-wrap input { min-width: 0; flex: 1; border: 0; outline: 0; color: var(--ja-foreground); background: transparent; font-size: 0.8rem; }
+.ja-search-input-wrap input::placeholder { color: var(--ja-foreground-muted); }
+.ja-search-results { min-height: 0; flex: 1; overflow: auto; overscroll-behavior: contain; }
+.ja-search-result-row { min-height: 3.6rem; border-bottom: 1px solid var(--ja-border); }
+.ja-search-result { display: grid; width: 100%; height: 100%; grid-template-columns: minmax(0, 1fr) auto; align-content: center; gap: 0.1rem 0.6rem; min-height: 3.6rem; border: 0; padding: 0.45rem 0.35rem; color: var(--ja-foreground); background: transparent; text-align: left; cursor: pointer; }
+.ja-search-result:hover { background: var(--ja-surface-muted); }
+.ja-search-result:focus-visible { outline: 2px solid var(--ja-focus); outline-offset: -2px; }
+.ja-search-result-path { overflow: hidden; color: var(--ja-accent); font-size: 0.75rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.ja-search-result-line { color: var(--ja-foreground-muted); font: 0.7rem ui-monospace, SFMono-Regular, Consolas, monospace; }
+.ja-search-result-preview { grid-column: 1 / -1; overflow: hidden; color: var(--ja-foreground-muted); font: 0.72rem ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.ja-search-result-preview mark { border-radius: 0.15rem; color: var(--ja-foreground); background: color-mix(in srgb, var(--ja-warning) 35%, transparent); }

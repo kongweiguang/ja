@@ -1,0 +1,7 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-terminal-panel { min-height: 0; flex: 1; overflow: hidden; padding: 0.35rem; background: var(--ja-background); }
+.ja-terminal-panel .xterm { height: 100%; padding: 0.25rem; }
+.ja-terminal-panel .xterm-viewport { background: transparent !important; }
+

@@ -1,0 +1,18 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-editor-viewer,
+.ja-editor-diff { min-width: 0; min-height: 0; height: 100%; overflow: auto; background: var(--ja-background); }
+.ja-editor-viewer .cm-editor,
+.ja-editor-diff .cm-editor { min-height: 100%; color: var(--ja-foreground); background: var(--ja-background); font: 0.78rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.ja-editor-viewer .cm-scroller,
+.ja-editor-diff .cm-scroller { min-height: 100%; }
+.ja-editor-viewer .cm-gutters,
+.ja-editor-diff .cm-gutters { border-right: 1px solid var(--ja-border); color: var(--ja-foreground-muted); background: var(--ja-surface); }
+.ja-editor-diff .cm-mergeView { min-height: 100%; }
+.ja-editor-diff .cm-mergeViewEditors { min-height: 100%; }
+.ja-editor-diff .cm-mergeViewEditor { min-width: 0; }
+.ja-editor-diff .cm-deletedChunk { background: color-mix(in srgb, var(--ja-danger) 24%, transparent); }
+.ja-editor-diff .cm-changedLine { background: color-mix(in srgb, var(--ja-warning) 16%, transparent); }
+.ja-editor-diff .cm-insertedLine { background: color-mix(in srgb, var(--ja-success) 20%, transparent); }
+

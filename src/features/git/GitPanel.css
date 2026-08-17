@@ -1,0 +1,34 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-git-panel { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 1rem; overflow: auto; padding: 0.8rem; }
+.ja-git-summary { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; border-bottom: 1px solid var(--ja-border); padding-bottom: 0.8rem; }
+.ja-git-branch { display: flex; min-width: 0; align-items: center; gap: 0.45rem; }
+.ja-git-branch svg { width: 1rem; height: 1rem; color: var(--ja-accent); }
+.ja-git-branch strong { overflow: hidden; font-size: 0.8rem; text-overflow: ellipsis; white-space: nowrap; }
+.ja-git-sync { color: var(--ja-foreground-muted); font-size: 0.7rem; white-space: nowrap; }
+.ja-git-section { display: grid; gap: 0.45rem; }
+.ja-git-section-heading { display: flex; align-items: center; gap: 0.4rem; color: var(--ja-foreground-muted); }
+.ja-git-section-heading svg { width: 0.9rem; height: 0.9rem; }
+.ja-git-section-heading h3 { margin: 0; color: var(--ja-foreground); font-size: 0.76rem; }
+.ja-git-section-heading span { margin-left: auto; font-size: 0.7rem; }
+.ja-git-muted { margin: 0; color: var(--ja-foreground-muted); font-size: 0.75rem; }
+.ja-git-file-list, .ja-git-commit-list { display: grid; gap: 0.2rem; margin: 0; padding: 0; list-style: none; }
+.ja-git-file-list li { display: flex; min-width: 0; align-items: center; gap: 0.45rem; min-height: 1.8rem; padding: 0.2rem 0.35rem; border-radius: var(--ja-radius-sm); font-size: 0.75rem; }
+.ja-git-file-list li:hover { background: var(--ja-surface-muted); }
+.ja-git-status { display: grid; width: 1.2rem; height: 1.2rem; flex: 0 0 auto; place-items: center; border-radius: 0.2rem; font: 0.65rem ui-monospace, SFMono-Regular, Consolas, monospace; font-weight: 700; }
+.ja-git-status-modified { color: var(--ja-warning); background: color-mix(in srgb, var(--ja-warning) 15%, transparent); }
+.ja-git-status-added { color: var(--ja-success); background: color-mix(in srgb, var(--ja-success) 15%, transparent); }
+.ja-git-status-deleted, .ja-git-status-conflicted { color: var(--ja-danger); background: color-mix(in srgb, var(--ja-danger) 15%, transparent); }
+.ja-git-status-renamed, .ja-git-status-untracked { color: var(--ja-accent); background: color-mix(in srgb, var(--ja-accent) 15%, transparent); }
+.ja-git-file-path { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ja-git-file-stat { color: var(--ja-foreground-muted); font: 0.65rem ui-monospace, SFMono-Regular, Consolas, monospace; white-space: nowrap; }
+.ja-git-commit-list li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.15rem 0.45rem; padding: 0.3rem 0.35rem; font-size: 0.73rem; }
+.ja-git-commit-list li:hover { background: var(--ja-surface-muted); }
+.ja-git-commit-list code { color: var(--ja-accent); font-size: 0.65rem; }
+.ja-git-commit-list li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ja-git-commit-list small { grid-column: 2; color: var(--ja-foreground-muted); font-size: 0.65rem; }
+.ja-git-diff-stat { display: flex; gap: 0.55rem; border-top: 1px solid var(--ja-border); padding-top: 0.7rem; color: var(--ja-foreground-muted); font-size: 0.72rem; }
+.ja-git-diff-stat strong:first-of-type { color: var(--ja-success); }
+.ja-git-diff-stat strong:last-of-type { color: var(--ja-danger); }
+
