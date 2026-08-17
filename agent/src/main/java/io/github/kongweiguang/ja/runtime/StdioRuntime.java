@@ -18,6 +18,7 @@ import io.github.kongweiguang.ja.domain.EventId;
 import io.github.kongweiguang.ja.domain.ServerInstanceId;
 import io.github.kongweiguang.ja.model.AgentScopeModelFactory;
 import io.github.kongweiguang.ja.model.ModelHandle;
+import io.github.kongweiguang.ja.mcp.McpServerDefinition;
 import io.github.kongweiguang.ja.profiles.ModelProfile;
 import io.github.kongweiguang.ja.profiles.SecretAccessException;
 import io.github.kongweiguang.ja.profiles.SecretRef;
@@ -45,6 +46,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
@@ -94,6 +96,8 @@ public final class StdioRuntime implements AutoCloseable {
     private volatile WorkspaceBinding workspaceBinding;
     private volatile SavedProfile savedProfile;
     private volatile String activeProfileRevision;
+    /** Stores only this sidecar generation's MCP definitions; control-lane handlers are the sole writers. */
+    private final LinkedHashMap<String, McpServerDefinition> mcpServers = new LinkedHashMap<>();
     private final ThreadPoolExecutor controlLane;
     private final CountDownLatch terminated = new CountDownLatch(1);
     private final AtomicBoolean readerStarted = new AtomicBoolean(false);
@@ -389,6 +393,18 @@ public final class StdioRuntime implements AutoCloseable {
             handleSkillList(request);
             return;
         }
+        if ("mcp/save".equals(request.method())) {
+            handleMcpSave(request);
+            return;
+        }
+        if ("mcp/list".equals(request.method())) {
+            handleMcpList(request);
+            return;
+        }
+        if ("mcp/delete".equals(request.method())) {
+            handleMcpDelete(request);
+            return;
+        }
         if ("version".equals(request.method())) {
             sendResponse(RpcResponse.success(request, versionResult()));
             return;
@@ -487,9 +503,11 @@ public final class StdioRuntime implements AutoCloseable {
             SavedProfile candidate = ProfileWireMapper.parse(profileNode);
             JsonNode expected = params.get("expectedRevision");
             SavedProfile existing = savedProfile;
-            if (expected != null && !expected.isNull()) {
-                if (!expected.isTextual() || existing == null
-                        || !expected.textValue().equals(existing.wireRevision())) {
+            if (params.has("expectedRevision")) {
+                if (expected == null || expected.isNull() || !expected.isTextual()) {
+                    throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+                }
+                if (existing == null || !expected.textValue().equals(existing.wireRevision())) {
                     throw new ProtocolException(JaErrorCode.CONFLICT);
                 }
             }
@@ -536,6 +554,83 @@ public final class StdioRuntime implements AutoCloseable {
             if (temporary != null) {
                 temporary.close();
             }
+        }
+    }
+
+    /**
+     * Saves one MCP definition in the current generation. Same-revision equal
+     * payloads are idempotent; a different payload cannot silently replace a
+     * profile reference or an already selected server.
+     */
+    private void handleMcpSave(RpcRequest request) {
+        try {
+            JsonNode serverNode = request.params().get("server");
+            McpServerDefinition candidate = McpWireMapper.parse(serverNode);
+            ObjectNode params = request.params();
+            JsonNode expected = params.get("expectedRevision");
+            if (params.has("expectedRevision")
+                    && (expected == null || expected.isNull() || !expected.isTextual())) {
+                throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+            }
+            McpServerDefinition existing = mcpServers.get(candidate.revision());
+            if (expected != null
+                    && (existing == null || !expected.textValue().equals(existing.revision()))) {
+                throw new ProtocolException(JaErrorCode.CONFLICT);
+            }
+            boolean created = existing == null;
+            if (!created && !existing.equals(candidate)) {
+                throw new ProtocolException(JaErrorCode.CONFLICT);
+            }
+            if (created) {
+                mcpServers.put(candidate.revision(), candidate);
+            }
+            ObjectNode result = JsonNodes.object();
+            result.set("server", McpWireMapper.summary(created ? candidate : existing));
+            result.put("created", created);
+            sendResponse(RpcResponse.success(request, result));
+        } catch (ProtocolException exception) {
+            sendFailure(request, exception);
+        } catch (RuntimeException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.INVALID_PARAMS));
+        }
+    }
+
+    /** Returns the insertion-ordered generation snapshot without probing MCP servers. */
+    private void handleMcpList(RpcRequest request) {
+        try {
+            ObjectNode result = JsonNodes.object();
+            var servers = JsonNodes.array();
+            mcpServers.values().forEach(server -> servers.add(McpWireMapper.summary(server)));
+            result.set("servers", servers);
+            sendResponse(RpcResponse.success(request, result));
+        } catch (RuntimeException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.INTERNAL_ERROR));
+        }
+    }
+
+    /**
+     * Deletes only an unreferenced generation definition. The profile snapshot
+     * is checked before removal so a saved profile cannot retain a dangling MCP
+     * revision that appears valid after settings synchronization.
+     */
+    private void handleMcpDelete(RpcRequest request) {
+        try {
+            String revision = requiredIdentifier(request.params(), "mcpRevision", "mcp_");
+            if (savedProfile != null && savedProfile.mcpRevisions().contains(revision)) {
+                throw new ProtocolException(JaErrorCode.CONFLICT);
+            }
+            if (!mcpServers.containsKey(revision)) {
+                throw new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
+            }
+            mcpServers.remove(revision);
+            ObjectNode result = JsonNodes.object();
+            result.put("accepted", true);
+            result.put("mcpRevision", revision);
+            sendResponse(RpcResponse.success(request, result));
+        } catch (ProtocolException exception) {
+            sendFailure(request, exception);
+        } catch (RuntimeException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.INVALID_PARAMS));
         }
     }
 
@@ -1100,7 +1195,8 @@ public final class StdioRuntime implements AutoCloseable {
     /** Builds one stable capability advertisement for initialize and read. */
     private static Capabilities capabilities() {
         List<String> methods = List.of("initialize", "version", "capabilities/read", "health/read", "shutdown",
-                "workspace/open", "profile/save", "profile/activate", "skill/list", "turn/start");
+                "workspace/open", "profile/save", "profile/activate", "skill/list", "mcp/list",
+                "mcp/save", "mcp/delete", "turn/start");
         return new Capabilities(methods,
                 List.of("runtime/statusChanged", "turn/started", "item/started", "item/delta",
                         "item/completed", "turn/completed"),

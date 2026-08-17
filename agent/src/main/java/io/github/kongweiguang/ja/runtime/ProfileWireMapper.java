@@ -32,7 +32,7 @@ final class ProfileWireMapper {
         String name = requiredText(profile, "name", 256);
         String accessMode = requiredEnum(profile, "accessMode", "read_only", "workspace", "full_access");
         List<String> skillRevisions = revisionArray(profile, "skillRevisions", "skill_");
-        validateRevisionArray(profile, "mcpRevisions", "mcp_");
+        List<String> mcpRevisions = revisionArray(profile, "mcpRevisions", "mcp_");
         JsonNode modelNode = profile.get("model");
         if (modelNode == null || !modelNode.isObject()) {
             throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
@@ -76,8 +76,8 @@ final class ProfileWireMapper {
         }
         CapabilityOverrides overrides = CapabilityOverrides.none();
         JsonNode supportsVision = modelNode.get("supportsVision");
-        if (supportsVision != null && !supportsVision.isNull()) {
-            if (!supportsVision.isBoolean()) {
+        if (modelNode.has("supportsVision")) {
+            if (supportsVision == null || supportsVision.isNull() || !supportsVision.isBoolean()) {
                 throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
             }
             // Missing supportsVision is deliberately left unknown; absence never becomes false.
@@ -95,7 +95,7 @@ final class ProfileWireMapper {
                 .secretRef(secretRef)
                 .capabilityOverrides(overrides)
                 .build();
-        return new SavedProfile(revision, accessMode, model, profile, skillRevisions);
+        return new SavedProfile(revision, accessMode, model, profile, skillRevisions, mcpRevisions);
     }
 
     /** Reads a non-blank bounded text property without echoing its value in errors. */
@@ -121,8 +121,11 @@ final class ProfileWireMapper {
     /** Enforces an optional field's schema length without treating omission as a false value. */
     private static String optionalText(JsonNode parent, String field, int maxLength) {
         JsonNode value = parent == null ? null : parent.get(field);
-        if (value == null || value.isNull()) {
+        if (value == null) {
             return null;
+        }
+        if (value.isNull()) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
         }
         if (!value.isTextual() || value.textValue().isBlank()
                 || value.textValue().length() > maxLength) {
@@ -155,9 +158,12 @@ final class ProfileWireMapper {
     /** Preserves Rust-owned skill/MCP references while checking only the stable wire shape. */
     private static List<String> revisionArray(JsonNode parent, String field, String prefix) {
         JsonNode values = parent.get(field);
-        if (values == null || values.isNull()) {
+        if (!parent.has(field)) {
             // Missing references intentionally mean builtin-only for the first generation.
             return List.of();
+        }
+        if (values == null || values.isNull()) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
         }
         if (!values.isArray() || values.size() > 128) {
             throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
@@ -182,10 +188,12 @@ final class ProfileWireMapper {
 
 /** Secret-free profile snapshot paired with the exact wire revision used for activation. */
 record SavedProfile(String wireRevision, String accessMode, ModelProfile model,
-                    ObjectNode wireProfile, List<String> skillRevisions) {
+                    ObjectNode wireProfile, List<String> skillRevisions,
+                    List<String> mcpRevisions) {
     SavedProfile {
         wireProfile = wireProfile.deepCopy();
         skillRevisions = skillRevisions == null ? List.of() : List.copyOf(skillRevisions);
+        mcpRevisions = mcpRevisions == null ? List.of() : List.copyOf(mcpRevisions);
     }
 
     /** Prevents response serialization from mutating the process-local settings snapshot. */
