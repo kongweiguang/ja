@@ -30,11 +30,11 @@ export interface AppProvidersProps extends ConnectionProviderProps {
  * This composition root is separate from the generated Tauri entrypoint so
  * the host integration can select a fake or real transport without coupling UI.
  */
-export function AppProviders({ children, client, transport }: AppProvidersProps): ReactElement {
+export function AppProviders({ children, runtime }: AppProvidersProps): ReactElement {
   return (
     <ErrorBoundary FallbackComponent={AppErrorFallback}>
       <ThemeProvider>
-        <ConnectionProvider client={client} transport={transport}>
+        <ConnectionProvider runtime={runtime}>
           {children}
         </ConnectionProvider>
       </ThemeProvider>

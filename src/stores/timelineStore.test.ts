@@ -2,91 +2,128 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { describe, expect, it } from "vitest";
-import type { HandshakeProjection } from "@/ipc/handshake";
-import { fingerprintReadyToken } from "@/ipc/readyToken";
+import { parseRuntimeHostEvent } from "@/ipc/runtime";
 import { useTimelineStore } from "./timelineStore";
 
-const readyProjection = Object.freeze({ phase: "ready" as const, generation: 1 }) as HandshakeProjection;
-const readyToken = "0123456789abcdef0123456789abcdef";
-const readyFingerprint = fingerprintReadyToken(readyToken);
+function statusFrame(generation: number, status: string): Record<string, unknown> {
+  return {
+    jsonrpc: "2.0",
+    method: "runtime/statusChanged",
+    params: {
+      serverInstanceId: "srv_store",
+      eventId: `evt_${status}_${generation}`,
+      occurredAt: "2026-08-16T00:00:00Z",
+      status,
+      health: { generation },
+    },
+  };
+}
 
-describe("timeline Zustand handshake seam", () => {
-  it("requires the projection action before direct business events can enter the store", () => {
-    const store = useTimelineStore.getState();
-    store.reset();
-    const result = store.applyEvent({
-      jsonrpc: "2.0",
-      method: "runtime/notice",
-      params: {
-        serverInstanceId: "srv_one",
-        eventId: "evt_notice",
-        occurredAt: "2026-08-16T00:00:00Z",
-        code: "NOTICE_OK",
-        message: "waiting",
+function timelineFrame(seq: number): Record<string, unknown> {
+  return {
+    jsonrpc: "2.0",
+    method: "turn/started",
+    params: {
+      serverInstanceId: "srv_store",
+      threadId: "thr_store",
+      seq,
+      eventId: `evt_turn_${seq}`,
+      occurredAt: `2026-08-16T00:00:0${seq}Z`,
+      turn: {
+        turnId: "turn_store",
+        threadId: "thr_store",
+        status: "running",
+        mode: "workspace",
+        permissionMode: "ask",
       },
-    });
+    },
+  };
+}
+
+describe("timeline Zustand RuntimeHost seam", () => {
+  it("requires the typed runtime projection before direct business events can enter the store", () => {
+    const store = useTimelineStore.getState();
+    store.reset();
+    expect(store.applyEvent(timelineFrame(1))).toBe("rejected");
+    expect(useTimelineStore.getState().runtime).toBeUndefined();
+    expect(useTimelineStore.getState().resyncRequired).toEqual({ runtime: "handshake_required" });
+  });
+
+  it("accepts a token-free RuntimeHost ready projection and then a timeline event", () => {
+    const store = useTimelineStore.getState();
+    store.reset();
+    const ready = parseRuntimeHostEvent(statusFrame(1, "ready"));
+    expect(ready.kind).toBe("status");
+    if (ready.kind !== "status") {
+      return;
+    }
+    expect(store.applyHostEvent(ready)).toBe("applied");
+    const event = parseRuntimeHostEvent(timelineFrame(1));
+    expect(event.kind).toBe("timeline");
+    if (event.kind !== "timeline") {
+      return;
+    }
+    expect(store.applyHostEvent(event)).toBe("applied");
     const state = useTimelineStore.getState();
-    expect(result).toBe("rejected");
-    expect(state.runtime).toBeUndefined();
-    expect(state.resyncRequired).toEqual({});
+    expect(state.handshake).toEqual({ phase: "ready", generation: 1 });
+    expect(state.turns["turn_store"]?.status).toBe("running");
+    expect(JSON.stringify(state)).not.toContain("token");
   });
 
-  it("does not let a ready event promote a fresh store or retain its token", () => {
+  it("rejects lifecycle frames without a valid generation before they reach the store", () => {
     const store = useTimelineStore.getState();
     store.reset();
-    const result = store.applyEvent({
-      jsonrpc: "2.0",
-      method: "runtime/statusChanged",
-      params: {
-        serverInstanceId: "srv_one",
-        eventId: "evt_ready",
-        occurredAt: "2026-08-16T00:00:00Z",
-        status: "ready",
-        readyToken,
-      },
-    });
+    const malformed = statusFrame(1, "ready");
+    const params = malformed["params"] as Record<string, unknown>;
+    delete (params["health"] as Record<string, unknown>)["generation"];
+    expect(store.applyEvent(malformed)).toBe("invalid");
+    expect(useTimelineStore.getState().handshake).toEqual({ phase: "disconnected", generation: 0 });
+  });
+
+  it("rejects stale stopped, crashed, and starting states without clearing newer business data", () => {
+    const store = useTimelineStore.getState();
+    store.reset();
+    const ready = parseRuntimeHostEvent(statusFrame(2, "ready"));
+    if (ready.kind !== "status") {
+      throw new Error("fixture must be a status event");
+    }
+    store.applyHostEvent(ready);
+    const event = parseRuntimeHostEvent(timelineFrame(1));
+    if (event.kind !== "timeline") {
+      throw new Error("fixture must be a timeline event");
+    }
+    store.applyHostEvent(event);
+    for (const status of ["stopped", "crashed", "starting"]) {
+      const stale = parseRuntimeHostEvent(statusFrame(1, status));
+      if (stale.kind !== "status") {
+        throw new Error("fixture must be a status event");
+      }
+      expect(store.applyHostEvent(stale)).toBe("rejected");
+    }
     const state = useTimelineStore.getState();
-    expect(result).toBe("rejected");
-    expect(state.handshake.phase).toBe("awaiting_initialized");
-    expect(JSON.stringify(state)).not.toContain(readyToken);
+    expect(state.handshake).toEqual({ phase: "ready", generation: 2 });
+    expect(state.turns["turn_store"]?.status).toBe("running");
   });
 
-  it("rejects malformed ready frames before parsing can classify them as business input", () => {
+  it("applies the current generation stop and blocks subsequent business events", () => {
     const store = useTimelineStore.getState();
     store.reset();
-    expect(store.applyEvent({
-      jsonrpc: "2.0",
-      method: "runtime/statusChanged",
-      params: { status: "ready", reason: "malformed" },
-    })).toBe("rejected");
-    expect(useTimelineStore.getState().handshake.phase).toBe("awaiting_initialized");
-  });
-
-  it("ignores the token-free ready event emitted by the client listener", () => {
-    const store = useTimelineStore.getState();
-    store.reset();
-    expect(store.applyEvent({
-      jsonrpc: "2.0",
-      method: "runtime/statusChanged",
-      params: {
-        serverInstanceId: "srv_one",
-        eventId: "evt_ready_sanitized",
-        occurredAt: "2026-08-16T00:00:00Z",
-        status: "ready",
-      },
-    })).toBe("rejected");
-    expect(useTimelineStore.getState().handshake.phase).toBe("awaiting_initialized");
-  });
-
-  it("accepts the frozen client projection as the sole readiness transition", () => {
-    const store = useTimelineStore.getState();
-    store.reset();
-    expect(store.applyHandshakeProjection(readyProjection, [])).toBe("rejected");
-    expect(useTimelineStore.getState().handshake.phase).toBe("awaiting_initialized");
-    const result = store.applyHandshakeProjection(readyProjection, [readyFingerprint]);
-    const state = useTimelineStore.getState();
-    expect(result).toBe("applied");
-    expect(state.handshake.phase).toBe("ready");
-    expect(Object.isFrozen(state.handshake)).toBe(true);
+    const ready = parseRuntimeHostEvent(statusFrame(3, "ready"));
+    if (ready.kind !== "status") {
+      throw new Error("fixture must be a status event");
+    }
+    store.applyHostEvent(ready);
+    const event = parseRuntimeHostEvent(timelineFrame(1));
+    if (event.kind !== "timeline") {
+      throw new Error("fixture must be a timeline event");
+    }
+    store.applyHostEvent(event);
+    const stopped = parseRuntimeHostEvent(statusFrame(3, "stopped"));
+    if (stopped.kind !== "status") {
+      throw new Error("fixture must be a status event");
+    }
+    expect(store.applyHostEvent(stopped)).toBe("applied");
+    expect(useTimelineStore.getState().turns).toEqual({});
+    expect(store.applyEvent(timelineFrame(2))).toBe("rejected");
   });
 });

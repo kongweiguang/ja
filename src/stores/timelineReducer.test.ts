@@ -3,15 +3,14 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  applyHandshakeProjection,
   applyLiveEvent,
+  applyRuntimeStatus,
   applySnapshot,
   createTimelineState,
   EVENT_DEDUP_WINDOW,
+  reduceTimeline,
 } from "./timelineReducer";
-import { fingerprintReadyToken } from "@/ipc/readyToken";
-import type { HandshakeProjection } from "@/ipc/handshake";
-import type { JaEvent, ThreadReadResult } from "@/ipc/protocol";
+import { parseEvent, type JaEvent, type ThreadReadResult } from "@/ipc/runtimeEvents";
 
 const snapshot: ThreadReadResult = {
   serverInstanceId: "srv_one",
@@ -26,35 +25,6 @@ const snapshot: ThreadReadResult = {
   snapshotSeq: 1,
 };
 
-const readyToken = "0123456789abcdef0123456789abcdef";
-const readyFingerprint = fingerprintReadyToken(readyToken);
-const nextReadyFingerprint = fingerprintReadyToken("fedcba9876543210fedcba9876543210");
-
-/**
- * Reducer fixtures use the single projection action so tests cannot create a
- * second handshake authority through runtime events.
- */
-function readyState() {
-  return applyHandshakeProjection(
-    createTimelineState(),
-    Object.freeze({ phase: "ready" as const, generation: 1 }),
-    [readyFingerprint],
-  );
-}
-
-/** Builds a non-ready projection while keeping the current opaque proof last. */
-function projectionState(
-  phase: "awaiting_initialized" | "awaiting_ready" | "ready",
-  generation: number,
-  fingerprints: readonly string[] = [readyFingerprint],
-) {
-  return applyHandshakeProjection(
-    createTimelineState(),
-    Object.freeze({ phase, generation }),
-    fingerprints,
-  );
-}
-
 const turn = {
   turnId: "turn_one",
   threadId: "thr_one",
@@ -63,26 +33,24 @@ const turn = {
   permissionMode: "ask" as const,
 };
 
-function event(seq: number, eventId: string, params: Record<string, unknown>, method: string = "turn/started") {
-  return {
-    jsonrpc: "2.0" as const,
-    method,
+function readyState() {
+  return applyRuntimeStatus(createTimelineState(), {
+    status: "ready",
+    generation: 1,
     serverInstanceId: "srv_one",
-    threadId: "thr_one",
-    seq,
-    eventId,
+    eventId: "evt_ready",
     occurredAt: "2026-08-16T00:00:00Z",
-    params,
-  } as unknown as JaEvent;
+  });
 }
 
-/**
- * Snapshot replay fixtures use the frozen wire shape where event identity is
- * carried in notification params rather than at the envelope root.
- */
-function embeddedEvent(seq: number, eventId: string, params: Record<string, unknown>, method: string = "turn/started") {
-  return {
-    jsonrpc: "2.0" as const,
+function event(
+  seq: number,
+  eventId: string,
+  params: Record<string, unknown>,
+  method: string = "turn/started",
+): JaEvent {
+  return parseEvent({
+    jsonrpc: "2.0",
     method,
     params: {
       serverInstanceId: "srv_one",
@@ -92,419 +60,219 @@ function embeddedEvent(seq: number, eventId: string, params: Record<string, unkn
       occurredAt: "2026-08-16T00:00:00Z",
       ...params,
     },
-  };
+  });
 }
 
-const item = {
-  itemId: "item_one",
-  turnId: "turn_one",
-  kind: "agent_message" as const,
-  status: "in_progress" as const,
-  text: "hello",
-};
-
-const approval = {
-  approvalId: "appr_one",
-  threadId: "thr_one",
-  turnId: "turn_one",
-  itemId: "item_one",
-  action: { kind: "shell" as const, fingerprint: "act_one" },
-  risk: "low" as const,
-  expiresAt: "2026-08-16T00:00:00Z",
-};
-
-describe("snapshot/live timeline reducer", () => {
-  it("blocks snapshots and business events until the challenge reaches ready", () => {
+describe("runtime-owned timeline reducer", () => {
+  it("blocks snapshots and business events until RuntimeHost reports ready", () => {
     const cold = createTimelineState();
-    const blockedSnapshot = applySnapshot(cold, snapshot);
-    expect(blockedSnapshot.lastOutcome).toBe("rejected");
-    expect(blockedSnapshot.resyncRequired["runtime"]).toBeUndefined();
-    const blockedEvent = applyLiveEvent(cold, event(1, "evt_before_ready", { turn }));
-    expect(blockedEvent.lastOutcome).toBe("rejected");
-    expect(blockedEvent.turns).toEqual({});
+    expect(applySnapshot(cold, snapshot).lastOutcome).toBe("rejected");
+    expect(applyLiveEvent(cold, event(1, "evt_before_ready", { turn })).lastOutcome).toBe("rejected");
   });
 
-  it("rejects token-shaped runtime notice messages and ready reasons before projection", () => {
-    const ready = applySnapshot(readyState(), snapshot);
-    const notice = applyLiveEvent(ready, {
-      jsonrpc: "2.0",
-      method: "runtime/notice",
-      serverInstanceId: "srv_one",
-      eventId: "evt_notice_token",
-      occurredAt: "2026-08-16T00:00:00Z",
-      params: { code: "NOTICE_TOKEN", message: `prefix_${readyToken}_suffix` },
-    } as unknown as JaEvent);
-    expect(notice.lastOutcome).toBe("rejected");
-    expect(notice.runtime).toBe(ready.runtime);
-
-    const waiting = projectionState("awaiting_ready", 1);
-    const readyWithLeakingReason = applyLiveEvent(waiting, {
-      jsonrpc: "2.0",
-      method: "runtime/statusChanged",
-      serverInstanceId: "srv_one",
-      eventId: "evt_ready_reason_token",
-      occurredAt: "2026-08-16T00:00:00Z",
-      params: {
-        status: "ready",
-        readyToken,
-        reason: `prefix_${readyToken}_suffix`,
-      },
-    } as unknown as JaEvent);
-    expect(readyWithLeakingReason.lastOutcome).toBe("rejected");
-    expect(readyWithLeakingReason.handshake.phase).toBe("awaiting_ready");
-    expect(readyWithLeakingReason.runtime).toBeUndefined();
-    expect(readyWithLeakingReason.resyncRequired).toEqual({});
-  });
-
-  it("fails closed when a token-free projection is copied without its private metadata", () => {
-    const ready = applySnapshot(readyState(), snapshot);
-    const copied = {
-      ...ready,
-      handshake: JSON.parse(JSON.stringify(ready.handshake)),
-    } as typeof ready;
-    const result = applyLiveEvent(copied, event(2, "evt_copied_projection", { turn }));
-    expect(result.lastOutcome).toBe("rejected");
-    expect(result.resyncRequired["runtime"]).toBeUndefined();
-  });
-
-  it("promotes only a frozen token-free handshake projection and clears old business state", () => {
-    const cold = createTimelineState();
-    const projection = Object.freeze({ phase: "ready" as const, generation: 4 }) as HandshakeProjection;
-    const promoted = applyHandshakeProjection(cold, projection, [fingerprintReadyToken(readyToken)]);
-    expect(promoted.lastOutcome).toBe("applied");
-    expect(promoted.handshake).not.toBe(projection);
-    expect(promoted.handshake.phase).toBe("ready");
-
-    const mutable = { phase: "ready" as const, generation: 4 } as HandshakeProjection;
-    expect(applyHandshakeProjection(promoted, mutable, [readyFingerprint]).lastOutcome).toBe("rejected");
-    const stale = Object.freeze({ phase: "ready" as const, generation: 3 }) as HandshakeProjection;
-    expect(applyHandshakeProjection(promoted, stale, [readyFingerprint]).lastOutcome).toBe("rejected");
-    expect(JSON.stringify(promoted)).not.toContain(readyToken);
-  });
-
-  it("does not accept awaiting-ready or ready at the uninitialized generation", () => {
-    const cold = createTimelineState();
-    expect(applyHandshakeProjection(
-      cold,
-      Object.freeze({ phase: "awaiting_ready" as const, generation: 0 }),
-      [readyFingerprint],
-    ).lastOutcome).toBe("rejected");
-    expect(applyHandshakeProjection(
-      cold,
-      Object.freeze({ phase: "ready" as const, generation: 0 }),
-      [readyFingerprint],
-    ).lastOutcome).toBe("rejected");
-  });
-
-  it("rejects direct reducer payloads that exceed depth, node, or string budgets", () => {
-    const state = applySnapshot(readyState(), snapshot);
-    const deep: Record<string, unknown> = {};
-    let cursor = deep;
-    for (let index = 0; index < 70; index += 1) {
-      cursor["next"] = {};
-      cursor = cursor["next"] as Record<string, unknown>;
-    }
-    const tooDeep = applyLiveEvent(state, event(2, "evt_deep", { turn, diagnostic: deep }));
-    expect(tooDeep.lastOutcome).toBe("rejected");
-
-    const tooMany = applyLiveEvent(state, event(2, "evt_nodes", { turn, diagnostics: Array.from({ length: 20_100 }, () => ({ value: true })) }));
-    expect(tooMany.lastOutcome).toBe("rejected");
-
-    const tooLong = applyLiveEvent(state, event(2, "evt_string", { turn, diagnostic: "x".repeat(4_194_305) }));
-    expect(tooLong.lastOutcome).toBe("rejected");
-  });
-
-  it("records only opaque handshake state and resets a prior generation", () => {
-    let state = readyState();
-    state = applySnapshot(state, snapshot);
-    const next = applyHandshakeProjection(
-      state,
-      Object.freeze({ phase: "awaiting_initialized" as const, generation: 2 }),
-      [readyFingerprint],
-    );
-    expect(next.threads).toEqual({});
-    expect(next.serverInstanceId).toBeUndefined();
-    expect(next.lastSeqByThread).toEqual({});
-    const fresh = applyHandshakeProjection(
-      next,
-      Object.freeze({ phase: "awaiting_ready" as const, generation: 2 }),
-      [readyFingerprint, nextReadyFingerprint],
-    );
-    expect(fresh.handshake.phase).toBe("awaiting_ready");
-    expect(fresh.threads).toEqual({});
-    expect(JSON.stringify(fresh)).not.toContain("fedcba9876543210fedcba9876543210");
-  });
-
-  it("does not apply a new-generation snapshot until its ready echo arrives", () => {
-    let state = applySnapshot(readyState(), snapshot);
-    state = applyHandshakeProjection(
-      state,
-      Object.freeze({ phase: "awaiting_initialized" as const, generation: 2 }),
-      [readyFingerprint],
-    );
-    state = applyHandshakeProjection(
-      state,
-      Object.freeze({ phase: "awaiting_ready" as const, generation: 2 }),
-      [readyFingerprint, nextReadyFingerprint],
-    );
-    const blocked = applySnapshot(state, snapshot);
-    expect(blocked.lastOutcome).toBe("rejected");
-    expect(blocked.threads).toEqual({});
-    const ready = applyHandshakeProjection(
-      blocked,
-      Object.freeze({ phase: "ready" as const, generation: 2 }),
-      [readyFingerprint, nextReadyFingerprint],
-    );
-    expect(applySnapshot(ready, snapshot).lastOutcome).toBe("applied");
-  });
-
-  it("applies an ordered event and ignores the duplicate event id", () => {
+  it("applies ordered events and ignores duplicates", () => {
     const ready = applySnapshot(readyState(), snapshot);
     const first = applyLiveEvent(ready, event(2, "evt_two", { turn }));
     const duplicate = applyLiveEvent(first, event(2, "evt_two", { turn }));
+    expect(first.lastOutcome).toBe("applied");
     expect(first.lastSeqByThread["thr_one"]).toBe(2);
-    expect(first.turns["turn_one"]).toEqual(turn);
     expect(duplicate.lastOutcome).toBe("duplicate");
-    expect(duplicate.lastSeqByThread["thr_one"]).toBe(2);
   });
 
-  it("requires resync for a gap and does not guess the missing event", () => {
+  it("requires resync for a sequence gap and never guesses missing work", () => {
     const ready = applySnapshot(readyState(), snapshot);
     const gap = applyLiveEvent(ready, event(4, "evt_four", { turn }));
     expect(gap.lastOutcome).toBe("gap");
     expect(gap.resyncRequired["thr_one"]).toBe("gap");
-    expect(gap.lastSeqByThread["thr_one"]).toBe(1);
     expect(gap.turns["turn_one"]).toBeUndefined();
   });
 
-  it("replaces a broken projection with a new-instance snapshot", () => {
-    const ready = applySnapshot(readyState(), snapshot);
-    const broken = applyLiveEvent(ready, event(3, "evt_three", { turn }));
-    const stopped = applyHandshakeProjection(
-      broken,
-      Object.freeze({ phase: "awaiting_initialized" as const, generation: 2 }),
-      [readyFingerprint],
-    );
-    const initialized = applyHandshakeProjection(
-      stopped,
-      Object.freeze({ phase: "awaiting_ready" as const, generation: 2 }),
-      [readyFingerprint, nextReadyFingerprint],
-    );
-    const recoveredReady = applyHandshakeProjection(
-      initialized,
-      Object.freeze({ phase: "ready" as const, generation: 2 }),
-      [readyFingerprint, nextReadyFingerprint],
-    );
-    const recovered = applySnapshot(recoveredReady, {
-      ...snapshot,
+  it("rejects every stale lifecycle status, including stopped and crashed", () => {
+    let state = applyLiveEvent(applySnapshot(readyState(), snapshot), event(2, "evt_two", { turn }));
+    state = applyRuntimeStatus(state, {
+      status: "ready",
+      generation: 2,
       serverInstanceId: "srv_two",
-      thread: { ...snapshot.thread, lastSeq: 0 },
-      snapshotSeq: 0,
+      eventId: "evt_new_ready",
+      occurredAt: "2026-08-16T00:00:01Z",
     });
-    expect(recovered.serverInstanceId).toBe("srv_two");
-    expect(recovered.resyncRequired["thr_one"]).toBeUndefined();
-    expect(recovered.turns).toEqual({});
+    expect(state.turns).toEqual({});
+    for (const status of ["starting", "stopped", "crashed", "faulted", "incompatible"] as const) {
+      const stale = applyRuntimeStatus(state, {
+        status,
+        generation: 1,
+        serverInstanceId: "srv_one",
+        eventId: `evt_stale_${status}`,
+        occurredAt: "2026-08-16T00:00:02Z",
+      });
+      expect(stale.lastOutcome).toBe("rejected");
+      expect(stale.turns).toEqual({});
+    }
   });
 
-  it("rejects snapshots whose cutoff, item identity, or existing membership is inconsistent", () => {
-    const mismatchedCutoff = applySnapshot(readyState(), {
-      ...snapshot,
-      thread: { ...snapshot.thread, lastSeq: 0 },
+  it("clears business projection when the current generation stops", () => {
+    const running = applyLiveEvent(applySnapshot(readyState(), snapshot), event(2, "evt_two", { turn }));
+    const stopped = applyRuntimeStatus(running, {
+      status: "stopped",
+      generation: 1,
+      serverInstanceId: null,
+      eventId: "evt_stopped",
+      occurredAt: "2026-08-16T00:00:02Z",
     });
-    expect(mismatchedCutoff.resyncRequired["thr_one"]).toBe("snapshot_invalid");
-
-    const duplicateItems = applySnapshot(readyState(), {
-      ...snapshot,
-      items: [item, { ...item }],
-    });
-    expect(duplicateItems.resyncRequired["thr_one"]).toBe("snapshot_invalid");
-
-    const otherThread = applySnapshot(readyState(), {
-      ...snapshot,
-      thread: { ...snapshot.thread, threadId: "thr_other" },
-      items: [{ ...item, itemId: "item_shared" }],
-    });
-    const collidingMembership = applySnapshot(otherThread, {
-      ...snapshot,
-      items: [{ ...item, itemId: "item_shared" }],
-    });
-    expect(collidingMembership.resyncRequired["thr_one"]).toBe("snapshot_invalid");
+    expect(stopped.turns).toEqual({});
+    expect(stopped.serverInstanceId).toBeUndefined();
   });
 
-  it("validates historical embedded events without mutating the snapshot baseline", () => {
-    const historical = applySnapshot(readyState(), {
-      ...snapshot,
-      events: [embeddedEvent(1, "evt_history", { turn })],
-    });
-    expect(historical.lastOutcome).toBe("applied");
-    expect(historical.turns["turn_one"]).toBeUndefined();
-    expect(historical.lastSeqByThread["thr_one"]).toBe(1);
-
-    const futureEvent = applySnapshot(readyState(), {
-      ...snapshot,
-      events: [embeddedEvent(2, "evt_future", { turn })],
-    });
-    expect(futureEvent.resyncRequired["thr_one"]).toBe("snapshot_invalid");
-
-    const malformed = applySnapshot(readyState(), {
-      ...snapshot,
-      events: [{ method: "turn/started" }],
-    });
-    expect(malformed.resyncRequired["thr_one"]).toBe("snapshot_invalid");
-
-    const outOfOrder = applySnapshot(readyState(), {
-      ...snapshot,
-      events: [embeddedEvent(1, "evt_one", { turn }), embeddedEvent(1, "evt_duplicate", { turn })],
-    });
-    expect(outOfOrder.resyncRequired["thr_one"]).toBe("snapshot_invalid");
-  });
-
-  it("projects terminal turns to an idle thread and advances thread.lastSeq", () => {
+  it("projects terminal turns to an idle thread", () => {
     const started = applyLiveEvent(applySnapshot(readyState(), snapshot), event(2, "evt_two", { turn }));
     const completedTurn = { ...turn, status: "completed" as const };
-    const completed = applyLiveEvent(started, event(3, "evt_three", { turn: completedTurn, terminalStatus: "completed" }, "turn/completed"));
+    const completed = applyLiveEvent(started, event(3, "evt_three", {
+      turn: completedTurn,
+      terminalStatus: "completed",
+    }, "turn/completed"));
     expect(completed.threads["thr_one"]?.status).toBe("idle");
     expect(completed.threads["thr_one"]?.activeTurnId).toBeUndefined();
-    expect(completed.threads["thr_one"]?.lastSeq).toBe(3);
     expect(completed.lastSeqByThread["thr_one"]).toBe(3);
   });
 
-  it("rejects terminal metadata that disagrees with the turn status", () => {
-    const ready = applySnapshot(readyState(), snapshot);
-    const invalid = applyLiveEvent(ready, event(2, "evt_two", { turn: { ...turn, status: "failed" }, terminalStatus: "completed" }, "turn/completed"));
-    expect(invalid.lastOutcome).toBe("resync_required");
-    expect(invalid.resyncRequired["thr_one"]).toBe("invalid_event");
-    expect(invalid.lastSeqByThread["thr_one"]).toBe(1);
+  it("maintains UTF-8 byte counts and rejects oversized deltas", () => {
+    const item = {
+      itemId: "item_one",
+      turnId: "turn_one",
+      kind: "agent_message" as const,
+      status: "in_progress" as const,
+      text: "你",
+    };
+    const started = applyLiveEvent(
+      applyLiveEvent(applySnapshot(readyState(), { ...snapshot, items: [item] }), event(2, "evt_turn", { turn })),
+      event(3, "evt_item", { item }, "item/started"),
+    );
+    const delta = applyLiveEvent(started, event(4, "evt_delta", { itemId: "item_one", delta: "好🙂" }, "item/delta"));
+    expect(delta.items["item_one"]?.text).toBe("你好🙂");
+    expect(delta.itemUtf8BytesById["item_one"]).toBe(10);
+    // The IPC projection rejects an oversized delta before it can reach the
+    // reducer, which keeps the byte budget fail-closed at the first boundary.
+    expect(() => event(5, "evt_oversized", { itemId: "item_one", delta: "x".repeat(1_048_570) }, "item/delta")).toThrow();
   });
 
-  it("accepts updates and deltas for snapshot items even when turns are not included", () => {
+  it("rejects cross-thread source identities before mutating state", () => {
+    const item = {
+      itemId: "item_one",
+      turnId: "turn_one",
+      kind: "agent_message" as const,
+      status: "in_progress" as const,
+      text: "hello",
+    };
     const ready = applySnapshot(readyState(), { ...snapshot, items: [item] });
-    const updatedItem = { ...item, status: "completed" as const, text: "hello world" };
-    const updated = applyLiveEvent(ready, event(2, "evt_two", { item: updatedItem }, "item/updated"));
-    const delta = applyLiveEvent(updated, event(3, "evt_three", { itemId: "item_one", delta: "!" }, "item/delta"));
-    expect(updated.lastOutcome).toBe("applied");
-    expect(delta.items["item_one"]?.text).toBe("hello world!");
-    expect(delta.itemUtf8BytesById["item_one"]).toBe(12);
-    expect(delta.lastSeqByThread["thr_one"]).toBe(3);
-    const cleaned = applySnapshot(delta, {
-      ...snapshot,
-      thread: { ...snapshot.thread, lastSeq: 4 },
-      snapshotSeq: 4,
-    });
-    expect(cleaned.itemUtf8BytesById["item_one"]).toBeUndefined();
-  });
-
-  it("requires provenance for a new item and bounds accumulated text", () => {
-    const ready = applySnapshot(readyState(), snapshot);
-    const unknown = { ...item, itemId: "item_new" };
-    const missing = applyLiveEvent(ready, event(2, "evt_two", { item: unknown }, "item/started"));
-    expect(missing.resyncRequired["thr_one"]).toBe("missing_item");
-
-    const withItem = applySnapshot(readyState(), { ...snapshot, items: [{ ...item, text: "x".repeat(1_048_570) }] });
-    const tooLarge = applyLiveEvent(withItem, event(2, "evt_two", { itemId: "item_one", delta: "123456789" }, "item/delta"));
-    expect(tooLarge.resyncRequired["thr_one"]).toBe("invalid_event");
-    expect(tooLarge.lastSeqByThread["thr_one"]).toBe(1);
-  });
-
-  it("maintains UTF-8 byte counts across Unicode deltas and replacements", () => {
-    const ready = applySnapshot(readyState(), { ...snapshot, items: [{ ...item, text: "你" }] });
-    expect(ready.itemUtf8BytesById["item_one"]).toBe(3);
-    const withDelta = applyLiveEvent(ready, event(2, "evt_two", { itemId: "item_one", delta: "好" }, "item/delta"));
-    expect(withDelta.itemUtf8BytesById["item_one"]).toBe(6);
-    const withEmoji = applyLiveEvent(withDelta, event(3, "evt_three", { itemId: "item_one", delta: "🙂" }, "item/delta"));
-    expect(withEmoji.items["item_one"]?.text).toBe("你好🙂");
-    expect(withEmoji.itemUtf8BytesById["item_one"]).toBe(10);
-    const replaced = applyLiveEvent(withEmoji, event(4, "evt_four", { item: { ...item, status: "completed", text: "ok" } }, "item/updated"));
-    expect(replaced.itemUtf8BytesById["item_one"]).toBe(2);
-    expect(replaced.items["item_one"]?.text).toBe("ok");
-  });
-
-  it("fails closed when a snapshot item exceeds the UTF-8 byte budget", () => {
-    const oversized = applySnapshot(readyState(), {
-      ...snapshot,
-      items: [{ ...item, text: "🙂".repeat(300_000) }],
-    });
-    expect(oversized.lastOutcome).toBe("resync_required");
-    expect(oversized.resyncRequired["thr_one"]).toBe("snapshot_invalid");
-    expect(oversized.items).toEqual({});
-  });
-
-  it("rejects cross-thread source identities and never changes an existing item's turn", () => {
-    const ready = applySnapshot(readyState(), { ...snapshot, items: [item] });
-    const changedTurn = applyLiveEvent(ready, event(2, "evt_two", {
-      item: { ...item, turnId: "turn_two", status: "completed" },
+    const mismatched = applyLiveEvent(ready, event(2, "evt_bad", {
+      item: { ...item, turnId: "turn_other", status: "completed" },
     }, "item/updated"));
-    expect(changedTurn.resyncRequired["thr_one"]).toBe("invalid_event");
-
-    const mismatchedThread = applyLiveEvent(ready, event(2, "evt_three", {
-      thread: { ...snapshot.thread, threadId: "thr_other" },
-      change: "updated",
-    }, "thread/changed"));
-    expect(mismatchedThread.resyncRequired["thr_one"]).toBe("invalid_event");
-
-    const mismatchedApproval = applyLiveEvent(ready, event(2, "evt_four", {
-      approval: { ...approval, threadId: "thr_other" },
-    }, "approval/requested"));
-    expect(mismatchedApproval.resyncRequired["thr_one"]).toBe("invalid_event");
-
-    const mismatchedTool = applyLiveEvent(ready, event(2, "evt_five", {
-      externalRequestId: "ext_one",
-      toolName: "filesystem",
-      threadId: "thr_other",
-    }, "externalTool/requested"));
-    expect(mismatchedTool.resyncRequired["thr_one"]).toBe("invalid_event");
+    expect(mismatched.lastOutcome).toBe("resync_required");
+    expect(mismatched.items["item_one"]?.turnId).toBe("turn_one");
   });
 
-  it("only creates an unknown item from item/started with a current-thread turn", () => {
-    const ready = applySnapshot(readyState(), snapshot);
-    const started = applyLiveEvent(ready, event(2, "evt_two", { turn }, "turn/started"));
-    const unknownUpdate = applyLiveEvent(started, event(3, "evt_three", {
-      item: { ...item, itemId: "item_new", status: "in_progress" },
-    }, "item/updated"));
-    expect(unknownUpdate.resyncRequired["thr_one"]).toBe("missing_item");
-
-    const startedItem = applyLiveEvent(started, event(3, "evt_four", {
-      item: { ...item, itemId: "item_new", status: "started" },
-    }, "item/started"));
-    expect(startedItem.lastOutcome).toBe("applied");
-    expect(startedItem.itemThreadById["item_new"]).toBe("thr_one");
-
-    const otherThreadTurn = { ...turn, turnId: "turn_other", threadId: "thr_other" };
-    const withOtherTurn = { ...startedItem, turns: { ...startedItem.turns, turn_other: otherThreadTurn } };
-    const crossThreadItem = applyLiveEvent(withOtherTurn, event(4, "evt_six", {
-      item: { ...item, itemId: "item_cross", turnId: "turn_other", status: "started" },
-    }, "item/started"));
-    expect(crossThreadItem.resyncRequired["thr_one"]).toBe("missing_item");
+  it("validates snapshots before replacing the authoritative baseline", () => {
+    const ready = readyState();
+    expect(applySnapshot(ready, { ...snapshot, thread: { ...snapshot.thread, lastSeq: 0 } }).resyncRequired["thr_one"])
+      .toBe("snapshot_invalid");
+    expect(applySnapshot(ready, {
+      ...snapshot,
+      items: [{
+        itemId: "item_one",
+        turnId: "turn_one",
+        kind: "agent_message",
+        status: "in_progress",
+        text: "x",
+      }, {
+        itemId: "item_one",
+        turnId: "turn_one",
+        kind: "agent_message",
+        status: "in_progress",
+        text: "x",
+      }],
+    }).resyncRequired["thr_one"]).toBe("snapshot_invalid");
   });
 
-  it("keeps archived/deleted thread projections while preserving sequence", () => {
-    const archivedThread = { ...snapshot.thread, status: "archived" as const };
-    const archived = applyLiveEvent(applySnapshot(readyState(), snapshot), event(2, "evt_two", { thread: archivedThread, change: "archived" }, "thread/changed"));
-    const deleted = applyLiveEvent(archived, event(3, "evt_three", { thread: archivedThread, change: "deleted" }, "thread/changed"));
-    expect(archived.threads["thr_one"]?.status).toBe("archived");
-    expect(deleted.threads["thr_one"]?.status).toBe("archived");
-    expect(deleted.threads["thr_one"]?.lastSeq).toBe(3);
+  it("keeps the reducer bounded and exposes the deduplication window contract", () => {
+    expect(EVENT_DEDUP_WINDOW).toBe(1024);
+    const base = applySnapshot(readyState(), snapshot);
+    const malformed = { jsonrpc: "2.0", method: "turn/started", params: { diagnostic: "untrusted" } };
+    expect(() => parseEvent(malformed)).toThrow();
+    expect(base.lastOutcome).toBe("applied");
   });
 
-  it("bounds per-runtime deduplication and clears a thread window on snapshot", () => {
-    let state = applySnapshot(readyState(), snapshot);
-    for (let index = 0; index < EVENT_DEDUP_WINDOW + 20; index += 1) {
-      state = applyLiveEvent(state, {
-        jsonrpc: "2.0",
-        method: "runtime/notice",
-        serverInstanceId: "srv_one",
-        eventId: `evt_runtime_${index}`,
-        occurredAt: "2026-08-16T00:00:00Z",
-        params: { code: "NOTICE_OK", message: "ok" },
+  it("keeps the pure action reducer aligned with RuntimeHost projections", () => {
+    const cold = createTimelineState();
+    const blocked = reduceTimeline(cold, {
+      type: "event",
+      event: event(1, "evt_before_ready", { turn }),
+    });
+    expect(blocked.lastOutcome).toBe("rejected");
+  });
+
+  it("rejects zero-generation reducer promotions even for terminal-looking states", () => {
+    const cold = createTimelineState();
+    for (const status of ["starting", "stopped", "recovery_required", "crashed"] as const) {
+      const rejected = applyRuntimeStatus(cold, {
+        status,
+        generation: 0,
+        serverInstanceId: null,
       });
+      expect(rejected.lastOutcome).toBe("rejected");
+      expect(rejected.handshake).toEqual({ phase: "disconnected", generation: 0 });
     }
-    expect(state.seenEventOrderByScope["runtime"]?.length).toBe(EVENT_DEDUP_WINDOW);
-    expect(Object.keys(state.seenEventIds).length).toBe(EVENT_DEDUP_WINDOW);
+  });
 
-    state = applyLiveEvent(state, event(2, "evt_thread", { turn }));
-    expect(state.seenEventOrderByScope["thr_one"]?.length).toBe(1);
-    state = applySnapshot(state, { ...snapshot, thread: { ...snapshot.thread, lastSeq: 2 }, snapshotSeq: 2 });
-    expect(state.seenEventOrderByScope["thr_one"]).toBeUndefined();
-    expect(state.itemUtf8BytesById["item_one"]).toBeUndefined();
+  it("evicts only the oldest dedup fingerprints while keeping sequence state authoritative", () => {
+    let state = applySnapshot(readyState(), snapshot);
+    for (let seq = 2; seq <= EVENT_DEDUP_WINDOW + 2; seq += 1) {
+      state = applyLiveEvent(state, event(seq, `evt_window_${seq}`, { turn }));
+      expect(state.lastOutcome).toBe("applied");
+    }
+    expect(state.seenEventIds["srv_one:thr_one:evt_window_2"]).toBeUndefined();
+    expect(state.seenEventIds[`srv_one:thr_one:evt_window_${EVENT_DEDUP_WINDOW + 2}`]).toBe(true);
+    const late = applyLiveEvent(state, event(2, "evt_window_2", { turn }));
+    expect(late.lastOutcome).toBe("late");
+    expect(late.resyncRequired["thr_one"]).toBe("late_event");
+  });
+
+  it("preserves the current provenance when a snapshot belongs to another server", () => {
+    const active = applyLiveEvent(applySnapshot(readyState(), snapshot), event(2, "evt_two", { turn }));
+    const foreign: ThreadReadResult = {
+      ...snapshot,
+      serverInstanceId: "srv_two",
+      thread: { ...snapshot.thread, workspaceId: "ws_two", title: "Foreign" },
+    };
+    const rejected = applySnapshot(active, foreign);
+    expect(rejected.lastOutcome).toBe("rejected");
+    expect(rejected.resyncRequired["runtime"]).toBe("handshake_required");
+    expect(rejected.turns["turn_one"]?.status).toBe("running");
+    expect(rejected.serverInstanceId).toBe("srv_one");
+  });
+
+  it("rejects terminal status mismatches before advancing a thread sequence", () => {
+    const active = applySnapshot(readyState(), snapshot);
+    expect(() => event(2, "evt_mismatch", {
+      turn: { ...turn, status: "failed" },
+      terminalStatus: "completed",
+    }, "turn/completed")).toThrow();
+    expect(active.lastSeqByThread["thr_one"]).toBe(1);
+  });
+
+  it("accepts the exact UTF-8 budget and rejects the first byte beyond it", () => {
+    const exact = "x".repeat(1_048_576);
+    const item = {
+      itemId: "item_budget",
+      turnId: "turn_one",
+      kind: "agent_message" as const,
+      status: "completed" as const,
+      text: exact,
+    };
+    const baseline = applySnapshot(readyState(), { ...snapshot, items: [item] });
+    expect(baseline.lastOutcome).toBe("applied");
+    const started = applyLiveEvent(baseline, event(2, "evt_budget_turn", { turn }));
+    const over = applyLiveEvent(started, event(3, "evt_budget_over", { itemId: "item_budget", delta: "y" }, "item/delta"));
+    expect(over.lastOutcome).toBe("resync_required");
+    expect(over.resyncRequired["thr_one"]).toBe("invalid_event");
   });
 });

@@ -30,14 +30,14 @@ describe("JA application shell", () => {
   beforeEach(() => installMatchMedia());
   afterEach(() => cleanup());
 
-  it("renders an honest engineering baseline instead of the starter greeting", () => {
+  it("renders the coding-first shell instead of the starter greeting", () => {
     render(<App />);
 
     expect(screen.getByRole("heading", { name: "JA 工程工作台" })).toBeInTheDocument();
-    expect(screen.getByText("Agent runtime 尚未接入")).toBeInTheDocument();
-    expect(screen.getByText("Sidecar 尚未接入")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "开始一条 coding turn" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "你想让 Agent 做什么？" })).toBeInTheDocument();
+    expect(screen.getByText("文件")).toBeInTheDocument();
     expect(screen.queryByText("Welcome to Tauri + React")).not.toBeInTheDocument();
     expect(screen.queryByText("Greet")).not.toBeInTheDocument();
-    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
 });
