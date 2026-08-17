@@ -88,6 +88,7 @@ type MarkerCleanupKey = (u32, u128, u32, i32, u64, u64, u64, u32, u32, u8);
 type GroupSignalHook<'a> =
     dyn FnMut(&ProcessIdentity) -> Result<GroupSignalRelease, &'static str> + 'a;
 type CleanupDiagnosticHook<'a> = dyn FnMut(&'static str, &'static str) + 'a;
+type PendingPostBackupHook<'a> = dyn FnMut() -> bool + 'a;
 
 /// Keep native fixture diagnostics on a closed, path-free vocabulary.  The
 /// callback receives only stage and error codes so a query cannot leak a PID,
@@ -233,7 +234,6 @@ fn marker_remove_diagnostic_code(code: &str) -> Option<&'static str> {
         "prepare-deadline" => Some("prepare-deadline"),
         "prepare-root" => Some("prepare-root"),
         "prepare-backup-stat" => Some("prepare-backup-stat"),
-        "prepare-backup-conflict" => Some("prepare-backup-conflict"),
         "prepare-backup-open" => Some("prepare-backup-open"),
         "prepare-backup-identity" => Some("prepare-backup-identity"),
         "prepare-backup-read" => Some("prepare-backup-read"),
@@ -248,8 +248,17 @@ fn marker_remove_diagnostic_code(code: &str) -> Option<&'static str> {
         "prepare-pending-sync" => Some("prepare-pending-sync"),
         "prepare-pending-root" => Some("prepare-pending-root"),
         "prepare-pending-dir-sync" => Some("prepare-pending-dir-sync"),
-        "prepare-pending-rename" => Some("prepare-pending-rename"),
+        "prepare-pending-reopen" => Some("prepare-pending-reopen"),
+        "prepare-pending-pre-publish-identity" => Some("prepare-pending-pre-publish-identity"),
+        "prepare-pending-close" => Some("prepare-pending-close"),
+        "prepare-pending-unlink" => Some("prepare-pending-unlink"),
+        "prepare-pending-postcheck" => Some("prepare-pending-postcheck"),
         "prepare-backup-dir-sync" => Some("prepare-backup-dir-sync"),
+        "prepare-backup-create" => Some("prepare-backup-create"),
+        "prepare-backup-write" => Some("prepare-backup-write"),
+        "prepare-backup-sync" => Some("prepare-backup-sync"),
+        "prepare-backup-close" => Some("prepare-backup-close"),
+        "prepare-backup-postcheck" => Some("prepare-backup-postcheck"),
         "prepare-backup-reopen" => Some("prepare-backup-reopen"),
         "deadline" => Some("deadline"),
         _ => None,
@@ -1854,6 +1863,7 @@ fn unlink_cleaned_evidence_with_diagnostics(
             deadline,
         },
         diagnostic,
+        None,
     ) {
         Ok(identity) => identity,
         Err(()) => {
@@ -2031,13 +2041,399 @@ struct RecoveryBackupRequest<'a> {
     deadline: Instant,
 }
 
-/// Publish a complete backup image before the final recovery unlink while
-/// exposing only a fixed, path-free phase code to the native fixture hook.
-/// This is diagnostic plumbing rather than a recovery fallback: every failure
-/// still returns the original error and therefore remains fail-closed.
+/// Publish a complete final backup with `O_EXCL` before touching the pending
+/// source.  The destination is therefore never populated by a mutable source
+/// pathname, and a pre-existing or concurrently created destination is a
+/// fail-closed conflict rather than an overwrite.
+fn publish_recovery_backup(
+    request: &RecoveryBackupRequest<'_>,
+    diagnostic: &mut Option<&mut CleanupDiagnosticHook<'_>>,
+) -> Result<marker::MarkerFileIdentity, ()> {
+    publish_recovery_backup_with_closer(request, diagnostic, fd::close_file)
+}
+
+/// Keep close-result injection at the exact production publication boundary;
+/// native tests can prove a close failure leaves a restartable pair while the
+/// normal path still uses the descriptor adapter's real close syscall.
+fn publish_recovery_backup_with_closer(
+    request: &RecoveryBackupRequest<'_>,
+    diagnostic: &mut Option<&mut CleanupDiagnosticHook<'_>>,
+    close_file: fn(File) -> std::io::Result<()>,
+) -> Result<marker::MarkerFileIdentity, ()> {
+    let RecoveryBackupRequest {
+        root,
+        root_directory,
+        root_identity,
+        backup,
+        contents,
+        deadline,
+        ..
+    } = request;
+    let root_fd = root_directory.as_raw_fd();
+    if Instant::now() >= *deadline || !has_cleanup_budget(*deadline, CLEANUP_SYSCALL_RESERVE) {
+        emit_marker_remove_stage(diagnostic, "prepare-deadline");
+        return Err(());
+    }
+    if verify_root_path_until(root, root_directory, *root_identity, *deadline).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-root");
+        return Err(());
+    }
+
+    match fd::fstatat_no_follow(root_fd, backup) {
+        Ok(()) => {
+            let mut file = match fd::open_at_file(root_fd, backup) {
+                Ok(file) => file,
+                Err(_) => {
+                    emit_marker_remove_stage(diagnostic, "prepare-backup-open");
+                    return Err(());
+                }
+            };
+            let identity = match validate_recovery_image(&file) {
+                Ok(identity) => identity,
+                Err(()) => {
+                    emit_marker_remove_stage(diagnostic, "prepare-backup-identity");
+                    return Err(());
+                }
+            };
+            let existing = match read_marker_image(&mut file, *deadline) {
+                Ok(existing) => existing,
+                Err(()) => {
+                    emit_marker_remove_stage(diagnostic, "prepare-backup-read");
+                    return Err(());
+                }
+            };
+            if existing != *contents {
+                emit_marker_remove_stage(diagnostic, "prepare-backup-content");
+                return Err(());
+            }
+            if close_file(file).is_err() {
+                emit_marker_remove_stage(diagnostic, "prepare-backup-close");
+                return Err(());
+            }
+            if verify_root_path_until(root, root_directory, *root_identity, *deadline).is_err()
+                || !has_cleanup_budget(*deadline, CLEANUP_SYSCALL_RESERVE)
+            {
+                emit_marker_remove_stage(diagnostic, "prepare-backup-postcheck");
+                return Err(());
+            }
+            if fd::sync_directory(root_directory).is_err() {
+                emit_marker_remove_stage(diagnostic, "prepare-backup-dir-sync");
+                return Err(());
+            }
+            if Instant::now() >= *deadline {
+                emit_marker_remove_stage(diagnostic, "prepare-deadline");
+                return Err(());
+            }
+            let mut final_file = match fd::open_at_file(root_fd, backup) {
+                Ok(file) => file,
+                Err(_) => {
+                    emit_marker_remove_stage(diagnostic, "prepare-backup-postcheck");
+                    return Err(());
+                }
+            };
+            let final_identity = match validate_recovery_image(&final_file) {
+                Ok(identity) => identity,
+                Err(()) => {
+                    emit_marker_remove_stage(diagnostic, "prepare-backup-postcheck");
+                    return Err(());
+                }
+            };
+            let final_image = match read_marker_image(&mut final_file, *deadline) {
+                Ok(image) => image,
+                Err(()) => {
+                    emit_marker_remove_stage(diagnostic, "prepare-backup-postcheck");
+                    return Err(());
+                }
+            };
+            if final_identity != identity || final_image != *contents {
+                emit_marker_remove_stage(diagnostic, "prepare-backup-postcheck");
+                return Err(());
+            }
+            if close_file(final_file).is_err() {
+                emit_marker_remove_stage(diagnostic, "prepare-backup-close");
+                return Err(());
+            }
+            return Ok(final_identity);
+        }
+        Err(_) if fd::last_errno() == fd::ENOENT => {}
+        Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-stat");
+            return Err(());
+        }
+    }
+
+    let mut file = match fd::create_at_file(root_fd, backup, MARKER_MODE) {
+        Ok(file) => file,
+        Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-create");
+            return Err(());
+        }
+    };
+    let initial_identity = match validate_recovery_image(&file) {
+        Ok(identity) => identity,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-identity");
+            return Err(());
+        }
+    };
+    if !has_cleanup_budget(*deadline, CLEANUP_SYSCALL_RESERVE) || file.write_all(contents).is_err()
+    {
+        emit_marker_remove_stage(diagnostic, "prepare-backup-write");
+        return Err(());
+    }
+    if !has_cleanup_budget(*deadline, CLEANUP_SYSCALL_RESERVE) || file.sync_all().is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-backup-sync");
+        return Err(());
+    }
+    if close_file(file).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-backup-close");
+        return Err(());
+    }
+    if Instant::now() >= *deadline {
+        emit_marker_remove_stage(diagnostic, "prepare-deadline");
+        return Err(());
+    }
+
+    // Reopen after the write and file sync.  This is required because the
+    // original descriptor only proves what was written, not what the durable
+    // directory entry currently names.
+    let mut readback = match fd::open_at_file(root_fd, backup) {
+        Ok(file) => file,
+        Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-reopen");
+            return Err(());
+        }
+    };
+    let actual_identity = match validate_recovery_image(&readback) {
+        Ok(identity) => identity,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-identity");
+            return Err(());
+        }
+    };
+    let persisted = match read_marker_image(&mut readback, *deadline) {
+        Ok(image) => image,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-read");
+            return Err(());
+        }
+    };
+    if actual_identity != initial_identity || persisted != *contents {
+        emit_marker_remove_stage(diagnostic, "prepare-backup-content");
+        return Err(());
+    }
+    if close_file(readback).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-backup-close");
+        return Err(());
+    }
+    if verify_root_path_until(root, root_directory, *root_identity, *deadline).is_err()
+        || !has_cleanup_budget(*deadline, CLEANUP_SYSCALL_RESERVE)
+    {
+        emit_marker_remove_stage(diagnostic, "prepare-backup-postcheck");
+        return Err(());
+    }
+    if fd::sync_directory(root_directory).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-backup-dir-sync");
+        return Err(());
+    }
+    if Instant::now() >= *deadline {
+        emit_marker_remove_stage(diagnostic, "prepare-deadline");
+        return Err(());
+    }
+
+    // Revalidate the final basename after the parent directory sync.  The
+    // check cannot promise atomicity against a hostile same-UID peer, but it
+    // rejects ordinary replacement and never authorizes a source rename.
+    let mut final_file = match fd::open_at_file(root_fd, backup) {
+        Ok(file) => file,
+        Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-postcheck");
+            return Err(());
+        }
+    };
+    let final_identity = match validate_recovery_image(&final_file) {
+        Ok(identity) => identity,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-postcheck");
+            return Err(());
+        }
+    };
+    let final_image = match read_marker_image(&mut final_file, *deadline) {
+        Ok(image) => image,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-postcheck");
+            return Err(());
+        }
+    };
+    if final_identity != initial_identity || final_image != *contents {
+        emit_marker_remove_stage(diagnostic, "prepare-backup-postcheck");
+        return Err(());
+    }
+    if close_file(final_file).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-backup-close");
+        return Err(());
+    }
+    Ok(final_identity)
+}
+
+/// Capture the pending inode before a fixture hook can mutate its basename;
+/// the later close phase must compare against this exact identity rather than
+/// against the independent final backup inode.
+fn capture_pending_identity(
+    request: &RecoveryBackupRequest<'_>,
+    diagnostic: &mut Option<&mut CleanupDiagnosticHook<'_>>,
+) -> Result<marker::MarkerFileIdentity, ()> {
+    let RecoveryBackupRequest {
+        root_directory,
+        pending,
+        contents,
+        deadline,
+        ..
+    } = request;
+    if Instant::now() >= *deadline {
+        emit_marker_remove_stage(diagnostic, "prepare-deadline");
+        return Err(());
+    }
+    let root_fd = root_directory.as_raw_fd();
+    let mut file = match fd::open_at_file(root_fd, pending) {
+        Ok(file) => file,
+        Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-pre-publish-identity");
+            return Err(());
+        }
+    };
+    let identity = match validate_recovery_image(&file) {
+        Ok(identity) => identity,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-pre-publish-identity");
+            return Err(());
+        }
+    };
+    let image = match read_marker_image(&mut file, *deadline) {
+        Ok(image) => image,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-read");
+            return Err(());
+        }
+    };
+    if image != *contents {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-pre-publish-identity");
+        return Err(());
+    }
+    if fd::close_file(file).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-close");
+        return Err(());
+    }
+    Ok(identity)
+}
+
+/// Remove only the pending source after a complete final backup is durable.
+/// If any identity, unlink, or directory-sync edge fails, the final backup is
+/// deliberately retained so a later pass can close the duplicate safely. The
+/// expected identity is always the pending inode, never the final backup.
+fn close_pending_after_backup(
+    request: &RecoveryBackupRequest<'_>,
+    expected_pending_identity: marker::MarkerFileIdentity,
+    diagnostic: &mut Option<&mut CleanupDiagnosticHook<'_>>,
+) -> Result<(), ()> {
+    let RecoveryBackupRequest {
+        root,
+        root_directory,
+        root_identity,
+        pending,
+        contents,
+        deadline,
+        ..
+    } = request;
+    let root_fd = root_directory.as_raw_fd();
+    if Instant::now() >= *deadline || !has_cleanup_budget(*deadline, CLEANUP_SYSCALL_RESERVE) {
+        emit_marker_remove_stage(diagnostic, "prepare-deadline");
+        return Err(());
+    }
+    let mut file = match fd::open_at_file(root_fd, pending) {
+        Ok(file) => file,
+        Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-unlink");
+            return Err(());
+        }
+    };
+    let identity = match validate_recovery_image(&file) {
+        Ok(identity) => identity,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-pre-publish-identity");
+            return Err(());
+        }
+    };
+    let image = match read_marker_image(&mut file, *deadline) {
+        Ok(image) => image,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-read");
+            return Err(());
+        }
+    };
+    if identity != expected_pending_identity || image != *contents {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-pre-publish-identity");
+        return Err(());
+    }
+    if fd::close_file(file).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-close");
+        return Err(());
+    }
+    if verify_root_path_until(root, root_directory, *root_identity, *deadline).is_err()
+        || !has_cleanup_budget(*deadline, CLEANUP_SYSCALL_RESERVE)
+    {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-root");
+        return Err(());
+    }
+    if fd::unlink_at(root_fd, pending).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-unlink");
+        return Err(());
+    }
+    match fd::fstatat_no_follow(root_fd, pending) {
+        Err(_) if fd::last_errno() == fd::ENOENT => {}
+        Ok(()) | Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-postcheck");
+            return Err(());
+        }
+    }
+    if verify_root_path_until(root, root_directory, *root_identity, *deadline).is_err()
+        || !has_cleanup_budget(*deadline, CLEANUP_SYSCALL_RESERVE)
+    {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-postcheck");
+        return Err(());
+    }
+    if fd::sync_directory(root_directory).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-dir-sync");
+        return Err(());
+    }
+    if Instant::now() >= *deadline
+        || verify_root_path_until(root, root_directory, *root_identity, *deadline).is_err()
+    {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-postcheck");
+        return Err(());
+    }
+    match fd::fstatat_no_follow(root_fd, pending) {
+        Err(_) if fd::last_errno() == fd::ENOENT => {}
+        Ok(()) | Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-postcheck");
+            return Err(());
+        }
+    }
+    if Instant::now() >= *deadline {
+        emit_marker_remove_stage(diagnostic, "prepare-deadline");
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Resume or create final recovery evidence without ever renaming a mutable
+/// pending pathname over the destination.  A failed post-publication hook
+/// leaves both the durable final image and the mutated pending evidence for
+/// the next bounded cleanup pass.
 fn prepare_recovery_backup(
     request: RecoveryBackupRequest<'_>,
     diagnostic: &mut Option<&mut CleanupDiagnosticHook<'_>>,
+    post_backup_hook: Option<&mut PendingPostBackupHook<'_>>,
 ) -> Result<marker::MarkerFileIdentity, ()> {
     let RecoveryBackupRequest {
         root,
@@ -2057,55 +2453,50 @@ fn prepare_recovery_backup(
         emit_marker_remove_stage(diagnostic, "prepare-root");
         return Err(());
     }
-    if fd::fstatat_no_follow(root_fd, backup).is_ok() {
-        if fd::fstatat_no_follow(root_fd, pending).is_ok() {
-            // A second staging entry means the previous publication did not
-            // reach a single settled state; keep both images for the next
-            // bounded pass instead of claiming this transaction complete.
-            emit_marker_remove_stage(diagnostic, "prepare-backup-conflict");
+
+    let backup_exists = match fd::fstatat_no_follow(root_fd, backup) {
+        Ok(()) => true,
+        Err(_) if fd::last_errno() == fd::ENOENT => false,
+        Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-stat");
             return Err(());
         }
-        if fd::last_errno() != fd::ENOENT {
-            emit_marker_remove_stage(diagnostic, "prepare-pending-stat");
-            return Err(());
-        }
-        let mut file = match fd::open_at_file(root_fd, backup) {
-            Ok(file) => file,
+    };
+    if backup_exists {
+        let request = RecoveryBackupRequest {
+            root,
+            root_directory,
+            root_identity,
+            backup,
+            pending,
+            contents,
+            deadline,
+        };
+        let backup_identity = publish_recovery_backup(&request, diagnostic)?;
+        match fd::fstatat_no_follow(root_fd, pending) {
+            Err(_) if fd::last_errno() == fd::ENOENT => return Ok(backup_identity),
+            Ok(()) => {}
             Err(_) => {
-                emit_marker_remove_stage(diagnostic, "prepare-backup-open");
+                emit_marker_remove_stage(diagnostic, "prepare-pending-stat");
                 return Err(());
             }
-        };
-        let identity = match validate_recovery_image(&file) {
-            Ok(identity) => identity,
-            Err(()) => {
-                emit_marker_remove_stage(diagnostic, "prepare-backup-identity");
-                return Err(());
-            }
-        };
-        let existing = match read_marker_image(&mut file, deadline) {
-            Ok(existing) => existing,
-            Err(()) => {
-                emit_marker_remove_stage(diagnostic, "prepare-backup-read");
-                return Err(());
-            }
-        };
-        if existing != contents || identity.uid != process::current_uid() {
-            emit_marker_remove_stage(diagnostic, "prepare-backup-content");
-            return Err(());
         }
-        return Ok(identity);
-    }
-    if fd::last_errno() != fd::ENOENT {
-        emit_marker_remove_stage(diagnostic, "prepare-backup-stat");
-        return Err(());
+        let pending_identity = capture_pending_identity(&request, diagnostic)?;
+        if let Some(hook) = post_backup_hook {
+            if !hook() {
+                emit_marker_remove_stage(diagnostic, "prepare-deadline");
+                return Err(());
+            }
+        }
+        close_pending_after_backup(&request, pending_identity, diagnostic)?;
+        return Ok(backup_identity);
     }
 
-    let mut pending_file = match fd::open_at_file(root_fd, pending) {
-        Ok(file) => file,
+    let (mut pending_file, pending_created) = match fd::open_at_file(root_fd, pending) {
+        Ok(file) => (file, false),
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
             match fd::create_at_file(root_fd, pending, MARKER_MODE) {
-                Ok(file) => file,
+                Ok(file) => (file, true),
                 Err(_) => {
                     emit_marker_remove_stage(diagnostic, "prepare-pending-create");
                     return Err(());
@@ -2124,84 +2515,126 @@ fn prepare_recovery_backup(
             return Err(());
         }
     };
-    let existing = match read_marker_image(&mut pending_file, deadline) {
-        Ok(existing) => existing,
-        Err(()) => {
-            emit_marker_remove_stage(diagnostic, "prepare-pending-read");
-            return Err(());
+    let existing = if pending_created {
+        // The O_EXCL create is write-only; its read-back is intentionally done
+        // through a fresh descriptor after the complete image is synced.
+        Vec::new()
+    } else {
+        match read_marker_image(&mut pending_file, deadline) {
+            Ok(existing) => existing,
+            Err(()) => {
+                emit_marker_remove_stage(diagnostic, "prepare-pending-read");
+                return Err(());
+            }
         }
     };
     if !existing.is_empty() && existing != contents {
         emit_marker_remove_stage(diagnostic, "prepare-pending-content");
         return Err(());
     }
-    if existing.is_empty() && pending_file.write_all(contents).is_err() {
-        emit_marker_remove_stage(diagnostic, "prepare-pending-write");
+    if pending_created {
+        if pending_file.write_all(contents).is_err() {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-write");
+            return Err(());
+        }
+    } else if existing.is_empty() {
+        // A pre-existing empty pending file is crash residue, not an
+        // authorization to mutate the original image before final backup
+        // publication; preserve it for the next bounded recovery pass.
+        emit_marker_remove_stage(diagnostic, "prepare-pending-content");
         return Err(());
     }
-    if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
-        emit_marker_remove_stage(diagnostic, "prepare-deadline");
-        return Err(());
-    }
-    if pending_file.sync_all().is_err() {
+    if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) || pending_file.sync_all().is_err() {
         emit_marker_remove_stage(diagnostic, "prepare-pending-sync");
         return Err(());
     }
-    drop(pending_file);
-    if verify_root_path_until(root, root_directory, root_identity, deadline).is_err() {
+    if fd::close_file(pending_file).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-close");
+        return Err(());
+    }
+
+    let mut pending_readback = match fd::open_at_file(root_fd, pending) {
+        Ok(file) => file,
+        Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-reopen");
+            return Err(());
+        }
+    };
+    let actual_pending_identity = match validate_recovery_image(&pending_readback) {
+        Ok(identity) => identity,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-identity");
+            return Err(());
+        }
+    };
+    let persisted = match read_marker_image(&mut pending_readback, deadline) {
+        Ok(image) => image,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-read");
+            return Err(());
+        }
+    };
+    if actual_pending_identity != pending_identity || persisted != contents {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-content");
+        return Err(());
+    }
+    if fd::close_file(pending_readback).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-close");
+        return Err(());
+    }
+
+    // Rebind the pending name once more before publishing the independent
+    // final file.  This protects the evidence pairing without authorizing a
+    // rename from that mutable pathname.
+    let pending_path_file = match fd::open_at_file(root_fd, pending) {
+        Ok(file) => file,
+        Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-pre-publish-identity");
+            return Err(());
+        }
+    };
+    let pathname_pending_identity = match validate_recovery_image(&pending_path_file) {
+        Ok(identity) => identity,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-pre-publish-identity");
+            return Err(());
+        }
+    };
+    if pathname_pending_identity != pending_identity
+        || pathname_pending_identity != actual_pending_identity
+    {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-pre-publish-identity");
+        return Err(());
+    }
+    if fd::close_file(pending_path_file).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-close");
+        return Err(());
+    }
+    if verify_root_path_until(root, root_directory, root_identity, deadline).is_err()
+        || !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE)
+    {
         emit_marker_remove_stage(diagnostic, "prepare-pending-root");
         return Err(());
     }
-    if fd::sync_directory(root_directory).is_err() {
-        emit_marker_remove_stage(diagnostic, "prepare-pending-dir-sync");
-        return Err(());
-    }
-    if Instant::now() >= deadline {
-        emit_marker_remove_stage(diagnostic, "prepare-deadline");
-        return Err(());
-    }
-    if fd::rename_at(root_fd, pending, backup).is_err() {
-        emit_marker_remove_stage(diagnostic, "prepare-pending-rename");
-        return Err(());
-    }
-    if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
-        emit_marker_remove_stage(diagnostic, "prepare-deadline");
-        return Err(());
-    }
-    if fd::sync_directory(root_directory).is_err() {
-        emit_marker_remove_stage(diagnostic, "prepare-backup-dir-sync");
-        return Err(());
-    }
-    if Instant::now() >= deadline {
-        emit_marker_remove_stage(diagnostic, "prepare-deadline");
-        return Err(());
-    }
-    let mut backup_file = match fd::open_at_file(root_fd, backup) {
-        Ok(file) => file,
-        Err(_) => {
-            emit_marker_remove_stage(diagnostic, "prepare-backup-reopen");
+
+    let request = RecoveryBackupRequest {
+        root,
+        root_directory,
+        root_identity,
+        backup,
+        pending,
+        contents,
+        deadline,
+    };
+    let backup_identity = publish_recovery_backup(&request, diagnostic)?;
+    if let Some(hook) = post_backup_hook {
+        if !hook() {
+            emit_marker_remove_stage(diagnostic, "prepare-deadline");
             return Err(());
         }
-    };
-    let actual = match validate_recovery_image(&backup_file) {
-        Ok(identity) => identity,
-        Err(()) => {
-            emit_marker_remove_stage(diagnostic, "prepare-backup-identity");
-            return Err(());
-        }
-    };
-    let image = match read_marker_image(&mut backup_file, deadline) {
-        Ok(image) => image,
-        Err(()) => {
-            emit_marker_remove_stage(diagnostic, "prepare-backup-read");
-            return Err(());
-        }
-    };
-    if actual != pending_identity || image != contents {
-        emit_marker_remove_stage(diagnostic, "prepare-backup-content");
-        return Err(());
     }
-    Ok(actual)
+    close_pending_after_backup(&request, pathname_pending_identity, diagnostic)?;
+    Ok(backup_identity)
 }
 
 /// Verify the owner-only regular-file invariants shared by recovery aliases.
@@ -3058,7 +3491,6 @@ mod unit_tests {
             "prepare-deadline",
             "prepare-root",
             "prepare-backup-stat",
-            "prepare-backup-conflict",
             "prepare-backup-open",
             "prepare-backup-identity",
             "prepare-backup-read",
@@ -3073,8 +3505,17 @@ mod unit_tests {
             "prepare-pending-sync",
             "prepare-pending-root",
             "prepare-pending-dir-sync",
-            "prepare-pending-rename",
+            "prepare-pending-reopen",
+            "prepare-pending-pre-publish-identity",
+            "prepare-pending-close",
+            "prepare-pending-unlink",
+            "prepare-pending-postcheck",
             "prepare-backup-dir-sync",
+            "prepare-backup-create",
+            "prepare-backup-write",
+            "prepare-backup-sync",
+            "prepare-backup-close",
+            "prepare-backup-postcheck",
             "prepare-backup-reopen",
             "deadline",
         ] {
@@ -3554,6 +3995,465 @@ mod unit_tests {
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty(), "unresolved evidence: {leftovers:?}");
         fs::remove_dir(&root).expect("root cleanup");
+    }
+
+    /// Exercise the production recovery transaction's post-publication seam
+    /// against replacement, rename, hardlink, symlink, query-loss, and
+    /// deadline faults.  Each fault must preserve both the durable final
+    /// image and the mutated pending evidence for restart diagnosis.
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy)]
+    enum PendingPostBackupFault {
+        Replace,
+        Rename,
+        Hardlink,
+        Symlink,
+        QueryFailure,
+        Timeout,
+    }
+
+    /// Run one post-publication fault through the same production backup
+    /// publisher; the callback mutates only the pending source after the
+    /// independently published final image has been durably read back.
+    #[cfg(target_os = "macos")]
+    fn run_pending_post_backup_fault(fault: PendingPostBackupFault) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ja-pending-post-backup-{nonce}"));
+        fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let target = b".ja-sandbox-recovery.ja-sandbox-log-helper-42-999992.marker";
+        let backup = b".ja-sandbox-cleaned.ja-sandbox-log-helper-42-999992.marker";
+        let pending = b".ja-sandbox-log-helper-42-999992.marker.pending";
+        let moved = b".ja-sandbox-log-helper-42-999992.marker.moved";
+        let hardlink = b".ja-sandbox-log-helper-42-999992.marker.hardlink";
+        let contents = b"owner_pid=42\nnonce=999992\npid=999992\npgid=999993\nstart_identity=fixture\nexecutable_kind=log\nstate=active\n";
+        let (root_directory, root_identity) = open_verified_root_directory(&root).expect("open");
+        let root_fd = root_directory.as_raw_fd();
+        let mut target_file = fd::create_at_file(root_fd, target, MARKER_MODE).expect("target");
+        target_file.write_all(contents).expect("target image");
+        target_file.sync_all().expect("target sync");
+        drop(target_file);
+        fd::sync_directory(&root_directory).expect("target directory sync");
+
+        let pending_path = root.join(std::str::from_utf8(pending).expect("pending name"));
+        let moved_path = root.join(std::str::from_utf8(moved).expect("moved name"));
+        let hardlink_path = root.join(std::str::from_utf8(hardlink).expect("hardlink name"));
+        let backup_path = root.join(std::str::from_utf8(backup).expect("backup name"));
+        let mut hook = || -> bool {
+            match fault {
+                PendingPostBackupFault::Replace => {
+                    fd::unlink_at(root_fd, pending).expect("replace unlink");
+                    let mut replacement =
+                        fd::create_at_file(root_fd, pending, MARKER_MODE).expect("replacement");
+                    replacement
+                        .write_all(b"replacement")
+                        .expect("replacement image");
+                    replacement.sync_all().expect("replacement sync");
+                }
+                PendingPostBackupFault::Rename => {
+                    fd::rename_at(root_fd, pending, moved).expect("pending rename");
+                }
+                PendingPostBackupFault::Hardlink => {
+                    fs::hard_link(&pending_path, &hardlink_path).expect("pending hardlink");
+                }
+                PendingPostBackupFault::Symlink => {
+                    fd::rename_at(root_fd, pending, moved).expect("symlink source rename");
+                    symlink(&moved_path, &pending_path).expect("pending symlink");
+                }
+                PendingPostBackupFault::QueryFailure => {
+                    fd::unlink_at(root_fd, pending).expect("query failure unlink");
+                    fs::create_dir(&pending_path).expect("query failure directory");
+                }
+                PendingPostBackupFault::Timeout => return false,
+            }
+            true
+        };
+        let mut diagnostic: Option<&mut CleanupDiagnosticHook<'_>> = None;
+        let result = prepare_recovery_backup(
+            RecoveryBackupRequest {
+                root: &root,
+                root_directory: &root_directory,
+                root_identity,
+                backup,
+                pending,
+                contents,
+                deadline: Instant::now() + CLEANUP_DEADLINE,
+            },
+            &mut diagnostic,
+            Some(&mut hook),
+        );
+        assert!(result.is_err(), "post-backup fault was accepted");
+        assert!(
+            backup_path.exists(),
+            "post-backup fault lost durable backup evidence"
+        );
+        assert_eq!(
+            fs::read(&backup_path).expect("durable backup read-back"),
+            contents,
+            "post-backup fault left an incomplete final image"
+        );
+        assert!(
+            root.join(std::str::from_utf8(target).expect("target name"))
+                .exists(),
+            "active evidence was removed"
+        );
+        match fault {
+            PendingPostBackupFault::Rename | PendingPostBackupFault::Symlink => {
+                assert!(moved_path.exists(), "renamed evidence disappeared");
+            }
+            PendingPostBackupFault::Hardlink => {
+                assert!(pending_path.exists(), "hardlink source disappeared");
+                assert!(hardlink_path.exists(), "hardlink evidence disappeared");
+            }
+            PendingPostBackupFault::Replace | PendingPostBackupFault::Timeout => {
+                assert!(pending_path.exists(), "pending evidence disappeared");
+            }
+            PendingPostBackupFault::QueryFailure => {
+                assert!(pending_path.exists(), "query failure evidence disappeared");
+            }
+        }
+        drop(root_directory);
+        for name in [
+            &target[..],
+            &pending[..],
+            &moved[..],
+            &hardlink[..],
+            &backup[..],
+        ] {
+            let path = root.join(std::str::from_utf8(name).expect("cleanup name"));
+            if fs::remove_file(&path).is_err() {
+                let _ = fs::remove_dir(path);
+            }
+        }
+        fs::remove_dir(root).expect("root cleanup");
+    }
+
+    /// Ensure every post-publication mutation path leaves a complete final
+    /// image and refuses to unlink a replaced pending source.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_post_backup_faults_remain_fail_closed() {
+        for fault in [
+            PendingPostBackupFault::Replace,
+            PendingPostBackupFault::Rename,
+            PendingPostBackupFault::Hardlink,
+            PendingPostBackupFault::Symlink,
+            PendingPostBackupFault::QueryFailure,
+            PendingPostBackupFault::Timeout,
+        ] {
+            run_pending_post_backup_fault(fault);
+        }
+    }
+
+    /// Refuse a destination that was created before this transaction; direct
+    /// O_EXCL publication must never overwrite a complete or protected image.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn direct_final_publish_refuses_precreated_destination() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ja-precreated-final-{nonce}"));
+        fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let backup = b".ja-sandbox-cleaned.ja-sandbox-log-helper-42-999993.marker";
+        let pending = b".ja-sandbox-log-helper-42-999993.marker.pending";
+        let contents = b"owner_pid=42\nnonce=999993\npid=999993\npgid=999994\nstart_identity=fixture\nexecutable_kind=log\nstate=active\n";
+        let (root_directory, root_identity) = open_verified_root_directory(&root).expect("open");
+        let root_fd = root_directory.as_raw_fd();
+        let mut protected = fd::create_at_file(root_fd, backup, MARKER_MODE).expect("backup");
+        protected
+            .write_all(b"protected-final")
+            .expect("protected image");
+        protected.sync_all().expect("protected sync");
+        drop(protected);
+        let mut pending_file = fd::create_at_file(root_fd, pending, MARKER_MODE).expect("pending");
+        pending_file.write_all(contents).expect("pending image");
+        pending_file.sync_all().expect("pending sync");
+        drop(pending_file);
+        fd::sync_directory(&root_directory).expect("directory sync");
+        let mut diagnostic: Option<&mut CleanupDiagnosticHook<'_>> = None;
+        let result = prepare_recovery_backup(
+            RecoveryBackupRequest {
+                root: &root,
+                root_directory: &root_directory,
+                root_identity,
+                backup,
+                pending,
+                contents,
+                deadline: Instant::now() + CLEANUP_DEADLINE,
+            },
+            &mut diagnostic,
+            None,
+        );
+        assert!(result.is_err(), "pre-created final was overwritten");
+        assert_eq!(
+            fs::read(root.join(std::str::from_utf8(backup).expect("backup name")))
+                .expect("backup read"),
+            b"protected-final"
+        );
+        assert!(
+            root.join(std::str::from_utf8(pending).expect("pending name"))
+                .exists()
+        );
+        drop(root_directory);
+        fs::remove_file(root.join(std::str::from_utf8(backup).expect("backup name")))
+            .expect("backup cleanup");
+        fs::remove_file(root.join(std::str::from_utf8(pending).expect("pending name")))
+            .expect("pending cleanup");
+        fs::remove_dir(root).expect("root cleanup");
+    }
+
+    /// Preserve a pre-existing empty staging inode instead of filling it
+    /// before an independent final image has reached durable publication.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preexisting_empty_pending_is_not_mutated_before_publish() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ja-empty-pending-{nonce}"));
+        fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let backup = b".ja-sandbox-cleaned.ja-sandbox-log-helper-42-999995.marker";
+        let pending = b".ja-sandbox-log-helper-42-999995.marker.pending";
+        let contents = b"owner_pid=42\nnonce=999995\npid=999995\npgid=999996\nstart_identity=fixture\nexecutable_kind=log\nstate=active\n";
+        let (root_directory, root_identity) = open_verified_root_directory(&root).expect("open");
+        let root_fd = root_directory.as_raw_fd();
+        let pending_file = fd::create_at_file(root_fd, pending, MARKER_MODE).expect("pending");
+        pending_file.sync_all().expect("pending sync");
+        drop(pending_file);
+        fd::sync_directory(&root_directory).expect("directory sync");
+        let mut diagnostic: Option<&mut CleanupDiagnosticHook<'_>> = None;
+        let result = prepare_recovery_backup(
+            RecoveryBackupRequest {
+                root: &root,
+                root_directory: &root_directory,
+                root_identity,
+                backup,
+                pending,
+                contents,
+                deadline: Instant::now() + CLEANUP_DEADLINE,
+            },
+            &mut diagnostic,
+            None,
+        );
+        assert!(result.is_err(), "empty pre-existing pending was filled");
+        assert!(
+            !root
+                .join(std::str::from_utf8(backup).expect("backup name"))
+                .exists()
+        );
+        assert_eq!(
+            fs::metadata(root.join(std::str::from_utf8(pending).expect("pending name")))
+                .expect("pending metadata")
+                .len(),
+            0
+        );
+        drop(root_directory);
+        fs::remove_file(root.join(std::str::from_utf8(pending).expect("pending name")))
+            .expect("pending cleanup");
+        fs::remove_dir(root).expect("root cleanup");
+    }
+
+    /// Treat a crash-like partial final as unresolved evidence; restart must
+    /// not overwrite it from a mutable pending source or claim success.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restart_with_partial_final_never_overwrites_destination() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ja-partial-final-{nonce}"));
+        fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let backup = b".ja-sandbox-cleaned.ja-sandbox-log-helper-42-999996.marker";
+        let pending = b".ja-sandbox-log-helper-42-999996.marker.pending";
+        let contents = b"owner_pid=42\nnonce=999996\npid=999996\npgid=999997\nstart_identity=fixture\nexecutable_kind=log\nstate=active\n";
+        let (root_directory, root_identity) = open_verified_root_directory(&root).expect("open");
+        let root_fd = root_directory.as_raw_fd();
+        let mut partial = fd::create_at_file(root_fd, backup, MARKER_MODE).expect("backup");
+        partial.write_all(b"owner_pid=42\n").expect("partial image");
+        partial.sync_all().expect("partial sync");
+        drop(partial);
+        let mut pending_file = fd::create_at_file(root_fd, pending, MARKER_MODE).expect("pending");
+        pending_file.write_all(contents).expect("pending image");
+        pending_file.sync_all().expect("pending sync");
+        drop(pending_file);
+        fd::sync_directory(&root_directory).expect("directory sync");
+        let mut diagnostic: Option<&mut CleanupDiagnosticHook<'_>> = None;
+        assert!(
+            prepare_recovery_backup(
+                RecoveryBackupRequest {
+                    root: &root,
+                    root_directory: &root_directory,
+                    root_identity,
+                    backup,
+                    pending,
+                    contents,
+                    deadline: Instant::now() + CLEANUP_DEADLINE,
+                },
+                &mut diagnostic,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(root.join(std::str::from_utf8(backup).expect("backup name")))
+                .expect("partial backup read"),
+            b"owner_pid=42\n"
+        );
+        assert!(
+            root.join(std::str::from_utf8(pending).expect("pending name"))
+                .exists()
+        );
+        drop(root_directory);
+        fs::remove_file(root.join(std::str::from_utf8(backup).expect("backup name")))
+            .expect("backup cleanup");
+        fs::remove_file(root.join(std::str::from_utf8(pending).expect("pending name")))
+            .expect("pending cleanup");
+        fs::remove_dir(root).expect("root cleanup");
+    }
+
+    /// Exercise the production publisher with a close fault at the exact
+    /// final-file boundary; a later normal pass must resume the retained pair.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn final_close_failure_keeps_pair_for_restart() {
+        fn fail_close(_: File) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected close failure"))
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ja-close-failure-{nonce}"));
+        fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let backup = b".ja-sandbox-cleaned.ja-sandbox-log-helper-42-999997.marker";
+        let pending = b".ja-sandbox-log-helper-42-999997.marker.pending";
+        let contents = b"owner_pid=42\nnonce=999997\npid=999997\npgid=999998\nstart_identity=fixture\nexecutable_kind=log\nstate=active\n";
+        let (root_directory, root_identity) = open_verified_root_directory(&root).expect("open");
+        let root_fd = root_directory.as_raw_fd();
+        let mut pending_file = fd::create_at_file(root_fd, pending, MARKER_MODE).expect("pending");
+        pending_file.write_all(contents).expect("pending image");
+        pending_file.sync_all().expect("pending sync");
+        drop(pending_file);
+        fd::sync_directory(&root_directory).expect("directory sync");
+        let request = RecoveryBackupRequest {
+            root: &root,
+            root_directory: &root_directory,
+            root_identity,
+            backup,
+            pending,
+            contents,
+            deadline: Instant::now() + CLEANUP_DEADLINE,
+        };
+        let mut diagnostic: Option<&mut CleanupDiagnosticHook<'_>> = None;
+        assert!(
+            publish_recovery_backup_with_closer(&request, &mut diagnostic, fail_close).is_err()
+        );
+        assert_eq!(
+            fs::read(root.join(std::str::from_utf8(backup).expect("backup name")))
+                .expect("retained backup"),
+            contents
+        );
+        assert!(
+            root.join(std::str::from_utf8(pending).expect("pending name"))
+                .exists()
+        );
+        let mut diagnostic: Option<&mut CleanupDiagnosticHook<'_>> = None;
+        prepare_recovery_backup(request, &mut diagnostic, None).expect("restart pair");
+        assert!(
+            !root
+                .join(std::str::from_utf8(pending).expect("pending name"))
+                .exists()
+        );
+        drop(root_directory);
+        fs::remove_file(root.join(std::str::from_utf8(backup).expect("backup name")))
+            .expect("backup cleanup");
+        fs::remove_dir(root).expect("root cleanup");
+    }
+
+    /// Resume a crash-like state containing both a durable final and pending
+    /// image; the restart pass closes only the verified pending duplicate.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restart_with_durable_final_and_pending_closes_duplicate() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ja-restart-final-{nonce}"));
+        fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let backup = b".ja-sandbox-cleaned.ja-sandbox-log-helper-42-999994.marker";
+        let pending = b".ja-sandbox-log-helper-42-999994.marker.pending";
+        let contents = b"owner_pid=42\nnonce=999994\npid=999994\npgid=999995\nstart_identity=fixture\nexecutable_kind=log\nstate=active\n";
+        let (root_directory, root_identity) = open_verified_root_directory(&root).expect("open");
+        let root_fd = root_directory.as_raw_fd();
+        for name in [&backup[..], &pending[..]] {
+            let mut file = fd::create_at_file(root_fd, name, MARKER_MODE).expect("evidence");
+            file.write_all(contents).expect("image");
+            file.sync_all().expect("file sync");
+            drop(file);
+        }
+        fd::sync_directory(&root_directory).expect("directory sync");
+        let mut diagnostic: Option<&mut CleanupDiagnosticHook<'_>> = None;
+        let result = prepare_recovery_backup(
+            RecoveryBackupRequest {
+                root: &root,
+                root_directory: &root_directory,
+                root_identity,
+                backup,
+                pending,
+                contents,
+                deadline: Instant::now() + CLEANUP_DEADLINE,
+            },
+            &mut diagnostic,
+            None,
+        )
+        .expect("restart cleanup");
+        assert_eq!(
+            fs::read(root.join(std::str::from_utf8(backup).expect("backup name")))
+                .expect("backup read"),
+            contents
+        );
+        assert!(
+            !root
+                .join(std::str::from_utf8(pending).expect("pending name"))
+                .exists()
+        );
+        assert_eq!(result.nlink, 1);
+        drop(root_directory);
+        fs::remove_file(root.join(std::str::from_utf8(backup).expect("backup name")))
+            .expect("backup cleanup");
+        fs::remove_dir(root).expect("root cleanup");
     }
 
     /// Drive the real fd-relative marker transaction through a failed open and
@@ -4190,6 +5090,7 @@ mod unit_tests {
                 deadline: Instant::now() + CLEANUP_DEADLINE,
             },
             &mut diagnostic,
+            None,
         )
         .expect("retained backup");
         fd::unlink_at(root_fd, original).expect("simulate target unlink");

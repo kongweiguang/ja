@@ -13,7 +13,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::ptr;
 use std::slice;
 
@@ -105,6 +105,8 @@ pub(super) fn open_at_file(root_fd: RawFd, name: &[u8]) -> io::Result<File> {
 
 /// Create a recovery evidence file relative to the verified root; O_EXCL and
 /// no-follow prevent an existing marker or symlink from being overwritten.
+/// The descriptor is intentionally write-only, so a caller that must verify
+/// persisted bytes must close and reopen the entry through this same root fd.
 pub(super) fn create_at_file(root_fd: RawFd, name: &[u8], mode: c_uint) -> io::Result<File> {
     let name = CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
     let fd = unsafe {
@@ -119,6 +121,19 @@ pub(super) fn create_at_file(root_fd: RawFd, name: &[u8], mode: c_uint) -> io::R
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Close an owned file descriptor explicitly so a close failure cannot be
+/// hidden by `File`'s infallible `Drop`; callers must fail closed when this
+/// operation reports an error after a durable write.
+pub(super) fn close_file(file: File) -> io::Result<()> {
+    let fd = file.into_raw_fd();
+    let result = unsafe { libc::close(fd) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Ask Darwin for the directory-entry stat without following a symlink; the
@@ -243,11 +258,11 @@ fn set_errno(value: i32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectoryStream, ENOENT, create_at_file, fstatat_no_follow, open_at_file, rename_at,
-        rename_at_no_replace, sync_directory, unlink_at,
+        DirectoryStream, ENOENT, close_file, create_at_file, fstatat_no_follow, open_at_file,
+        rename_at, rename_at_no_replace, sync_directory, unlink_at,
     };
     use std::fs::{self, DirBuilder, OpenOptions};
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -352,5 +367,78 @@ mod tests {
         drop(pending);
         sync_directory(&directory).expect("directory sync");
         fs::remove_dir_all(&root).expect("private root cleanup");
+    }
+
+    /// Prove that the generic publisher remains write-only while production
+    /// read-back must reopen the same descriptor-relative entry with the
+    /// verified root; this prevents a write buffer from masquerading as a
+    /// durable image.
+    #[test]
+    fn write_only_create_requires_descriptor_relative_readback() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ja-fd-readback-{}-{nonce}", std::process::id()));
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .expect("private root");
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(super::O_NOFOLLOW | super::O_CLOEXEC)
+            .open(&root)
+            .expect("root fd");
+        let root_fd = directory.as_raw_fd();
+        let mut write_only = create_at_file(root_fd, b"pending", 0o600).expect("pending create");
+        write_only
+            .write_all(b"durable pending")
+            .expect("pending write");
+        write_only.sync_all().expect("pending sync");
+        let mut rejected = Vec::new();
+        assert!(
+            write_only.read_to_end(&mut rejected).is_err(),
+            "write-only publisher unexpectedly became readable"
+        );
+        drop(write_only);
+
+        let mut readback = open_at_file(root_fd, b"pending").expect("pending reopen");
+        let mut image = Vec::new();
+        readback.read_to_end(&mut image).expect("pending read-back");
+        assert_eq!(image, b"durable pending");
+        drop(readback);
+        sync_directory(&directory).expect("directory sync");
+        unlink_at(root_fd, b"pending").expect("pending cleanup");
+        sync_directory(&directory).expect("cleanup sync");
+        drop(directory);
+        fs::remove_dir(&root).expect("private root cleanup");
+    }
+
+    /// Keep the explicit close path exercised so durable publishers cannot
+    /// silently fall back to `File::drop` when the descriptor is owned.
+    #[test]
+    fn explicit_file_close_reports_success() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ja-fd-close-{}-{nonce}", std::process::id()));
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .expect("private root");
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(super::O_NOFOLLOW | super::O_CLOEXEC)
+            .open(&root)
+            .expect("root fd");
+        let file = create_at_file(directory.as_raw_fd(), b"closed", 0o600).expect("file");
+        close_file(file).expect("explicit close");
+        sync_directory(&directory).expect("directory sync");
+        unlink_at(directory.as_raw_fd(), b"closed").expect("cleanup");
+        sync_directory(&directory).expect("cleanup sync");
+        drop(directory);
+        fs::remove_dir(&root).expect("private root cleanup");
     }
 }

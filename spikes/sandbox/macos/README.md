@@ -52,7 +52,7 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   CI 下先在 spawn 前以 0600 准备 primary/fallback/emergency marker；spawn 后再将精确
   PID/PGID、owner、nonce、executable kind 与 start identity 原子替换激活。每个 marker
   打开时使用 no-follow/close-on-exec，并在写前后校验 regular-file、当前 uid、0600、单
-  hardlink 和 inode identity。rename 后同步 parent directory；这只承诺已向 macOS 文件
+  hardlink 和 inode identity。每次原子发布或删除后同步 parent directory；这只承诺已向 macOS 文件
   系统 API 请求 file/parent-directory durability，不承诺底层磁盘、runner 异常断电或
   外部存储的更强保证。workflow 以 20 秒短窗口校验文件名、全部身份字段和 stat 属性，
   并调用与探针相同的 `marker_cleanup` Rust 实现；它从内核 errno 严格区分 `ESRCH`
@@ -62,12 +62,21 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   marker cleanup 会先打开并校验 owner-private root directory，再通过持有的
   Darwin `fdopendir/readdir` 扫描和 `openat` 重新打开 marker，删除则使用同一个
   dirfd 的 `renameat/unlinkat`；因此授权扫描、marker open 与删除不会各自解析一份
-  可替换的 root pathname。active marker 会先在该目录内原子改名为
-  `.ja-sandbox-cleaned.*`，并在同一目录内写入 `.ja-sandbox-recovery.*` 原始镜像后
-  fsync；目录描述符先尝试 Darwin `F_FULLFSYNC`，对目录不支持该 regular-file
+  可替换的 root pathname。active marker 的恢复副本不再把可变 pending pathname
+  rename 到 final：cleanup 先在同一 rootfd 以 `O_EXCL|O_NOFOLLOW|O_CLOEXEC|0600`
+  直接创建 `.ja-sandbox-cleaned.*` 或 `.ja-sandbox-recovery.*` final，完整写入、
+  文件 fsync、显式 close（close 失败也 fail-closed）后重新 open/read-back/identity 校验，再同步 parent directory。
+  已存在的 final 只在完整 image 与捕获内容一致时复用，预创建或竞争创建的冲突绝不覆盖。
+  预存在的空或不一致 pending 也不会被改写；只有本轮以 O_EXCL 创建并完成的 staging
+  才会被填充。只有 final durable 后才允许 unlink pending；pending 的 identity、bytes、rootfd 和
+  删除后 `ENOENT`/目录 fsync 都会再次确认。目录描述符先尝试 Darwin `F_FULLFSYNC`，对目录不支持该 regular-file
   操作时仅回退到 `fsync(dirfd)`，普通文件仍使用文件级 `F_FULLFSYNC`；两种目录
   同步都失败都会 fail-closed。同一轮保持完整 backup 直到 recovery 的最终 unlink 与目录 fsync 都成功，
   然后才删除 backup，所以成功的 active cleanup 不留下 cleaned/recovery evidence。
+  这避免 pending source 被替换后通过普通 rename 覆盖 final；macOS 没有 pidfd/目录项
+  事务可让同一 UID 的恶意宿主在最后一次 pathname 复核后实现绝对原子性，因此该威胁
+  模型仍以 owner-private 0700 root、rootfd-relative O_NOFOLLOW、inode/uid/mode/nlink
+  校验和 fail-closed 为边界，不声称抵御纳秒级同 UID basename swap。
   APFS 的目录 `st_nlink` 会随目录项创建、改名和删除变化；每次 root revalidate 都重新
   `fstat(rootfd)`，再与同一时刻的 root `lstat` 逐字段比较（包括当前 nlink），同时要求
   dev/ino/mode/uid 仍等于 spawn 前捕获的私有 root。不会把正常事务中的 nlink 变化误判为
