@@ -87,6 +87,7 @@ release/
 secrets/
 *.secret
 credentials.*
+!src-tauri/src/settings/credentials.rs
 *.pem
 *.key
 *.p12
