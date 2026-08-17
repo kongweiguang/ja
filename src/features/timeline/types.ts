@@ -88,4 +88,3 @@ export function workSummary(steps: readonly WorkStepAdapter[]): string {
   }
   return `${steps.length} 个步骤已完成`;
 }
-

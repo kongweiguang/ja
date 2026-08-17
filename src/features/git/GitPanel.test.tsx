@@ -18,4 +18,3 @@ describe("GitPanel", () => {
     expect(screen.queryByText(/stage|commit|push|reset|checkout/i)).not.toBeInTheDocument();
   });
 });
-

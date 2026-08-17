@@ -18,4 +18,3 @@
 .ja-preview-state svg { width: 1.4rem; height: 1.4rem; color: var(--ja-accent); }
 .ja-preview-state strong { max-width: 100%; overflow: hidden; color: var(--ja-foreground); font: 0.85rem ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .ja-preview-state p { margin: 0; font-size: 0.75rem; line-height: 1.5; }
-

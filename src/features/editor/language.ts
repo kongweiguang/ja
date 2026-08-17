@@ -29,4 +29,3 @@ export function languageExtension(filePath: string, language?: string): Extensio
     default: return undefined;
   }
 }
-

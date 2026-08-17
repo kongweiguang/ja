@@ -31,4 +31,3 @@
 .ja-git-diff-stat { display: flex; gap: 0.55rem; border-top: 1px solid var(--ja-border); padding-top: 0.7rem; color: var(--ja-foreground-muted); font-size: 0.72rem; }
 .ja-git-diff-stat strong:first-of-type { color: var(--ja-success); }
 .ja-git-diff-stat strong:last-of-type { color: var(--ja-danger); }
-

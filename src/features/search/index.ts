@@ -3,4 +3,3 @@
 
 export { SearchPanel } from "./SearchPanel";
 export type { SearchPanelProps, SearchResult } from "./SearchPanel";
-

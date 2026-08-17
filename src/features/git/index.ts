@@ -3,4 +3,3 @@
 
 export { GitPanel } from "./GitPanel";
 export type { GitCommitProjection, GitFileProjection, GitFileStatus, GitPanelProps } from "./GitPanel";
-

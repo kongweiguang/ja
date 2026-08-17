@@ -15,4 +15,3 @@
 .ja-editor-diff .cm-deletedChunk { background: color-mix(in srgb, var(--ja-danger) 24%, transparent); }
 .ja-editor-diff .cm-changedLine { background: color-mix(in srgb, var(--ja-warning) 16%, transparent); }
 .ja-editor-diff .cm-insertedLine { background: color-mix(in srgb, var(--ja-success) 20%, transparent); }
-

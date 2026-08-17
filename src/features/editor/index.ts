@@ -5,4 +5,3 @@ export { CodeViewer } from "./CodeViewer";
 export { DiffViewer } from "./DiffViewer";
 export type { CodeViewerProps } from "./CodeViewer";
 export type { DiffViewerProps } from "./DiffViewer";
-
