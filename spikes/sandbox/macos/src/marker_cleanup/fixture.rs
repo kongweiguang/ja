@@ -1837,7 +1837,9 @@ fn persist_fixture_failure_pair_until(
     let supervisor = fixture_identity_evidence(
         "supervisor",
         Some(supervisor_pid),
-        Some(context.supervisor_group),
+        context
+            .supervisor_identity
+            .map(|_| context.supervisor_group),
         context.supervisor_identity,
     )?;
     let target = fixture_identity_evidence(
@@ -1877,9 +1879,11 @@ fn persist_fixture_failure_pair_until(
     write_fixture_failure_evidence_until(root, &contents, deadline)
 }
 
-/// Render one identity with a fixed prefix and retain provisional PID/PGID
-/// values when the OS query failed; unknown start/comm never becomes a signal
-/// authorization, but remains auditable for the next bounded cleanup pass.
+/// Render one identity with a fixed prefix.  A failed supervisor query is an
+/// unavailable identity and therefore omits its PGID; only a separately
+/// captured target PID/PGID may be recorded as provisional.  Unknown
+/// start/comm never becomes a signal authorization, but remains auditable for
+/// the next bounded cleanup pass.
 fn fixture_identity_evidence(
     prefix: &str,
     expected_pid: Option<u32>,
@@ -1911,24 +1915,29 @@ fn fixture_identity_evidence(
         {
             return Err("fixture-failure-evidence");
         }
-        None => (
-            if expected_pid.is_some() {
+        None => {
+            let pid = expected_pid
+                .filter(|value| *value > 1)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let group = expected_group
+                .filter(|value| *value > 1)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let state = if expected_pid.is_some() && expected_group.is_some() {
                 "provisional"
             } else {
                 "unavailable"
-            },
-            expected_pid
-                .filter(|value| *value > 1)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_owned()),
-            expected_group
-                .filter(|value| *value > 1)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_owned()),
-            "unknown".to_owned(),
-            "redacted".to_owned(),
-            "redacted".to_owned(),
-        ),
+            };
+            (
+                state,
+                pid,
+                group,
+                "unknown".to_owned(),
+                "redacted".to_owned(),
+                "redacted".to_owned(),
+            )
+        }
     };
     Ok(format!(
         "{prefix}-state={state}\n{prefix}-pid={pid}\n{prefix}-pgid={group}\n{prefix}-uid={uid}\n{prefix}-comm={comm}\n{prefix}-start={start}\n"
@@ -3883,7 +3892,8 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
     }
 
     /// Exercise the real owner-only evidence writer so an identity-query
-    /// fault retains the known process group even when identity is absent.
+    /// fault keeps the supervisor unavailable while retaining a separately
+    /// captured target provisional reference.
     #[test]
     fn launcher_query_failure_persists_group_evidence() {
         let root = std::env::temp_dir().join(format!(
@@ -3915,8 +3925,8 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
             .expect("failure evidence contents");
         assert!(contents.contains("category=fixture-helper-query\n"));
         assert!(contents.contains("supervisor-pid=42\n"));
-        assert!(contents.contains("supervisor-pgid=43\n"));
         assert!(contents.contains("supervisor-state=unavailable\n"));
+        assert!(contents.contains("supervisor-pgid=unknown\n"));
         assert!(contents.contains("target-state=provisional\n"));
         assert!(contents.contains("target-pid=44\n"));
         assert!(contents.contains("target-pgid=45\n"));

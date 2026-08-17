@@ -169,7 +169,9 @@ wrapper 在 exec 前形成独立 process group；超时、取消、输出超限�
   成功。supervisor/target 的身份与 PGID 分开记录，父端必须同时拥有 target 的外部
   identity 与 supervisor 的独立 identity；缺少任一身份只保留 failure evidence 并
   fail-closed，绝不把 supervisor 的 PID 当作 target marker。若 supervisor identity
-  查询失败，父端先读取 target 的 provisional PID/PGID 并持久化受限 evidence，发送 `q`
+  查询失败，evidence 中 supervisor 固定为 `unavailable`，只保留可验证的 direct PID，
+  PGID 保持 `unknown`，绝不把内存中的 launcher group number 当作可信身份；父端再读取 target 的
+  provisional PID/PGID 并持久化受限 evidence，发送 `q`
   后只等待 supervisor 自然退出；只有 supervisor 成功状态（其内部已确认 target
   direct reap+PGID empty）或 target 已取得外部 identity 后，才允许完成该失败分支的
   bounded cleanup，绝不在 q 尚未消费前直接 kill supervisor。父端向控制管道写入 `q`
