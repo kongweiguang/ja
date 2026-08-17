@@ -1285,7 +1285,9 @@ mod tests {
     }
 
     /// The stable manifest is published only after a complete same-directory
-    /// temporary image is synced; no pending image remains after success.
+    /// temporary image is synced; no pending manifest remains after success.
+    /// The source scope is intentionally still present here because the outer
+    /// quarantine transaction moves it only after this publication phase.
     #[test]
     fn quarantine_manifest_publication_is_atomic() {
         let nonce = SystemTime::now()
@@ -1321,12 +1323,21 @@ mod tests {
             write_quarantine_manifest(&mut io, &manifest, &[entry]).expect("publish");
         assert!(validate_scope_path(&manifest, identity).is_ok());
         assert_eq!(fs::read(&manifest).expect("manifest bytes"), image);
-        let names = fs::read_dir(&root)
+        let manifest_names = fs::read_dir(&root)
             .expect("entries")
             .map(|entry| entry.expect("entry").file_name())
+            .filter(|name| {
+                let name = name.to_string_lossy();
+                name == QUARANTINE_MANIFEST
+                    || name.starts_with(&format!("{QUARANTINE_PREFIX}manifest-pending-"))
+            })
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 1);
-        assert_eq!(names[0], QUARANTINE_MANIFEST);
+        assert_eq!(manifest_names.len(), 1);
+        assert_eq!(manifest_names[0], QUARANTINE_MANIFEST);
+        assert!(
+            source_cleanup.exists(),
+            "source moved before manifest publication"
+        );
         fs::remove_file(manifest).expect("manifest cleanup");
         fs::remove_file(source_cleanup).expect("source cleanup");
         fs::remove_dir(root).expect("root cleanup");
