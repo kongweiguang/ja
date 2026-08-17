@@ -3937,7 +3937,8 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
     }
 
     /// Require every version-2 field and identity state before recovery can
-    /// promote a candidate; an invalid sibling remains visible for diagnosis.
+    /// promote a candidate; an invalid final is retained under the fixed
+    /// damaged quarantine name when no valid replacement exists.
     #[test]
     fn fixture_evidence_recovery_requires_complete_identity_grammar() {
         let good = "fixture-failure-version=2\ncategory=fixture-helper-query\nsupervisor-state=provisional\nsupervisor-pid=42\nsupervisor-pgid=43\nsupervisor-uid=unknown\nsupervisor-comm=redacted\nsupervisor-start=redacted\ntarget-state=provisional\ntarget-pid=44\ntarget-pgid=45\ntarget-uid=unknown\ntarget-comm=redacted\ntarget-start=redacted\n";
@@ -3986,9 +3987,10 @@ SANDBOX-MARKER-QUERY: stage=post-signal-proof code=partial";
             Instant::now() + Duration::from_secs(2),
         );
         assert_eq!(result, Err("fixture-failure-evidence"));
+        assert!(!root.join(super::FIXTURE_FAILURE_EVIDENCE).exists());
         assert_eq!(
-            fs::read_to_string(root.join(super::FIXTURE_FAILURE_EVIDENCE))
-                .expect("invalid final retained"),
+            fs::read_to_string(root.join(super::FIXTURE_FAILURE_DAMAGED[0]))
+                .expect("invalid final quarantine retained"),
             invalid_cases[0]
         );
         fs::remove_dir_all(root).expect("invalid final root cleanup");
