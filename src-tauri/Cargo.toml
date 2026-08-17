@@ -21,6 +21,14 @@ rust-version = "1.88"
 name = "ja_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Integration tests may inject a trusted Java25 fixture without making the
+# executable/path constructor part of the production command surface.
+test-support = []
+# Tauri MockRuntime is opt-in because Windows test hosts may not provide the
+# native API set needed by the mock builder's transitive runtime.
+tauri-smoke = ["tauri/test", "test-support"]
+
 [build-dependencies]
 # Pin the build tool with the runtime so generated context code is reproducible.
 tauri-build = { version = "=2.6.3", features = [] }
@@ -28,7 +36,14 @@ tauri-build = { version = "=2.6.3", features = [] }
 [dependencies]
 # Keep the desktop host on the Tauri 2 line while leaving platform-specific
 # functionality behind explicit plugins and capabilities.
-tauri = { version = "=2.11.5", features = [] }
+# Keep the production Wry runtime while omitting the v6 common-controls
+# linker import; Windows' test host may only expose comctl32 v5 without an
+# application manifest, while native bundle manifests provide the v6 theme.
+tauri = { version = "=2.11.5", default-features = false, features = [
+    "wry",
+    "compression",
+    "dynamic-acl",
+] }
 
 # Wire format and stable error/identity primitives are shared by future IPC
 # adapters; exact pins keep the native host reproducible across machines.
@@ -49,6 +64,11 @@ tokio-util = { version = "=0.7.19", features = ["codec", "io-util"] }
 # stdout is reserved for the full-duplex JSONL protocol.
 tracing = "=0.1.44"
 tracing-subscriber = "=0.3.23"
+
+[[test]]
+name = "int_foundation_host"
+path = "tests/int_foundation_host.rs"
+required-features = ["test-support"]
 
 [profile.release]
 # Abort avoids shipping unwind metadata across the Tauri/sidecar boundary.

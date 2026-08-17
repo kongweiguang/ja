@@ -8,7 +8,11 @@
 
 // The contract test compiles the not-yet-wired module tree in isolation; these
 // re-exports and future composition-root methods are intentionally unused here.
-#[allow(dead_code, unused_imports)]
+#[expect(
+    dead_code,
+    unused_imports,
+    reason = "the contract compiles the complete foundation module tree in isolation"
+)]
 #[path = "../src/agent_process/mod.rs"]
 mod agent_process;
 
@@ -2041,6 +2045,92 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         assert_eq!(supervisor.state(), LifecycleState::Faulted);
         supervisor.shutdown(Duration::from_secs(1)).unwrap();
     }
+}
+
+/// 真实 child 的首次超时清理必须保留 owner；第二次 shutdown 在同一
+/// supervisor 上重试并确认 tree reap 后才允许 Exited，防止失败即假绿。
+#[test]
+#[cfg(windows)]
+fn real_child_shutdown_retries_retained_owner_after_reap_timeout() {
+    let system_root = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+    let powershell = system_root
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if !powershell.is_file() {
+        return;
+    }
+    let fixture_dir = TempFixtureDir::new();
+    let script_path = fixture_dir.path.join("retry-shutdown.ps1");
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"minimumCompatibleMinor":0,"serverVersion":"fixture-1","serverInstanceId":"srv_fixture","runtime":{"kind":"native-image","agentScopeVersion":"1","javaVersion":"25"},"capabilities":{"methods":[],"events":[],"permissionModes":["plan","workspace","full_access"],"itemKinds":[],"mcp":{"protocolVersions":[],"transports":[],"features":[]}},"limits":{"maxFrameBytes":4194304,"maxInboundQueueFrames":256,"maxOutboundQueueFrames":1024,"maxInFlightRequests":64,"maxPendingRequests":64,"maxItemDeltaBytes":65536,"maxInlineToolOutputBytes":1048576,"maxArtifactBytes":268435456,"maxLogBytes":1048576,"defaultRequestDeadlineMs":120000,"defaultApprovalDeadlineMs":300000}}}'
+function Write-Lf([string]$text) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes($text + [char]10)
+    $stdout = [Console]::OpenStandardOutput()
+    $stdout.Write($bytes, 0, $bytes.Length)
+    $stdout.Flush()
+}
+while (($line = [Console]::In.ReadLine()) -ne $null) {
+    if ($line -match '"method":"initialize"') {
+        Write-Lf $init
+        continue
+    }
+    if ($line -match '"method":"initialized"') {
+        $token = ($line | ConvertFrom-Json).params.readyToken
+        Write-Lf ('{"jsonrpc":"2.0","method":"runtime/statusChanged","params":{"serverInstanceId":"srv_fixture","eventId":"evt_ready","occurredAt":"2099-01-01T00:00:00Z","status":"ready","readyToken":"' + $token + '"}}')
+        Start-Sleep -Seconds 30
+        break
+    }
+}
+"#;
+    fs::write(&script_path, script).expect("retry fixture script");
+    let mut config = SidecarConfig::new(&powershell, &fixture_dir.path);
+    config.args = vec![
+        OsString::from("-NoProfile"),
+        OsString::from("-NonInteractive"),
+        OsString::from("-File"),
+        script_path.into_os_string(),
+    ];
+    config.env.insert(
+        OsString::from("SystemRoot"),
+        system_root.clone().into_os_string(),
+    );
+    config.env.insert(
+        OsString::from("WINDIR"),
+        system_root.clone().into_os_string(),
+    );
+    config.env.insert(
+        OsString::from("SystemDrive"),
+        system_root
+            .components()
+            .next()
+            .map(|component| component.as_os_str().to_owned())
+            .unwrap_or_else(|| OsString::from("C:")),
+    );
+    config.ready_timeout = Duration::from_secs(5);
+    config.shutdown_timeout = Duration::from_secs(2);
+    let mut supervisor = SidecarSupervisor::new(config).expect("retry supervisor");
+    supervisor.start().expect("retry fixture ready");
+    let client = supervisor.client().expect("retry client");
+    let payload = json!({"blob": "x".repeat(64 * 1024)});
+    for _ in 0..256 {
+        if client.notify("data/fill", payload.clone()).is_err() {
+            break;
+        }
+    }
+    let first = supervisor.shutdown(Duration::from_millis(1));
+    assert!(first.is_err(), "zero cleanup budget must retain the owner");
+    assert_eq!(supervisor.state(), LifecycleState::Stopping);
+    let retry_deadline = Instant::now() + Duration::from_secs(4);
+    let second = supervisor.shutdown(Duration::from_secs(3));
+    assert!(
+        second.is_ok(),
+        "retained owner must be retryable: {second:?}"
+    );
+    assert!(Instant::now() < retry_deadline);
+    assert_eq!(supervisor.state(), LifecycleState::Exited);
 }
 
 #[cfg(windows)]

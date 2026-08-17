@@ -19,6 +19,8 @@ use crate::agent_process::lifecycle::{LifecycleMachine, LifecycleState};
 use crate::agent_process::session::{EventPump, Session, SessionEvent, TerminalReason};
 use serde_json::Value;
 use std::collections::VecDeque;
+#[cfg(feature = "tauri-smoke")]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +35,23 @@ pub use client::AgentClient;
 pub use config::SidecarConfig;
 use process::{RunningProcess, TerminalSignal, spawn_process};
 
+#[cfg(feature = "tauri-smoke")]
+fn consume_shutdown_failure_for_test(injector: &AtomicUsize) -> bool {
+    let mut current = injector.load(AtomicOrdering::Acquire);
+    while current != 0 {
+        match injector.compare_exchange(
+            current,
+            current - 1,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(next) => current = next,
+        }
+    }
+    false
+}
+
 /// 唯一控制真实 sidecar 的宿主状态；所有状态变更回到 lifecycle 单线程对象。
 pub struct SidecarSupervisor {
     config: SidecarConfig,
@@ -43,11 +62,49 @@ pub struct SidecarSupervisor {
     expected_server_instance: Option<String>,
     terminal_signals: Arc<Mutex<VecDeque<TerminalSignal>>>,
     stopping: Arc<Mutex<bool>>,
+    #[cfg(feature = "tauri-smoke")]
+    shutdown_failure_injector: Option<Arc<AtomicUsize>>,
 }
 
 impl SidecarSupervisor {
     /// 校验边界后才创建生命周期 owner，避免无效配置进入 crash-loop。
     pub fn new(config: SidecarConfig) -> Result<Self, AgentProcessError> {
+        #[cfg(feature = "tauri-smoke")]
+        {
+            Self::new_with_failure_injector(config, None)
+        }
+        #[cfg(not(feature = "tauri-smoke"))]
+        {
+            Self::new_validated(config)
+        }
+    }
+
+    /// Creates a supervisor with a private cleanup-failure seam used only by
+    /// lifecycle smoke tests; keeping the injector on the owner prevents one
+    /// test's forced failure from changing another running supervisor.
+    #[cfg(feature = "tauri-smoke")]
+    pub(crate) fn new_with_shutdown_failure_injector(
+        config: SidecarConfig,
+        injector: Arc<AtomicUsize>,
+    ) -> Result<Self, AgentProcessError> {
+        Self::new_with_failure_injector(config, Some(injector))
+    }
+
+    /// Builds the common supervisor state while making the optional test
+    /// seam compile out of production artifacts entirely.
+    #[cfg(feature = "tauri-smoke")]
+    fn new_with_failure_injector(
+        config: SidecarConfig,
+        shutdown_failure_injector: Option<Arc<AtomicUsize>>,
+    ) -> Result<Self, AgentProcessError> {
+        let mut supervisor = Self::new_validated(config)?;
+        supervisor.shutdown_failure_injector = shutdown_failure_injector;
+        Ok(supervisor)
+    }
+
+    /// 创建已完成配置校验的生命周期 owner；测试注入器在专用 cfg 分支中附加，
+    /// 使生产签名和对象布局不携带任何测试占位类型。
+    fn new_validated(config: SidecarConfig) -> Result<Self, AgentProcessError> {
         config.validate()?;
         let lifecycle = LifecycleMachine::new(config.restart)?;
         Ok(Self {
@@ -59,6 +116,8 @@ impl SidecarSupervisor {
             expected_server_instance: None,
             terminal_signals: Arc::new(Mutex::new(VecDeque::new())),
             stopping: Arc::new(Mutex::new(false)),
+            #[cfg(feature = "tauri-smoke")]
+            shutdown_failure_injector: None,
         })
     }
 
@@ -107,6 +166,33 @@ impl SidecarSupervisor {
 
     /// 启动一个新 generation，并在返回前完成严格 initialize/ready 握手。
     pub fn start(&mut self) -> Result<(), AgentProcessError> {
+        let deadline = checked_deadline(self.config.ready_timeout, MAX_READY_TIMEOUT)?;
+        self.start_until(deadline)
+    }
+
+    /// Starts a generation while allowing the host to register the newly
+    /// created session before any blocking handshake request begins.
+    pub(crate) fn start_with_session_hook(
+        &mut self,
+        session_hook: Option<&dyn Fn(Session)>,
+    ) -> Result<(), AgentProcessError> {
+        let deadline = checked_deadline(self.config.ready_timeout, MAX_READY_TIMEOUT)?;
+        self.start_until_with_session_hook(deadline, session_hook)
+    }
+
+    /// 使用调用方的绝对 deadline 完成握手，避免应用退出期间重新开始
+    /// ready timeout；bridge 因而可以让 slow start 与 shutdown 共用预算。
+    pub(crate) fn start_until(&mut self, deadline: Instant) -> Result<(), AgentProcessError> {
+        self.start_until_with_session_hook(deadline, None)
+    }
+
+    /// 注册一个 host-owned cancellation hook，使握手等待可被退出请求
+    /// 主动唤醒，而不是等到固定 protocol timeout 自然返回。
+    pub(crate) fn start_until_with_session_hook(
+        &mut self,
+        deadline: Instant,
+        session_hook: Option<&dyn Fn(Session)>,
+    ) -> Result<(), AgentProcessError> {
         self.sync_terminal_signals();
         *self
             .stopping
@@ -117,7 +203,10 @@ impl SidecarSupervisor {
             LifecycleState::Exited | LifecycleState::Backoff
         ) && (self.process.is_some() || self.session.is_some())
         {
-            self.fail_process_only();
+            self.fail_process_only_until(deadline);
+            if self.owns_resources() {
+                return Err(AgentProcessError::ProcessTree);
+            }
         }
         let generation = self.lifecycle.begin_start()?;
         self.expected_server_instance = None;
@@ -131,10 +220,13 @@ impl SidecarSupervisor {
             };
         self.process = Some(process);
         self.session = Some(session.clone());
+        if let Some(session_hook) = session_hook {
+            session_hook(session.clone());
+        }
         self.event_pump = match session.take_event_pump() {
             Ok(pump) => Some(pump),
             Err(error) => {
-                self.fail_generation(generation);
+                self.fail_generation_until(generation, deadline);
                 return Err(error);
             }
         };
@@ -142,29 +234,36 @@ impl SidecarSupervisor {
         let ready_token = match self.next_ready_token() {
             Ok(token) => token,
             Err(error) => {
-                self.fail_generation(generation);
+                self.fail_generation_until(generation, deadline);
                 return Err(error);
             }
         };
         if let Err(error) = session.install_ready_token_challenge(ready_token) {
-            self.fail_generation(generation);
+            self.fail_generation_until(generation, deadline);
             return Err(error);
         }
 
+        let initialize_timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(self.config.ready_timeout);
+        if initialize_timeout.is_zero() {
+            self.fail_generation_until(generation, deadline);
+            return Err(AgentProcessError::DeadlineExceeded);
+        }
         let initialize = match session.request(
             "initialize",
             self.config.initialize_params.clone(),
-            self.config.ready_timeout,
+            initialize_timeout,
         ) {
             Ok(response) => response,
             Err(error) => {
-                self.fail_generation(generation);
+                self.fail_generation_until(generation, deadline);
                 return Err(error);
             }
         };
         if let Some(error) = initialize.error() {
             let incompatible = error_is_incompatible(error.code(), error.data());
-            self.fail_process_only();
+            self.fail_process_only_until(deadline);
             if incompatible {
                 let _ = self.lifecycle.mark_incompatible(generation);
                 return Err(AgentProcessError::Incompatible);
@@ -179,7 +278,7 @@ impl SidecarSupervisor {
             .and_then(|result| self.check_initialize_result(result));
         if let Err(error) = result {
             let incompatible = matches!(error, AgentProcessError::Incompatible);
-            self.fail_process_only();
+            self.fail_process_only_until(deadline);
             if incompatible {
                 let _ = self.lifecycle.mark_incompatible(generation);
             } else {
@@ -191,25 +290,18 @@ impl SidecarSupervisor {
         let initialized_params = match session.initialized_params() {
             Ok(params) => params,
             Err(error) => {
-                self.fail_generation(generation);
+                self.fail_generation_until(generation, deadline);
                 return Err(error);
             }
         };
         if let Err(error) = session.notify("initialized", initialized_params) {
-            self.fail_generation(generation);
+            self.fail_generation_until(generation, deadline);
             return Err(error);
         }
-        let deadline = match checked_deadline(self.config.ready_timeout, MAX_READY_TIMEOUT) {
-            Ok(deadline) => deadline,
-            Err(error) => {
-                self.fail_generation(generation);
-                return Err(error);
-            }
-        };
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                self.fail_generation(generation);
+                self.fail_generation_until(generation, deadline);
                 return Err(AgentProcessError::DeadlineExceeded);
             }
             match self
@@ -221,13 +313,13 @@ impl SidecarSupervisor {
                     if is_runtime_ready_notification(&frame) =>
                 {
                     if !is_ready_notification(&frame, self.expected_server_instance.as_deref()) {
-                        self.fail_generation(generation);
+                        self.fail_generation_until(generation, deadline);
                         return Err(AgentProcessError::HandshakeFailed);
                     }
                     let promotion = session
                         .with_ready_promotion(&frame, || self.lifecycle.mark_ready(generation));
                     if let Err(error) = promotion {
-                        self.fail_generation(generation);
+                        self.fail_generation_until(generation, deadline);
                         return Err(error);
                     }
                     return Ok(());
@@ -242,15 +334,15 @@ impl SidecarSupervisor {
                     );
                 }
                 Some(SessionEvent::ProcessExited { .. } | SessionEvent::Eof) => {
-                    self.fail_generation(generation);
+                    self.fail_generation_until(generation, deadline);
                     return Err(AgentProcessError::ProcessExited);
                 }
                 Some(SessionEvent::HandshakeFailed) => {
-                    self.fail_generation(generation);
+                    self.fail_generation_until(generation, deadline);
                     return Err(AgentProcessError::HandshakeFailed);
                 }
                 Some(SessionEvent::WriterTimedOut) => {
-                    self.fail_generation(generation);
+                    self.fail_generation_until(generation, deadline);
                     return Err(AgentProcessError::DeadlineExceeded);
                 }
                 Some(
@@ -258,12 +350,12 @@ impl SidecarSupervisor {
                     | SessionEvent::QueueFatalOverflow(_)
                     | SessionEvent::ResponseRejected(_),
                 ) => {
-                    self.fail_generation(generation);
+                    self.fail_generation_until(generation, deadline);
                     return Err(AgentProcessError::ProtocolFault);
                 }
                 Some(_) => {}
                 None => {
-                    self.fail_generation(generation);
+                    self.fail_generation_until(generation, deadline);
                     return Err(AgentProcessError::DeadlineExceeded);
                 }
             }
@@ -298,6 +390,22 @@ impl SidecarSupervisor {
         let _ = self.lifecycle.mark_ready_again(generation);
         self.sync_terminal_signals();
         result
+    }
+
+    /// Provides a clone of the current session only for host cancellation;
+    /// it does not create a second event-pump consumer or supervisor owner.
+    pub(crate) fn session_for_cancellation(&self) -> Option<Session> {
+        self.session.clone()
+    }
+
+    /// Exposes the session's bounded close primitive to the host exit gate;
+    /// keeping this adapter here preserves `Session::close_until` visibility
+    /// while ensuring writer join consumes the caller's absolute deadline.
+    pub(crate) fn close_session_until(
+        session: &Session,
+        deadline: Instant,
+    ) -> Result<(), AgentProcessError> {
+        session.close_until(deadline)
     }
 
     /// 读取外部事件；nested request 等待路径使用 session 的专用 server-request 队列。
@@ -355,22 +463,46 @@ impl SidecarSupervisor {
     /// 先在 bounded deadline 内请求 shutdown，随后终止完整 process tree。
     pub fn shutdown(&mut self, timeout: Duration) -> Result<(), AgentProcessError> {
         let deadline = checked_deadline(timeout, MAX_SHUTDOWN_TIMEOUT)?;
+        self.shutdown_until(deadline)
+    }
+
+    /// 使用调用方已经建立的绝对 deadline，避免 bridge 的退出预算在
+    /// supervisor 边界被重新计算而延长整个 Tauri 关闭流程。
+    pub(crate) fn shutdown_until(&mut self, deadline: Instant) -> Result<(), AgentProcessError> {
         *self
             .stopping
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        #[cfg(feature = "tauri-smoke")]
+        if self
+            .shutdown_failure_injector
+            .as_ref()
+            .is_some_and(|injector| consume_shutdown_failure_for_test(injector))
+        {
+            return Err(AgentProcessError::ProcessTree);
+        }
         self.sync_terminal_signals();
         let generation = self.lifecycle.generation();
-        if !matches!(
-            self.lifecycle.state(),
+        let state = self.lifecycle.state();
+        let owns_resources =
+            self.process.is_some() || self.session.is_some() || self.event_pump.is_some();
+        let already_stopping = state == LifecycleState::Stopping;
+        let active = matches!(
+            state,
             LifecycleState::Starting | LifecycleState::Ready | LifecycleState::Busy
-        ) {
-            self.fail_process_only();
-            let _ = self.lifecycle.mark_exited(generation);
+        );
+        if !active && !already_stopping && !owns_resources {
+            // A faulted/incompatible generation has no process owner left; it
+            // is already terminal, so there is nothing to mark or retry.
             return Ok(());
         }
-        self.lifecycle.begin_stop(generation)?;
-        if let Some(session) = self.session.clone() {
+        if active && !already_stopping {
+            self.lifecycle.begin_stop(generation)?;
+        }
+        if active
+            && !already_stopping
+            && let Some(session) = self.session.clone()
+        {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if !remaining.is_zero() {
                 let _ = session.request_with_server_request_handler(
@@ -388,27 +520,17 @@ impl SidecarSupervisor {
                     },
                 );
             }
-            let _ = session.close_until(deadline);
-            session.detach_terminal_callback();
         }
-        let mut exited = false;
-        if let Some(process) = self.process.clone() {
-            exited = process.wait_until(deadline);
-            if !exited {
-                let _ = process.terminate_tree_until(deadline);
-                exited = process.wait_until(deadline);
-            }
-        }
-        self.process = None;
-        self.session = None;
-        self.event_pump = None;
+
+        // Every owner is retained until both the writer and the process-tree
+        // adapter confirm cleanup.  A failed attempt therefore leaves the
+        // exact handles available for a later retry instead of publishing a
+        // false Exited state.
+        let cleanup_result = self.cleanup_owner_until(deadline);
+        cleanup_result?;
         self.sync_terminal_signals();
         let _ = self.lifecycle.mark_exited(generation);
-        if exited {
-            Ok(())
-        } else {
-            Err(AgentProcessError::ShutdownTimeout)
-        }
+        Ok(())
     }
 
     /// 严格验证 server 的版本、实例、runtime、能力和 effective limits 后才允许 ready。
@@ -509,14 +631,19 @@ impl SidecarSupervisor {
                         LifecycleState::Starting | LifecycleState::Ready | LifecycleState::Busy => {
                             let _ = self.lifecycle.record_crash(signal.generation);
                         }
-                        LifecycleState::Stopping => {
+                        LifecycleState::Stopping if !self.owns_resources() => {
+                            // A monitor signal only describes the leader; a
+                            // failed tree reap still retains the process and
+                            // session owner, so it cannot publish Exited yet.
                             let _ = self.lifecycle.mark_exited(signal.generation);
                         }
+                        LifecycleState::Stopping => {}
                         _ => {}
                     }
                 }
                 TerminalReason::Closed => {
-                    if self.lifecycle.state() == LifecycleState::Stopping {
+                    if self.lifecycle.state() == LifecycleState::Stopping && !self.owns_resources()
+                    {
                         let _ = self.lifecycle.mark_exited(signal.generation);
                     }
                 }
@@ -524,25 +651,62 @@ impl SidecarSupervisor {
         }
     }
 
-    /// 失败路径必须先收口 session 与完整 process tree，再改变 lifecycle 状态。
-    fn fail_generation(&mut self, generation: u64) {
-        self.fail_process_only();
+    /// Keeps handshake failure cleanup inside the caller's absolute budget;
+    /// otherwise a slow start could create a fresh shutdown window after the
+    /// host had already begun exiting.
+    fn fail_generation_until(&mut self, generation: u64, deadline: Instant) {
+        self.fail_process_only_until(deadline);
         let _ = self.lifecycle.mark_faulted(generation);
     }
 
     /// 幂等释放 process/session 资源；用于 fault、restart、shutdown 和 Drop。
     fn fail_process_only(&mut self) {
-        self.event_pump = None;
-        if let Some(session) = self.session.take() {
-            session.close();
+        let deadline = checked_deadline(self.config.shutdown_timeout, MAX_SHUTDOWN_TIMEOUT)
+            .unwrap_or_else(|_| Instant::now());
+        self.fail_process_only_until(deadline);
+    }
+
+    /// Cleans process/session owners under a supplied absolute deadline so
+    /// retries from start, shutdown, and Drop cannot extend one another.
+    fn fail_process_only_until(&mut self, deadline: Instant) {
+        if let Err(error) = self.cleanup_owner_until(deadline) {
+            // The caller may still own this supervisor and retry.  Drop is
+            // only a last-resort fallback, so do not erase handles here.
+            tracing::error!(?error, "sidecar failure cleanup remains owned");
+        }
+    }
+
+    /// Reports whether any process/session/event owner remains live; lifecycle
+    /// signals may mark Exited only after this predicate becomes false.
+    fn owns_resources(&self) -> bool {
+        self.process.is_some() || self.session.is_some() || self.event_pump.is_some()
+    }
+
+    /// 在同一个绝对 deadline 内收口 writer、session 和完整 process tree；
+    /// 任一阶段失败都保留所有 owner，保证下一次 shutdown 仍能重试真实句柄。
+    fn cleanup_owner_until(&mut self, deadline: Instant) -> Result<(), AgentProcessError> {
+        let mut first_error = None;
+        if let Some(session) = self.session.as_ref() {
+            if let Err(error) = session.close_until(deadline) {
+                first_error = Some(error);
+            }
             session.detach_terminal_callback();
         }
-        if let Some(process) = self.process.take() {
-            let deadline = checked_deadline(self.config.shutdown_timeout, MAX_SHUTDOWN_TIMEOUT)
-                .unwrap_or_else(|_| Instant::now());
-            let _ = process.terminate_tree_until(deadline);
+        if let Some(process) = self.process.as_ref()
+            && let Err(error) = process.terminate_tree_until(deadline)
+        {
+            // A monitor completion is useful evidence for the next retry,
+            // but it never replaces the process-tree result as proof.
             let _ = process.wait_until(deadline);
+            first_error.get_or_insert(error);
         }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        self.event_pump = None;
+        self.session = None;
+        self.process = None;
+        Ok(())
     }
 }
 
@@ -554,7 +718,14 @@ impl Drop for SidecarSupervisor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         self.fail_process_only();
-        let generation = self.lifecycle.generation();
-        let _ = self.lifecycle.mark_exited(generation);
+        if !self.owns_resources() {
+            let generation = self.lifecycle.generation();
+            let _ = self.lifecycle.mark_exited(generation);
+        } else {
+            tracing::error!(
+                generation = self.lifecycle.generation(),
+                "sidecar drop could not confirm process-tree cleanup"
+            );
+        }
     }
 }

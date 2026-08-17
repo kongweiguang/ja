@@ -16,7 +16,7 @@ use crate::agent_process::pending::{PendingRegistry, ResolveDisposition, deadlin
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;

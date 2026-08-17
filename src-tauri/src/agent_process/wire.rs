@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// 数据队列的预算必须独立于控制保留区，否则 delta 可以把审批/关闭饿死。
 pub(super) const MAX_WRITER_DATA_QUEUE_BYTES: usize = 64 * 1024 * 1024;
