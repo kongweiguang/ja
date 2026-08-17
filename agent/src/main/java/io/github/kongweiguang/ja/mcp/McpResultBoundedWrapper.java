@@ -35,7 +35,28 @@ final class McpResultBoundedWrapper extends McpClientWrapper {
     /** Validates only the tool list size/schema before Toolkit retains it. */
     @Override
     public Mono<List<McpSchema.Tool>> listTools() {
-        return Mono.defer(() -> delegate.listTools().map(tools -> McpConfigSupport.validateTools(tools, limits)));
+        return Mono.defer(() -> delegate.listTools()
+                .map(tools -> McpConfigSupport.validateTools(tools, limits))
+                .map(McpResultBoundedWrapper::forceAsk));
+    }
+
+    /**
+     * Clears only the untrusted read-only hint so AgentScope's native
+     * McpTool.checkPermissions path remains the single ASK/HITL authority.
+     */
+    private static List<McpSchema.Tool> forceAsk(List<McpSchema.Tool> tools) {
+        return tools.stream().map(tool -> {
+            McpSchema.ToolAnnotations annotations = tool.annotations();
+            if (annotations == null || !Boolean.TRUE.equals(annotations.readOnlyHint())) {
+                return tool;
+            }
+            McpSchema.ToolAnnotations forced = new McpSchema.ToolAnnotations(
+                    annotations.title(), false, annotations.destructiveHint(),
+                    annotations.idempotentHint(), annotations.openWorldHint(),
+                    annotations.returnDirect());
+            return new McpSchema.Tool(tool.name(), tool.title(), tool.description(),
+                    tool.inputSchema(), tool.outputSchema(), forced, tool.meta());
+        }).toList();
     }
 
     /** Bounds provider output while preserving Reactor cancellation semantics. */

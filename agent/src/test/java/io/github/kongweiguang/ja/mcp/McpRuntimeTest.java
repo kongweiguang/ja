@@ -7,13 +7,18 @@ package io.github.kongweiguang.ja.mcp;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
+import io.agentscope.core.permission.PermissionBehavior;
+import io.agentscope.core.permission.PermissionContextState;
 import io.agentscope.core.tool.ToolCallParam;
+import io.agentscope.core.tool.ToolBase;
 import io.agentscope.core.tool.Toolkit;
 import io.agentscope.harness.agent.tools.McpServerConfig;
 import java.io.BufferedReader;
@@ -32,6 +37,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -52,6 +58,12 @@ class McpRuntimeTest {
                     .filter(name -> name.contains("echo"))
                     .findFirst()
                     .orElseThrow();
+            ToolBase tool = (ToolBase) runtime.toolkit().getTool(toolName);
+            assertFalse(tool.isReadOnly());
+            assertEquals(PermissionBehavior.ASK,
+                    tool
+                            .checkPermissions(Map.of(), PermissionContextState.builder().build())
+                            .block(Duration.ofSeconds(1)).getBehavior());
             ToolResultBlock result = runtime.toolkit().callTool(ToolCallParam.builder()
                     .toolUseBlock(ToolUseBlock.builder()
                             .id("call-1")
@@ -67,6 +79,144 @@ class McpRuntimeTest {
             assertFalse(result.isSuspended());
             assertTrue(fixture.called.await(1, TimeUnit.SECONDS));
         }
+    }
+
+    /**
+     * Probes use the same upstream wrapper but never register or invoke a
+     * Toolkit tool, which keeps settings diagnostics side-effect free.
+     */
+    @Test
+    void probeDiscoversToolsAndForcesAskWithoutToolkitRegistration() throws InterruptedException {
+        try (HttpFixture fixture = HttpFixture.start();
+                McpRuntime runtime = runtime(McpLimits.DEFAULT, reference -> "unused")) {
+            McpRuntime.ProbeResult result = runtime.probe("probe", httpConfig(fixture.url(),
+                    Duration.ofSeconds(3)), "2024-11-05");
+            assertEquals(McpRuntime.State.READY, result.state());
+            assertEquals("2024-11-05", result.protocolVersion());
+            assertEquals(1, result.toolCount());
+            assertFalse(result.tools().getFirst().annotations().readOnlyHint());
+            assertTrue(runtime.toolkit().getToolNames().isEmpty());
+            assertFalse(fixture.called.await(100, TimeUnit.MILLISECONDS));
+        }
+    }
+
+    /** A slow discovery must become a stable failure and still close its temporary client. */
+    @Test
+    void probeTimeoutIsStableAndDoesNotCallTool() throws InterruptedException {
+        try (HttpFixture fixture = HttpFixture.startProbeSlow();
+                McpRuntime runtime = runtime(McpLimits.DEFAULT, reference -> "unused")) {
+            McpRuntime.ProbeResult result = runtime.probe("slow-probe", httpConfig(fixture.url(),
+                    Duration.ofMillis(100)), "2024-11-05");
+            assertEquals(McpRuntime.State.FAILED, result.state());
+            assertEquals("mcp_timeout", result.error());
+            assertTrue(runtime.toolkit().getToolNames().isEmpty());
+            assertFalse(fixture.called.await(100, TimeUnit.MILLISECONDS));
+        }
+    }
+
+    /** A server selecting another advertised protocol fails discovery without a fake negotiation. */
+    @Test
+    void probeRejectsProtocolMismatchWithoutToolkitRegistration() throws InterruptedException {
+        try (HttpFixture fixture = HttpFixture.startProtocolMismatch();
+                McpRuntime runtime = runtime(McpLimits.DEFAULT, reference -> "unused")) {
+            McpRuntime.ProbeResult result = runtime.probe("mismatch", httpConfig(fixture.url(),
+                    Duration.ofSeconds(3)), "2024-11-05");
+            assertEquals(McpRuntime.State.FAILED, result.state());
+            assertNull(result.protocolVersion());
+            assertTrue(fixture.initializeCalls.get() > 0);
+            assertTrue(runtime.toolkit().getToolNames().isEmpty());
+            assertFalse(fixture.called.await(100, TimeUnit.MILLISECONDS));
+        }
+    }
+
+    /** Secret refs map to transport-specific fields without retaining a real credential. */
+    @Test
+    void wireDefinitionMapsSecretRefAtTheFinalTransportBoundary() {
+        McpServerDefinition stdio = new McpServerDefinition("mcp_stdio", "stdio", "stdio",
+                javaExecutable(), "2024-11-05", List.of(), Map.of("MCP_MODE", "test"),
+                Map.of(), Map.of(), new McpServerDefinition.Auth("env", "MCP_SECRET",
+                "cred_mcp"), true);
+        assertEquals("secret-ref://cred_mcp", stdio.toConfig().getEnv().get("MCP_SECRET"));
+        assertEquals("resolved", stdio.resolvedConfig("resolved").getEnv().get("MCP_SECRET"));
+
+        McpServerDefinition bearer = new McpServerDefinition("mcp_http", "http", "streamable_http",
+                "https://example.test/mcp", "2025-06-18", List.of(), Map.of(), Map.of(), Map.of(),
+                new McpServerDefinition.Auth("bearer", null, "cred_mcp"), true);
+        assertEquals("Bearer secret-ref://cred_mcp", bearer.toConfig().getHeaders().get("Authorization"));
+        assertEquals("Bearer resolved", bearer.resolvedConfig("resolved").getHeaders().get("Authorization"));
+    }
+
+    /** Schema-sensitive endpoint, protocol, and value counterexamples are rejected before IO. */
+    @Test
+    void wireDefinitionRejectsUnsupportedOrSecretBearingShapes() {
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "streamable_http", "https://example.test/mcp/password=x",
+                "2024-11-05", List.of(), Map.of(), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", "java-password=x", "2024-11-05",
+                List.of(), Map.of(), Map.of(), Map.of(), McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "streamable_http", "https://example.test/mcp?token=x",
+                "2024-11-05", List.of(), Map.of(), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "streamable_http", "https://example.test/mcp?value=%25",
+                "2024-11-05", List.of(), Map.of(), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "streamable_http", "https://example.test/mcp",
+                "2023-01-01", List.of(), Map.of(), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", javaExecutable(), "2024-11-05",
+                List.of("x".repeat(4097)), Map.of(), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", "java server", "2024-11-05",
+                List.of(), Map.of(), Map.of(), Map.of(), McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", "java -", "2024-11-05",
+                List.of(), Map.of(), Map.of(), Map.of(), McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", "java", "2024-11-05", List.of(),
+                Map.of("mode", "Bearer x"), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", "java", "2024-11-05", List.of(),
+                Map.of("mode", "sk-abcdefghijkl"), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", "java", "2024-11-05", List.of(),
+                Map.of("mode", "apiKey=x"), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", "java", "2024-11-05", List.of("Bearer x"),
+                Map.of(), Map.of(), Map.of(), McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", "java", "2024-11-05", List.of(),
+                Map.of("API_KEY", "safe"), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "streamable_http", "https://example.test/mcp", "2024-11-05",
+                List.of(), Map.of(), Map.of("X-Mode", "secret=x"), Map.of(),
+                McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "streamable_http", "https://example.test/mcp", "2024-11-05",
+                List.of(), Map.of(), Map.of(), Map.of("access_token", "safe"),
+                McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", "java -", "2024-11-05",
+                List.of(), Map.of(), Map.of(), Map.of(), McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", "java --", "2024-11-05",
+                List.of(), Map.of(), Map.of(), Map.of(), McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", "java /", "2024-11-05",
+                List.of(), Map.of(), Map.of(), Map.of(), McpServerDefinition.Auth.none(), true));
+        assertThrows(IllegalArgumentException.class, () -> new McpServerDefinition(
+                "mcp_bad", "bad", "stdio", "java //", "2024-11-05",
+                List.of(), Map.of(), Map.of(), Map.of(), McpServerDefinition.Auth.none(), true));
     }
 
     /** The official builder timeout completes a slow tool without a JA network implementation. */
@@ -134,6 +284,34 @@ class McpRuntimeTest {
         }
         assertTrue(awaitProcessExit(pid));
         deleteTree(directory);
+    }
+
+    /** A stdio server selecting an older protocol fails before discovery and is reaped after probe. */
+    @Test
+    void stdioProbeRejectsProtocolMismatchWithoutToolkitOrChildLeak() throws Exception {
+        Path directory = Files.createTempDirectory("ja-mcp-stdio-probe");
+        Path pidFile = directory.resolve("pid");
+        long pid = -1;
+        try (McpRuntime runtime = runtime(McpLimits.DEFAULT, reference -> "unused")) {
+            McpServerConfig config = new McpServerConfig();
+            config.setTransport("stdio");
+            config.setCommand(javaExecutable());
+            config.setArgs(List.of("-cp", absoluteClasspath(), StdioFixture.class.getName(), pidFile.toString()));
+            config.setInitializationTimeout(Duration.ofSeconds(3));
+            config.setTimeout(Duration.ofSeconds(3));
+
+            McpRuntime.ProbeResult result = runtime.probe("stdio-mismatch", config, "2025-06-18");
+            assertEquals(McpRuntime.State.FAILED, result.state());
+            assertNull(result.protocolVersion());
+            assertTrue(runtime.toolkit().getToolNames().isEmpty());
+            assertTrue(awaitFile(pidFile));
+            pid = Long.parseLong(Files.readString(pidFile));
+        } finally {
+            if (pid > 0) {
+                assertTrue(awaitProcessExit(pid));
+            }
+            deleteTree(directory);
+        }
     }
 
     /** Invalid transport is rejected before any upstream client or network is created. */
@@ -210,18 +388,29 @@ class McpRuntimeTest {
         return false;
     }
 
-    /** Removes only the temporary fixture directory. */
-    private static void deleteTree(Path directory) throws IOException {
-        if (Files.exists(directory)) {
-            try (var paths = Files.walk(directory)) {
-                paths.sorted(java.util.Comparator.reverseOrder()).forEach(path -> {
-                    try {
-                        Files.deleteIfExists(path);
-                    } catch (IOException failure) {
-                        throw new IllegalStateException("fixture_cleanup_failed");
-                    }
-                });
+    /** Removes only the temporary fixture directory, allowing Windows handles to settle after process exit. */
+    private static void deleteTree(Path directory) throws IOException, InterruptedException {
+        // A process handle can report exited before the OS releases its last file handle, so a
+        // short bounded retry avoids turning valid cleanup into a flaky test while still failing.
+        IOException lastFailure = null;
+        for (int attempt = 0; attempt < 100 && Files.exists(directory); attempt++) {
+            List<Path> paths;
+            try (var stream = Files.walk(directory)) {
+                paths = stream.sorted(java.util.Comparator.reverseOrder()).toList();
             }
+            for (Path path : paths) {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException failure) {
+                    lastFailure = failure;
+                }
+            }
+            if (Files.exists(directory)) {
+                Thread.sleep(20);
+            }
+        }
+        if (Files.exists(directory)) {
+            throw new IOException("fixture_cleanup_failed", lastFailure);
         }
     }
 
@@ -230,26 +419,49 @@ class McpRuntimeTest {
         private final HttpServer server;
         private final ExecutorService executor;
         private final boolean delayed;
+        private final boolean delayDiscovery;
+        private final String serverProtocolVersion;
         private final AtomicReference<String> authorization = new AtomicReference<>();
+        private final AtomicInteger initializeCalls = new AtomicInteger();
         private final CountDownLatch called = new CountDownLatch(1);
 
-        private HttpFixture(HttpServer server, ExecutorService executor, boolean delayed) {
+        private HttpFixture(HttpServer server, ExecutorService executor, boolean delayed,
+                            boolean delayDiscovery, String serverProtocolVersion) {
             this.server = server;
             this.executor = executor;
             this.delayed = delayed;
+            this.delayDiscovery = delayDiscovery;
+            this.serverProtocolVersion = serverProtocolVersion;
         }
 
         /** Starts the fixture on loopback with a random port. */
         static HttpFixture start() {
-            return start(false);
+            return start(false, false, "2024-11-05");
         }
 
         /** Starts a fixture whose tool response intentionally exceeds the client timeout. */
         static HttpFixture start(boolean delayed) {
+            return start(delayed, false, "2024-11-05");
+        }
+
+        /** Starts a fixture that delays initialize/list to exercise probe cleanup. */
+        static HttpFixture startProbeSlow() {
+            return start(false, true, "2024-11-05");
+        }
+
+        /** Starts a fixture whose initialize response intentionally selects protocol B. */
+        static HttpFixture startProtocolMismatch() {
+            return start(false, false, "2025-03-26");
+        }
+
+        /** Starts a loopback fixture with independently controlled delays and protocol response. */
+        private static HttpFixture start(boolean delayed, boolean delayDiscovery,
+                                         String serverProtocolVersion) {
             try {
                 HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
                 ExecutorService executor = Executors.newCachedThreadPool();
-                HttpFixture fixture = new HttpFixture(server, executor, delayed);
+                HttpFixture fixture = new HttpFixture(server, executor, delayed, delayDiscovery,
+                        serverProtocolVersion);
                 server.createContext("/mcp", fixture::handle);
                 server.setExecutor(executor);
                 server.start();
@@ -285,16 +497,27 @@ class McpRuntimeTest {
                     }
                 }
             }
+            if (delayDiscovery && ("initialize".equals(method) || "tools/list".equals(method))) {
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            if ("initialize".equals(method)) {
+                initializeCalls.incrementAndGet();
+            }
             String result = switch (method) {
-                case "initialize" -> "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}";
-                case "tools/list" -> "{\"tools\":[{\"name\":\"echo\",\"description\":\"echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}}}}]}";
+                case "initialize" -> "{\"protocolVersion\":\"" + serverProtocolVersion
+                        + "\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}";
+                case "tools/list" -> "{\"tools\":[{\"name\":\"echo\",\"description\":\"echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}}},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false}}]}";
                 case "tools/call" -> "{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":false}";
                 default -> "{}";
             };
             byte[] body = ("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result + "}")
                     .getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "application/json");
-            exchange.getResponseHeaders().set("MCP-Protocol-Version", "2024-11-05");
+            exchange.getResponseHeaders().set("MCP-Protocol-Version", serverProtocolVersion);
             exchange.getResponseHeaders().set("Mcp-Session-Id", "fixture-session");
             exchange.sendResponseHeaders(200, body.length);
             try (OutputStream output = exchange.getResponseBody()) {

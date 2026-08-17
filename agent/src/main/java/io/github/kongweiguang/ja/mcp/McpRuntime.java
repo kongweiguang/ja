@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentMap;
  */
 public final class McpRuntime implements AutoCloseable {
     private static final Duration CLOSE_TIMEOUT = Duration.ofSeconds(3);
+    private static final String DEFAULT_PROTOCOL_VERSION = "2024-11-05";
 
     /** Resolves a static secret reference at configuration composition time. */
     @FunctionalInterface
@@ -45,6 +46,23 @@ public final class McpRuntime implements AutoCloseable {
 
     /** Stable state snapshot with no provider exception text. */
     public record ServerStatus(String server, State state, String error) {
+    }
+
+    /**
+     * Temporary discovery result; retaining the upstream Tool records keeps
+     * projection faithful while this object owns no client or Toolkit entry.
+     */
+    public record ProbeResult(String server, State state, String error,
+                              String protocolVersion, List<McpSchema.Tool> tools) {
+        /** Keeps failed probes structurally safe for callers that still render tool lists. */
+        public ProbeResult {
+            tools = tools == null ? List.of() : List.copyOf(tools);
+        }
+
+        /** Returns the stable count used by the wire result without exposing provider details. */
+        public int toolCount() {
+            return tools.size();
+        }
     }
 
     private final SecretResolver secretResolver;
@@ -77,6 +95,14 @@ public final class McpRuntime implements AutoCloseable {
      * official registration API; no JA registry or tool descriptor copy exists.
      */
     public ServerStatus connect(String name, McpServerConfig config) {
+        return connect(name, config, DEFAULT_PROTOCOL_VERSION);
+    }
+
+    /**
+     * Connects one validated config through AgentScope's official Toolkit
+     * registration path, selecting only a wire-approved protocol version.
+     */
+    public ServerStatus connect(String name, McpServerConfig config, String protocolVersion) {
         if (name == null || name.isBlank()) {
             return fail(name, "mcp_server_name_invalid");
         }
@@ -87,8 +113,10 @@ public final class McpRuntime implements AutoCloseable {
         statuses.put(name, connecting);
         McpClientWrapper wrapper = null;
         try {
+            String selectedProtocol = McpConfigSupport.validateProtocolVersion(protocolVersion);
             McpServerConfig resolved = McpConfigSupport.resolve(name, config, secretResolver, limits);
-            wrapper = new McpResultBoundedWrapper(buildWrapper(name, resolved), limits);
+            wrapper = new McpResultBoundedWrapper(
+                    buildWrapper(name, resolved, selectedProtocol), limits);
             removeRegistered(name);
             clients.remove(name);
             Toolkit.ToolRegistration registration = toolkit.registration().mcpClient(wrapper);
@@ -105,6 +133,43 @@ public final class McpRuntime implements AutoCloseable {
                 closeWrapper(wrapper);
             }
             return fail(name, McpConfigSupport.stableFailure(failure));
+        }
+    }
+
+    /**
+     * Performs only initialize and tools/list on a short-lived official
+     * client. It never touches Toolkit, never calls a tool, and always closes
+     * the wrapper so failed probes cannot leave a process or HTTP stream.
+     */
+    public ProbeResult probe(String name, McpServerConfig config, String protocolVersion) {
+        if (name == null || name.isBlank()) {
+            return probeFailure(name, "mcp_server_name_invalid");
+        }
+        if (closed) {
+            return probeFailure(name, "mcp_runtime_closed");
+        }
+        McpClientWrapper wrapper = null;
+        String selectedProtocol;
+        try {
+            selectedProtocol = McpConfigSupport.validateProtocolVersion(protocolVersion);
+            McpServerConfig resolved = McpConfigSupport.resolve(name, config, secretResolver, limits);
+            wrapper = new McpResultBoundedWrapper(
+                    buildWrapper(name, resolved, selectedProtocol), limits);
+            Duration initializationTimeout = resolved.getInitializationTimeout();
+            Duration requestTimeout = resolved.getTimeout();
+            wrapper.initialize().block(initializationTimeout);
+            List<McpSchema.Tool> tools = wrapper.listTools().block(requestTimeout);
+            if (tools == null) {
+                throw new IllegalStateException("mcp_tools_empty_response");
+            }
+            return new ProbeResult(name, State.READY, null, selectedProtocol, tools);
+        } catch (Exception failure) {
+            String stable = McpConfigSupport.stableFailure(failure);
+            return probeFailure(name, stable);
+        } finally {
+            if (wrapper != null) {
+                closeWrapper(wrapper);
+            }
         }
     }
 
@@ -147,12 +212,13 @@ public final class McpRuntime implements AutoCloseable {
     }
 
     /** Selects the official AgentScope builder for HTTP and SDK transport for controlled stdio. */
-    private McpClientWrapper buildWrapper(String name, McpServerConfig config) {
+    private McpClientWrapper buildWrapper(String name, McpServerConfig config,
+                                          String protocolVersion) {
         Duration timeout = config.getTimeout();
         Duration initializationTimeout = config.getInitializationTimeout();
         if ("stdio".equalsIgnoreCase(config.getTransport())) {
             McpProcessTransport transport = new McpProcessTransport(
-                    config.getCommand(), config.getArgs(), config.getEnv(), processPort);
+                    config.getCommand(), config.getArgs(), config.getEnv(), processPort, protocolVersion);
             McpSyncClient client = McpClient.sync(transport)
                     .requestTimeout(timeout)
                     .initializationTimeout(initializationTimeout)
@@ -167,8 +233,15 @@ public final class McpRuntime implements AutoCloseable {
                 .queryParams(config.getQueryParams())
                 .timeout(timeout)
                 .initializationTimeout(initializationTimeout)
-                .protocolVersions("2024-11-05", "2025-03-26", "2025-06-18");
+                .protocolVersions(protocolVersion);
         return builder.buildSync();
+    }
+
+    /** Constructs a failed probe without retaining provider exception text. */
+    private static ProbeResult probeFailure(String name, String error) {
+        // A failed probe has no negotiated protocol; null prevents the caller from mistaking
+        // the requested version for a server response after initialize failed.
+        return new ProbeResult(name, State.FAILED, error, null, List.of());
     }
 
     /** Removes an existing Toolkit registration before a replacement can collide. */
