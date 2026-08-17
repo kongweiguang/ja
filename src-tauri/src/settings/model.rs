@@ -4,6 +4,7 @@
 //! Versioned, non-sensitive settings DTOs.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
@@ -19,6 +20,40 @@ pub enum ApiProtocol {
     AnthropicMessages,
     OpenAiChatCompletions,
     OpenAiResponses,
+}
+
+/// The three product-visible access modes are persisted as part of the
+/// profile snapshot so replay cannot silently widen a user's selected policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessMode {
+    ReadOnly,
+    #[default]
+    Workspace,
+    FullAccess,
+}
+
+/// MCP authentication placement is explicit and secret-free; the credential
+/// value itself remains in the OS keyring behind `CredentialRef`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAuthKind {
+    None,
+    Bearer,
+    Header,
+    Env,
+}
+
+/// Structured MCP auth metadata mirrors the frozen Java wire shape while
+/// retaining only an opaque keyring reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpAuthSetting {
+    pub kind: McpAuthKind,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub credential_ref: Option<CredentialRef>,
 }
 
 /// Theme is intentionally an enum so unknown values fail closed at the
@@ -103,10 +138,20 @@ pub struct ProfileSetting {
     pub provider: String,
     pub protocol: ApiProtocol,
     pub model: String,
+    #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(default)]
     pub credential_ref: Option<CredentialRef>,
     #[serde(default)]
     pub supports_vision: bool,
+    #[serde(default)]
+    pub access_mode: AccessMode,
+    #[serde(default)]
+    pub skill_revisions: Vec<String>,
+    /// `None` preserves legacy settings semantics (all enabled definitions);
+    /// `Some([])` is an explicit profile with no MCP servers selected.
+    #[serde(default)]
+    pub mcp_revisions: Option<Vec<String>>,
 }
 
 /// MCP settings intentionally store an opaque credential reference rather
@@ -119,6 +164,18 @@ pub struct McpServerSetting {
     pub transport: String,
     pub endpoint: String,
     pub protocol_version: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub query_params: BTreeMap<String, String>,
+    /// New settings use this field; `credential_ref` remains a legacy alias.
+    #[serde(default)]
+    pub auth: Option<McpAuthSetting>,
+    #[serde(default)]
     pub credential_ref: Option<CredentialRef>,
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -205,10 +262,24 @@ impl SettingsDocument {
             validate_text(active)?;
         }
         for profile in &self.profiles {
-            validate_text(&profile.profile_revision)?;
+            validate_revision_identifier(&profile.profile_revision, "profile_")?;
             validate_text(&profile.name)?;
             validate_text(&profile.provider)?;
             validate_text(&profile.model)?;
+            validate_revision_list(&profile.skill_revisions, "skill_")?;
+            if let Some(revisions) = &profile.mcp_revisions {
+                validate_revision_list(revisions, "mcp_")?;
+                for revision in revisions {
+                    let selected = self
+                        .mcp_servers
+                        .iter()
+                        .find(|server| server.mcp_revision == *revision)
+                        .ok_or(SettingsModelError::InvalidText)?;
+                    if !selected.enabled {
+                        return Err(SettingsModelError::InvalidText);
+                    }
+                }
+            }
             if matches!(profile.protocol, ApiProtocol::OpenAiResponses) {
                 return Err(SettingsModelError::UnsupportedProtocol);
             }
@@ -220,11 +291,19 @@ impl SettingsDocument {
             }
         }
         for server in &self.mcp_servers {
-            validate_text(&server.mcp_revision)?;
+            validate_revision_identifier(&server.mcp_revision, "mcp_")?;
             validate_text(&server.name)?;
-            validate_text(&server.transport)?;
+            if !matches!(server.transport.as_str(), "stdio" | "streamable_http") {
+                return Err(SettingsModelError::InvalidText);
+            }
             validate_text(&server.endpoint)?;
             validate_text(&server.protocol_version)?;
+            if !matches!(
+                server.protocol_version.as_str(),
+                "2024-11-05" | "2025-03-26" | "2025-06-18"
+            ) {
+                return Err(SettingsModelError::InvalidText);
+            }
             if contains_sensitive_text(&server.endpoint) {
                 return Err(SettingsModelError::InvalidText);
             }
@@ -236,6 +315,7 @@ impl SettingsDocument {
             if let Some(reference) = &server.credential_ref {
                 CredentialRef::parse(reference.as_str())?;
             }
+            validate_mcp_shape(server)?;
         }
         self.window.validate()
     }
@@ -315,6 +395,213 @@ fn validate_url(value: &str) -> Result<(), SettingsModelError> {
         return Err(SettingsModelError::InvalidUrl);
     }
     Ok(())
+}
+
+/// Validates selected skill/MCP references without inventing a second catalog
+/// or accepting arbitrary provider-owned identifiers.
+fn validate_revision_list(values: &[String], prefix: &str) -> Result<(), SettingsModelError> {
+    if values.len() > 128 {
+        return Err(SettingsModelError::TooManyEntries);
+    }
+    let mut unique = std::collections::HashSet::with_capacity(values.len());
+    for value in values {
+        if value.len() < prefix.len() + 1
+            || value.len() > 128
+            || !value.starts_with(prefix)
+            || !value[prefix.len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || !unique.insert(value)
+        {
+            return Err(SettingsModelError::InvalidText);
+        }
+    }
+    Ok(())
+}
+
+/// Keeps persisted revisions aligned with the frozen Java identifiers while
+/// retaining a single validation rule for profile and MCP definitions.
+fn validate_revision_identifier(value: &str, prefix: &str) -> Result<(), SettingsModelError> {
+    if value.len() < prefix.len() + 1
+        || value.len() > 128
+        || !value.starts_with(prefix)
+        || !value[prefix.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(SettingsModelError::InvalidText);
+    }
+    Ok(())
+}
+
+/// Applies the frozen transport/auth matrix before a definition is replayed
+/// into Java, keeping arguments and header/query maps secret-free and bounded.
+fn validate_mcp_shape(server: &McpServerSetting) -> Result<(), SettingsModelError> {
+    if server.args.len() > 64 || server.env.len() > 64 || server.headers.len() > 64 {
+        return Err(SettingsModelError::TooManyEntries);
+    }
+    if server.query_params.len() > 64 {
+        return Err(SettingsModelError::TooManyEntries);
+    }
+    for value in &server.args {
+        validate_mcp_value(value)?;
+    }
+    for (key, value) in server
+        .env
+        .iter()
+        .chain(server.headers.iter())
+        .chain(server.query_params.iter())
+    {
+        if key.is_empty()
+            || key.len() > 128
+            || contains_sensitive_config_key(key)
+            || contains_sensitive_text(value)
+        {
+            return Err(SettingsModelError::InvalidText);
+        }
+        validate_mcp_value(value)?;
+    }
+    if server.transport == "stdio"
+        && (!server.headers.is_empty() || !server.query_params.is_empty())
+    {
+        return Err(SettingsModelError::InvalidText);
+    }
+    if server.transport == "streamable_http" && (!server.args.is_empty() || !server.env.is_empty())
+    {
+        return Err(SettingsModelError::InvalidText);
+    }
+    if let Some(auth) = &server.auth {
+        if server.credential_ref.is_some() {
+            return Err(SettingsModelError::InvalidCredentialRef);
+        }
+        match auth.kind {
+            McpAuthKind::None => {
+                if auth.name.is_some() || auth.credential_ref.is_some() {
+                    return Err(SettingsModelError::InvalidCredentialRef);
+                }
+            }
+            McpAuthKind::Env => {
+                if server.transport != "stdio"
+                    || !valid_env_name(auth.name.as_deref())
+                    || auth.credential_ref.is_none()
+                    || auth
+                        .name
+                        .as_ref()
+                        .is_some_and(|name| server.env.contains_key(name))
+                {
+                    return Err(SettingsModelError::InvalidText);
+                }
+            }
+            McpAuthKind::Bearer => {
+                if server.transport != "streamable_http"
+                    || auth.name.is_some()
+                    || auth.credential_ref.is_none()
+                    || server
+                        .headers
+                        .keys()
+                        .any(|key| key.eq_ignore_ascii_case("authorization"))
+                {
+                    return Err(SettingsModelError::InvalidText);
+                }
+            }
+            McpAuthKind::Header => {
+                if server.transport != "streamable_http"
+                    || !valid_header_name(auth.name.as_deref())
+                    || auth.credential_ref.is_none()
+                    || auth.name.as_ref().is_some_and(|name| {
+                        server
+                            .headers
+                            .keys()
+                            .any(|key| key.eq_ignore_ascii_case(name))
+                    })
+                {
+                    return Err(SettingsModelError::InvalidText);
+                }
+            }
+        }
+        if let Some(reference) = &auth.credential_ref {
+            CredentialRef::parse(reference.as_str())?;
+        }
+    }
+    Ok(())
+}
+
+/// Rejects control, NUL, inline-secret, and oversized MCP values before they
+/// can enter a child environment, command argument, or HTTP transport.
+fn validate_mcp_value(value: &str) -> Result<(), SettingsModelError> {
+    if value.is_empty()
+        || value.len() > 4096
+        || value.contains('\0')
+        || value.chars().any(|character| character.is_control())
+        || contains_sensitive_text(value)
+    {
+        return Err(SettingsModelError::InvalidText);
+    }
+    Ok(())
+}
+
+/// Mirrors Java's key-name denylist so credentials cannot be smuggled through
+/// an ordinary MCP environment/header/query map key.
+fn contains_sensitive_config_key(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    [
+        "api_key",
+        "apikey",
+        "access_token",
+        "accesstoken",
+        "authorization",
+        "credential",
+        "password",
+        "secret",
+        "token",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+/// Checks the platform-neutral environment-name grammar used by Java's MCP
+/// definition, while leaving the actual secret in the keyring.
+fn valid_env_name(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    if value.is_empty() || value.len() > 128 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+/// Checks an RFC-token-like HTTP header name before the provider adapter sees
+/// it; values still remain opaque configuration and never contain secrets.
+fn valid_header_name(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+    })
 }
 
 /// Rejects common inline secret assignments in stdio/MCP endpoint text while

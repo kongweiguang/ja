@@ -57,6 +57,8 @@ pub fn run() {
             app_runtime::ja_runtime_state,
             app_runtime::ja_runtime_recovery_state,
             app_runtime::ja_runtime_acknowledge_recovery,
+            app_runtime::ja_runtime_configure,
+            app_runtime::ja_approval_respond,
             app_runtime::ja_turn_start,
             terminal::commands::ja_terminal_configure,
             terminal::commands::ja_terminal_open,

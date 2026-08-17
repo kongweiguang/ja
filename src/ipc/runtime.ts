@@ -23,6 +23,7 @@ export const JA_RUNTIME_COMMANDS = {
   state: "ja_runtime_state",
   recoveryState: "ja_runtime_recovery_state",
   acknowledgeRecovery: "ja_runtime_acknowledge_recovery",
+  approvalRespond: "ja_approval_respond",
   turnStart: "ja_turn_start",
 } as const;
 
@@ -89,6 +90,12 @@ const TurnAcceptedSchema = z.object({
   status: z.string().min(1).max(64),
 }).strict();
 
+const ApprovalResponseInputSchema = z.object({
+  approvalId: z.string().regex(/^appr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(128),
+  decision: z.enum(["allow_once", "allow_session", "deny", "expired", "disconnected"]),
+  resolvedAt: z.string().datetime({ offset: true }).max(64),
+}).strict();
+
 const RuntimeStatusEventParamsSchema = z.object({
   serverInstanceId: ServerInstanceIdSchema,
   eventId: z.string().regex(/^evt_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(100),
@@ -121,6 +128,7 @@ export type RecoveryReason = z.infer<typeof RecoveryReasonSchema>;
 export type ManualRecoveryConfirmation = z.infer<typeof ManualRecoveryConfirmationSchema>;
 export type TurnStartInput = z.infer<typeof TurnStartInputSchema>;
 export type TurnAccepted = z.infer<typeof TurnAcceptedSchema>;
+export type ApprovalResponseInput = z.infer<typeof ApprovalResponseInputSchema>;
 
 const SAFE_RUNTIME_REASONS = new Set([
   "starting",
@@ -233,7 +241,7 @@ function assertHostPayloadSafe(value: unknown): void {
     }
     throw new RuntimeHostError("SENSITIVE_EVENT_BLOCKED", SAFE_RUNTIME_ERRORS["SENSITIVE_EVENT_BLOCKED"]?.message ?? "运行时事件包含受保护数据", false);
   }
-  const visit = (current: unknown, seen = new WeakSet<object>()): void => {
+  const visit = (current: unknown, seen = new WeakSet<object>(), path: string[] = []): void => {
     if (current === null || typeof current !== "object") {
       return;
     }
@@ -242,10 +250,16 @@ function assertHostPayloadSafe(value: unknown): void {
     }
     seen.add(current);
     for (const [key, child] of Object.entries(current)) {
-      if (SENSITIVE_KEY_PATTERN.test(key) || /(?:path|cwd|stack|cause|token|secret|credential)/i.test(key)) {
+      const approvalActionField = path.length === 3
+        && path[0] === "params"
+        && path[1] === "approval"
+        && path[2] === "action"
+        && (key === "cwd" || key === "relativePaths");
+      if (!approvalActionField
+        && (SENSITIVE_KEY_PATTERN.test(key) || /(?:path|cwd|stack|cause|token|secret|credential)/i.test(key))) {
         throw new RuntimeHostError("SENSITIVE_EVENT_BLOCKED", SAFE_RUNTIME_ERRORS["SENSITIVE_EVENT_BLOCKED"]?.message ?? "运行时事件包含受保护数据", false);
       }
-      visit(child, seen);
+      visit(child, seen, [...path, key]);
     }
     seen.delete(current);
   };
@@ -286,6 +300,8 @@ export interface RuntimeHostAdapter {
   state(): Promise<RuntimeStatus>;
   recoveryState(): Promise<RuntimeRecoveryState>;
   acknowledgeRecovery(confirmation: ManualRecoveryConfirmation): Promise<RuntimeRecoveryState>;
+  /** Optional for existing host test doubles until the approval UI consumes it. */
+  approvalRespond?(input: ApprovalResponseInput): Promise<void>;
   turnStart(input: TurnStartInput): Promise<TurnAccepted>;
   subscribe(listener: RuntimeHostListener): Promise<RuntimeHostUnsubscribe>;
 }
@@ -320,6 +336,24 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
       { confirmation: parsed },
       RuntimeRecoveryStateSchema,
     );
+  }
+
+  /**
+   * Sends only the user-facing approval identity; Rust resolves the private
+   * JSON-RPC request id so the WebView never becomes coupled to a generic
+   * protocol envelope or receives an internal server-request identifier.
+   */
+  async approvalRespond(input: ApprovalResponseInput): Promise<void> {
+    const parsed = ApprovalResponseInputSchema.parse(input);
+    try {
+      const result = await this.bridge.invoke<unknown>(JA_RUNTIME_COMMANDS.approvalRespond, { input: parsed });
+      assertHostPayloadSafe(result);
+      if (result !== null && result !== undefined) {
+        throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true);
+      }
+    } catch (error) {
+      throw normalizeRuntimeError(error);
+    }
   }
 
   async turnStart(input: TurnStartInput): Promise<TurnAccepted> {

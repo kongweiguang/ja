@@ -4,6 +4,11 @@
 //! Trusted sidecar launch policy and typed command DTOs.
 
 use crate::agent_process::{AgentProcessError, LifecycleState, SidecarConfig};
+use crate::settings::{
+    AccessMode, ApiProtocol, CredentialRef, McpAuthKind, McpServerSetting, ProfileSetting,
+    SecretBackend, SettingsDocument,
+};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 #[cfg(any(test, feature = "test-support", debug_assertions))]
@@ -38,6 +43,292 @@ pub enum EventEmitError {
 /// A sink isolates Tauri event emission from the actor and makes lifecycle
 /// tests deterministic without creating a WebView or a real Tauri app.
 pub type EventSink = Arc<dyn Fn(Value) -> Result<(), EventEmitError> + Send + Sync + 'static>;
+
+/// Captures the one workspace/profile snapshot that may be replayed into a
+/// freshly handshaken sidecar.  Keeping this snapshot separate from the
+/// persisted settings document prevents the bridge from inventing a second
+/// settings repository while still making restart order deterministic.
+#[derive(Debug, Clone)]
+pub struct RuntimeReplayConfig {
+    pub(crate) workspace_id: String,
+    pub(crate) root_path: PathBuf,
+    pub(crate) display_name: Option<String>,
+    pub(crate) trust: String,
+    pub(crate) profile: ProfileSetting,
+    pub(crate) skill_revisions: Vec<String>,
+    pub(crate) mcp_servers: Vec<McpServerSetting>,
+}
+
+/// Typed command input for selecting the frozen workspace/settings snapshot
+/// before a sidecar start.  Secrets are intentionally absent; only opaque
+/// credential references cross this boundary.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeConfigureInput {
+    pub workspace_id: String,
+    pub root_path: String,
+    pub display_name: Option<String>,
+    pub trust: String,
+    pub settings: SettingsDocument,
+}
+
+/// A successful configuration change is represented without echoing the
+/// selected path or any provider data into the WebView response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeConfigurationStatus {
+    pub configured: bool,
+    pub profile_revision: String,
+    pub mcp_count: usize,
+}
+
+/// Restricts the WebView approval response to the business approval identity;
+/// the private JSON-RPC request ID stays inside the native bridge.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApprovalResponseInput {
+    pub approval_id: String,
+    pub decision: String,
+    pub resolved_at: String,
+}
+
+impl ApprovalResponseInput {
+    /// Validates only the stable approval wire shape; Java remains the
+    /// authoritative parser for the timestamp's exact instant semantics.
+    pub(crate) fn validate(&self) -> Result<(), RuntimeCommandError> {
+        if !self.approval_id.starts_with("appr_")
+            || !valid_text_id(&self.approval_id, 128)
+            || !matches!(
+                self.decision.as_str(),
+                "allow_once" | "allow_session" | "deny" | "expired" | "disconnected"
+            )
+            || self.resolved_at.is_empty()
+            || self.resolved_at.len() > 64
+            || self
+                .resolved_at
+                .chars()
+                .any(|character| character.is_control())
+            || !self.resolved_at.contains('T')
+        {
+            return Err(RuntimeCommandError::invalid_params());
+        }
+        Ok(())
+    }
+
+    /// Produces the response object without exposing a generic JSON-RPC seam.
+    pub(crate) fn result(&self) -> Value {
+        json!({"decision": self.decision, "resolvedAt": self.resolved_at})
+    }
+}
+
+impl RuntimeReplayConfig {
+    /// Validates and freezes the workspace/profile snapshot before it can
+    /// influence a sidecar generation; this is the only settings-to-wire
+    /// selection point and therefore avoids a second runtime registry.
+    pub(crate) fn from_input(input: RuntimeConfigureInput) -> Result<Self, RuntimeCommandError> {
+        input
+            .settings
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        if !input.workspace_id.starts_with("ws_")
+            || !valid_text_id(&input.workspace_id, 128)
+            || !matches!(input.trust.as_str(), "untrusted" | "trusted")
+            || input.root_path.is_empty()
+            || input.root_path.len() > 4096
+            || input
+                .root_path
+                .chars()
+                .any(|character| character.is_control())
+            || input.display_name.as_ref().is_some_and(|value| {
+                value.is_empty()
+                    || value.len() > 256
+                    || value.chars().any(|character| character.is_control())
+            })
+        {
+            return Err(RuntimeCommandError::invalid_params());
+        }
+        let raw_root = PathBuf::from(&input.root_path);
+        let metadata =
+            fs::symlink_metadata(&raw_root).map_err(|_| RuntimeCommandError::configuration())?;
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) || !metadata.is_dir() {
+            return Err(RuntimeCommandError::configuration());
+        }
+        let root_path =
+            fs::canonicalize(&raw_root).map_err(|_| RuntimeCommandError::configuration())?;
+        let active_revision = input
+            .settings
+            .active_profile_revision
+            .clone()
+            .ok_or_else(RuntimeCommandError::profile_unavailable)?;
+        let profile = input
+            .settings
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_revision == active_revision)
+            .cloned()
+            .ok_or_else(RuntimeCommandError::profile_unavailable)?;
+        let skill_revisions = profile.skill_revisions.clone();
+        let enabled_mcp = input
+            .settings
+            .mcp_servers
+            .iter()
+            .filter(|server| server.enabled)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mcp_servers = match profile.mcp_revisions.as_ref() {
+            Some(revisions) => revisions
+                .iter()
+                .filter_map(|revision| {
+                    enabled_mcp
+                        .iter()
+                        .find(|server| server.mcp_revision == *revision)
+                        .cloned()
+                })
+                .collect::<Vec<_>>(),
+            None => enabled_mcp,
+        };
+        if mcp_servers
+            .iter()
+            .any(|server| !valid_text_id(&server.mcp_revision, 128))
+        {
+            return Err(RuntimeCommandError::invalid_params());
+        }
+        Ok(Self {
+            workspace_id: input.workspace_id,
+            root_path,
+            display_name: input.display_name,
+            trust: input.trust,
+            profile,
+            skill_revisions,
+            mcp_servers,
+        })
+    }
+
+    /// Returns the opaque credential selected for the model, if one exists;
+    /// callers still need to verify the active profile revision before use.
+    pub(crate) fn model_credential(&self) -> Option<&CredentialRef> {
+        self.profile.credential_ref.as_ref()
+    }
+
+    /// Finds one selected MCP definition by revision without accepting a
+    /// caller-supplied server that was not part of the frozen snapshot.
+    pub(crate) fn mcp(&self, revision: &str) -> Option<&McpServerSetting> {
+        self.mcp_servers
+            .iter()
+            .find(|server| server.mcp_revision == revision)
+    }
+
+    /// Returns the effective opaque MCP credential while preserving the
+    /// legacy top-level reference as a backwards-compatible alias.
+    pub(crate) fn mcp_credential(server: &McpServerSetting) -> Option<&CredentialRef> {
+        server
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.credential_ref.as_ref())
+            .or(server.credential_ref.as_ref())
+    }
+
+    /// Converts the supported provider setting into the small JA wire profile
+    /// DTO; the mapper deliberately does not reuse Java or database models.
+    pub(crate) fn profile_params(&self) -> Value {
+        let protocol = match self.profile.protocol {
+            ApiProtocol::AnthropicMessages => "anthropic_messages",
+            ApiProtocol::OpenAiChatCompletions => "openai_chat_completions",
+            ApiProtocol::OpenAiResponses => "openai_responses",
+        };
+        let provider = self.profile.provider.clone();
+        let access_mode = match self.profile.access_mode {
+            AccessMode::ReadOnly => "read_only",
+            AccessMode::Workspace => "workspace",
+            AccessMode::FullAccess => "full_access",
+        };
+        let mcp_revisions = self
+            .mcp_servers
+            .iter()
+            .map(|server| Value::String(server.mcp_revision.clone()))
+            .collect::<Vec<_>>();
+        let mut model = json!({
+            "provider": provider,
+            "protocol": protocol,
+            "model": self.profile.model,
+            "supportsVision": self.profile.supports_vision,
+        });
+        if let Some(base_url) = &self.profile.base_url {
+            model["baseUrl"] = Value::String(base_url.clone());
+        }
+        if let Some(reference) = &self.profile.credential_ref {
+            model["credentialRef"] = Value::String(reference.as_str().to_owned());
+        }
+        json!({
+            "profileRevision": self.profile.profile_revision,
+            "name": self.profile.name,
+            "accessMode": access_mode,
+            "skillRevisions": self.skill_revisions,
+            "mcpRevisions": mcp_revisions,
+            "model": model,
+        })
+    }
+
+    /// Converts one settings MCP entry into the Java generation DTO while
+    /// retaining only structured endpoint/auth fields and no secret bytes.
+    pub(crate) fn mcp_params(server: &McpServerSetting) -> Value {
+        let mut result = json!({
+            "mcpRevision": server.mcp_revision,
+            "name": server.name,
+            "transport": server.transport,
+            "endpoint": server.endpoint,
+            "protocolVersion": server.protocol_version,
+            "enabled": server.enabled,
+        });
+        if server.transport == "stdio" {
+            if !server.args.is_empty() {
+                result["args"] = json!(server.args);
+            }
+            if !server.env.is_empty() {
+                result["env"] = json!(server.env);
+            }
+        } else {
+            if !server.headers.is_empty() {
+                result["headers"] = json!(server.headers);
+            }
+            if !server.query_params.is_empty() {
+                result["queryParams"] = json!(server.query_params);
+            }
+        }
+        let auth = match server.auth.as_ref() {
+            Some(auth) => {
+                let kind = match auth.kind {
+                    McpAuthKind::None => "none",
+                    McpAuthKind::Bearer => "bearer",
+                    McpAuthKind::Header => "header",
+                    McpAuthKind::Env => "env",
+                };
+                let mut value = json!({"kind": kind});
+                if let Some(name) = &auth.name {
+                    value["name"] = Value::String(name.clone());
+                }
+                if let Some(reference) = &auth.credential_ref {
+                    value["credentialRef"] = Value::String(reference.as_str().to_owned());
+                }
+                value
+            }
+            None => match (&server.credential_ref, server.transport.as_str()) {
+                (Some(reference), "stdio") => json!({
+                    "kind": "env",
+                    "name": "JA_MCP_SECRET",
+                    "credentialRef": reference.as_str(),
+                }),
+                (Some(reference), _) => json!({
+                    "kind": "bearer",
+                    "credentialRef": reference.as_str(),
+                }),
+                (None, _) => json!({"kind": "none"}),
+            },
+        };
+        result["auth"] = auth;
+        result
+    }
+}
 
 /// The reason is deliberately closed so the recovery command cannot become a
 /// free-form path/process acknowledgement channel.
@@ -608,6 +899,8 @@ pub struct LaunchConfig {
     pub(super) sidecar: SidecarConfig,
     pub(super) request_timeout: Duration,
     pub(super) shutdown_timeout: Duration,
+    pub(super) replay: Option<RuntimeReplayConfig>,
+    pub(super) secret_backend: Arc<dyn SecretBackend>,
 }
 
 impl LaunchConfig {
@@ -644,7 +937,17 @@ impl LaunchConfig {
             sidecar,
             request_timeout: TURN_DEADLINE,
             shutdown_timeout: SHUTDOWN_DEADLINE,
+            replay: None,
+            secret_backend: Arc::new(crate::settings::NativeKeyringBackend),
         }
+    }
+
+    /// Installs a test-only credential backend while keeping the production
+    /// path on the mature native keyring and the same resolver boundary.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_secret_backend(mut self, backend: Arc<dyn SecretBackend>) -> Self {
+        self.secret_backend = backend;
+        self
     }
 }
 
@@ -667,10 +970,21 @@ pub fn bundled_launch_config(
     if executable != expected || !executable.starts_with(&resource_root) || !executable.is_file() {
         return Err(RuntimeCommandError::configuration());
     }
+    let run_dir = run_dir.into();
+    let mut sidecar = bounded_sidecar(executable, run_dir);
+    sidecar.args = vec![
+        OsString::from("--runtime=production"),
+        OsString::from(format!(
+            "--data-dir-base64={}",
+            encode_data_dir(&sidecar.run_dir)?
+        )),
+    ];
     Ok(LaunchConfig {
-        sidecar: bounded_sidecar(executable, run_dir.into()),
+        sidecar,
         request_timeout: TURN_DEADLINE,
         shutdown_timeout: SHUTDOWN_DEADLINE,
+        replay: None,
+        secret_backend: Arc::new(crate::settings::NativeKeyringBackend),
     })
 }
 
@@ -729,6 +1043,15 @@ fn bounded_sidecar(executable: PathBuf, run_dir: PathBuf) -> SidecarConfig {
     sidecar
 }
 
+/// Encodes the canonical data directory as URL-safe ASCII so Windows native
+/// argv never has to carry a Unicode path through a lossy process boundary.
+fn encode_data_dir(path: &Path) -> Result<String, RuntimeCommandError> {
+    let utf8 = path
+        .to_str()
+        .ok_or_else(RuntimeCommandError::configuration)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(utf8.as_bytes()))
+}
+
 /// Creates the app-data runtime directory and applies the narrowest native
 /// permission available; Tauri's app-data root remains the Windows boundary.
 pub fn prepare_run_dir(run_dir: impl AsRef<Path>) -> Result<PathBuf, RuntimeCommandError> {
@@ -760,11 +1083,17 @@ impl LaunchConfig {
             OsString::from("-jar"),
             jar.into_os_string(),
             OsString::from("--runtime=fake"),
+            OsString::from(format!(
+                "--data-dir-base64={}",
+                encode_data_dir(&sidecar.run_dir)?
+            )),
         ];
         let config = Self {
             sidecar,
             request_timeout: TURN_DEADLINE,
             shutdown_timeout: SHUTDOWN_DEADLINE,
+            replay: None,
+            secret_backend: Arc::new(crate::settings::NativeKeyringBackend),
         };
         config.validate()?;
         Ok(config)
@@ -975,12 +1304,32 @@ impl RuntimeCommandError {
         }
     }
 
+    /// Distinguishes a missing active model from a temporarily unavailable
+    /// sidecar so settings UI can ask for configuration before retrying start.
+    pub(super) const fn profile_unavailable() -> Self {
+        Self {
+            code: "PROFILE_UNAVAILABLE",
+            message: "active model profile is unavailable",
+            retryable: false,
+        }
+    }
+
     /// Gives callers a stable backpressure result instead of blocking a Tauri
     /// command until the actor eventually drains its bounded queue.
     pub(super) const fn queue_full() -> Self {
         Self {
             code: "RUNTIME_QUEUE_FULL",
             message: "runtime bridge queue is full",
+            retryable: true,
+        }
+    }
+
+    /// Distinguishes a bounded configuration replay deadline from a generic
+    /// sidecar failure so callers can retry without exposing child details.
+    pub(super) const fn deadline() -> Self {
+        Self {
+            code: "RUNTIME_COMMAND_DEADLINE",
+            message: "runtime request deadline exceeded",
             retryable: true,
         }
     }
@@ -1127,6 +1476,61 @@ mod tests {
             result,
             Err(error) if error == RuntimeCommandError::configuration()
         ));
+    }
+
+    /// Native launch arguments carry only URL-safe ASCII for the data path;
+    /// this prevents a Unicode Windows path from falling back to legacy argv.
+    #[test]
+    fn bundled_resource_uses_ascii_base64_data_directory_argument() {
+        let root = std::env::temp_dir().join(format!("ja-resource-unicode-{}", Uuid::new_v4()));
+        let run_dir = root.join("运行目录");
+        let staged = root.join(sidecar_resource_name());
+        std::fs::create_dir_all(staged.parent().expect("sidecar parent")).expect("sidecar dir");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        std::fs::write(&staged, b"fixture").expect("staged sidecar");
+        let config = bundled_launch_config(&root, &run_dir).expect("launch config");
+        let data_arg = config
+            .sidecar
+            .args
+            .iter()
+            .find_map(|arg| {
+                arg.to_str()
+                    .filter(|value| value.starts_with("--data-dir-base64="))
+            })
+            .expect("base64 data argument");
+        let encoded = data_arg.trim_start_matches("--data-dir-base64=");
+        assert!(!encoded.is_empty());
+        assert!(
+            encoded
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') })
+        );
+        assert!(
+            config
+                .sidecar
+                .args
+                .iter()
+                .all(|arg| !arg.to_string_lossy().starts_with("--data-dir="))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A start cannot reach Java activation until a validated active profile
+    /// exists; this keeps missing model configuration explicit and retry-free.
+    #[test]
+    fn configure_requires_an_active_profile() {
+        let root = std::env::temp_dir().join(format!("ja-config-profile-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("workspace root");
+        let error = RuntimeReplayConfig::from_input(RuntimeConfigureInput {
+            workspace_id: "ws_fixture".to_owned(),
+            root_path: root.to_string_lossy().into_owned(),
+            display_name: None,
+            trust: "trusted".to_owned(),
+            settings: SettingsDocument::default(),
+        })
+        .expect_err("missing active profile must fail");
+        assert_eq!(error.code, "PROFILE_UNAVAILABLE");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Unix runtime directories stay private even when the parent app-data

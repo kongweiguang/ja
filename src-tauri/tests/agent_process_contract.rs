@@ -2665,9 +2665,9 @@ fn limits_reject_unbounded_configuration() {
     assert!(PendingRegistry::new(1, usize::MAX).is_err());
 }
 
-/// 证明 Native-only 启动边界不允许 JRE/PATH 回退或把 secret 放进 argv。
+/// 证明 Native-only 启动边界允许固定 coding runtime，但不允许 JRE 回退或 secret 进入 argv。
 #[test]
-fn native_only_config_rejects_jre_fallback_environment() {
+fn native_only_config_rejects_jre_fallback_and_secret_environment() {
     let executable = std::env::current_exe().unwrap();
     let run_dir = std::env::temp_dir();
     let mut java_home = SidecarConfig::new(&executable, &run_dir);
@@ -2682,10 +2682,23 @@ fn native_only_config_rejects_jre_fallback_environment() {
     let mut path = SidecarConfig::new(&executable, &run_dir);
     path.env.insert(
         OsString::from("PATH"),
-        OsString::from("C:\\Windows\\System32"),
+        OsString::from("C:\\secret-project\\bin;C:\\Windows\\System32"),
     );
+    assert!(path.validate().is_ok());
+
+    let mut comspec = SidecarConfig::new(&executable, &run_dir);
+    comspec.env.insert(
+        OsString::from("ComSpec"),
+        OsString::from("C:\\Windows\\System32\\cmd.exe"),
+    );
+    assert!(comspec.validate().is_ok());
+
+    let mut secret_env = SidecarConfig::new(&executable, &run_dir);
+    secret_env
+        .env
+        .insert(OsString::from("OPENAI_API_KEY"), OsString::from("sk-test"));
     assert_eq!(
-        path.validate(),
+        secret_env.validate(),
         Err(agent_process::AgentProcessError::InvalidConfig)
     );
 
@@ -2718,6 +2731,51 @@ fn native_only_config_rejects_jre_fallback_environment() {
         replaced_path.validate(),
         Err(agent_process::AgentProcessError::InvalidConfig)
     );
+}
+
+/// Captures the actual env_clear/envs child boundary so Java's existing shell
+/// adapter can receive PATH/ComSpec while provider keys and proxy variables stay absent.
+#[cfg(windows)]
+#[test]
+fn real_child_receives_coding_runtime_allowlist_without_secret_or_proxy() {
+    let system_root = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+    let powershell = system_root
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if !powershell.is_file() {
+        return;
+    }
+    let run_dir = std::env::temp_dir();
+    let config = SidecarConfig::new(&powershell, &run_dir);
+    let path = config
+        .env
+        .get(&OsString::from("PATH"))
+        .expect("coding PATH must be captured")
+        .to_string_lossy()
+        .into_owned();
+    let comspec = config
+        .env
+        .get(&OsString::from("ComSpec"))
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let script = "[Console]::WriteLine(('PATH=' + $env:PATH)); [Console]::WriteLine(('ComSpec=' + $env:ComSpec)); [Console]::WriteLine(('OPENAI_API_KEY=' + $env:OPENAI_API_KEY)); [Console]::WriteLine(('HTTP_PROXY=' + $env:HTTP_PROXY))";
+    let output = Command::new(&powershell)
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .current_dir(&run_dir)
+        .env_clear()
+        .envs(config.env.iter())
+        .output()
+        .expect("coding runtime child spawned");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!("PATH={path}")));
+    assert!(stdout.contains(&format!("ComSpec={comspec}")));
+    assert!(stdout.contains("OPENAI_API_KEY="));
+    assert!(stdout.contains("HTTP_PROXY="));
+    assert!(!stdout.contains("sk-"));
+    assert!(!stdout.contains("proxy.invalid"));
 }
 
 #[test]

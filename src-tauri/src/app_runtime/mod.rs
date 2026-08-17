@@ -12,9 +12,10 @@ mod projection;
 pub use bridge::BridgeTestTrace;
 pub use bridge::RuntimeBridge;
 pub use config::{
-    EventEmitError, EventSink, LaunchConfig, ManualRecoveryConfirmation, ManualRecoveryReason,
-    RuntimeCommandError, RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind, TurnAccepted,
-    TurnInputPart, TurnStartInput, bundled_launch_config, prepare_run_dir,
+    ApprovalResponseInput, EventEmitError, EventSink, LaunchConfig, ManualRecoveryConfirmation,
+    ManualRecoveryReason, RuntimeCommandError, RuntimeConfigurationStatus, RuntimeConfigureInput,
+    RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind, TurnAccepted, TurnInputPart,
+    TurnStartInput, bundled_launch_config, prepare_run_dir,
 };
 pub use host::RuntimeHost;
 pub use projection::RPC_FRAME_EVENT;
@@ -27,6 +28,8 @@ pub fn register_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
         ja_runtime_state,
         ja_runtime_recovery_state,
         ja_runtime_acknowledge_recovery,
+        ja_runtime_configure,
+        ja_approval_respond,
         ja_turn_start
     ])
 }
@@ -79,6 +82,27 @@ pub fn ja_runtime_acknowledge_recovery(
     state: tauri::State<'_, RuntimeHost>,
 ) -> Result<RuntimeRecoveryState, RuntimeCommandError> {
     state.acknowledge_recovery(&confirmation)
+}
+
+/// Freezes one validated workspace/settings snapshot before the next start;
+/// changing it uses the host's bounded restart path rather than hot-swapping
+/// a live AgentScope generation.
+#[tauri::command]
+pub fn ja_runtime_configure(
+    input: RuntimeConfigureInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<RuntimeConfigurationStatus, RuntimeCommandError> {
+    state.configure(input)
+}
+
+/// Sends one typed approval decision to the pending Java request without
+/// exposing a generic server-response command to the WebView.
+#[tauri::command]
+pub fn ja_approval_respond(
+    input: ApprovalResponseInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<(), RuntimeCommandError> {
+    state.approval_respond(input)
 }
 
 /// Shares the production exit cleanup path with MockRuntime tests so a Tauri

@@ -28,7 +28,7 @@ pub use credentials::{
     SecretDeliveryChannel, SecretDeliveryError, SecretError,
 };
 pub use model::{
-    ApiProtocol, CredentialRef, McpServerSetting, ProfileSetting, SettingsDocument,
-    SettingsModelError, ThemePreference, WindowSettings,
+    AccessMode, ApiProtocol, CredentialRef, McpAuthKind, McpAuthSetting, McpServerSetting,
+    ProfileSetting, SettingsDocument, SettingsModelError, ThemePreference, WindowSettings,
 };
 pub use store::{LoadSource, LoadedSettings, SettingsError, SettingsStore};

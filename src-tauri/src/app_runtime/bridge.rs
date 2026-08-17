@@ -8,14 +8,16 @@
 //! start/turn request cannot starve notifications or terminal cleanup.
 
 use super::config::{
-    EventSink, LaunchConfig, RuntimeCommandError, RuntimeStatus, RuntimeStatusKind, TurnAccepted,
-    TurnStartInput, clear_recovery_record, ensure_recovery_clear, persist_recovery_record,
-    recovery_marker_path,
+    ApprovalResponseInput, EventSink, LaunchConfig, RuntimeCommandError, RuntimeReplayConfig,
+    RuntimeStatus, RuntimeStatusKind, TurnAccepted, TurnStartInput, clear_recovery_record,
+    ensure_recovery_clear, persist_recovery_record, recovery_marker_path,
 };
-use super::projection::{emit_frame, emit_status, frame_to_value};
+use super::projection::{emit_frame, emit_status, frame_to_value, project_approval_request};
 use crate::agent_process::codec::RpcFrame;
-use crate::agent_process::{EventPump, Session, SessionEvent, SidecarSupervisor};
+use crate::agent_process::{AgentClient, EventPump, Session, SessionEvent, SidecarSupervisor};
+use crate::settings::{CredentialPurpose, CredentialRef, CredentialVault, SecretError};
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 #[cfg(feature = "tauri-smoke")]
 use std::sync::atomic::AtomicUsize;
@@ -32,10 +34,12 @@ const EXIT_DEADLINE: Duration = Duration::from_secs(30);
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(25);
 const ACTOR_POLL_TIMEOUT: Duration = Duration::from_millis(25);
 const EVENT_CANCEL_GRACE: Duration = Duration::from_millis(100);
+const REPLAY_DEADLINE: Duration = Duration::from_secs(60);
 
 const TERMINAL_NONE: u8 = 0;
 const TERMINAL_SIDECAR: u8 = 1;
 const TERMINAL_EVENT_DELIVERY: u8 = 2;
+const TERMINAL_SERVER_REQUEST_QUEUE: u8 = 3;
 
 #[cfg(feature = "test-support")]
 const PHASE_ACTOR_ENTER: u8 = 1;
@@ -389,6 +393,10 @@ enum BridgeCommand {
         params: Value,
         reply: Reply<TurnAccepted>,
     },
+    ApprovalRespond {
+        input: ApprovalResponseInput,
+        reply: Reply<()>,
+    },
     #[cfg(feature = "test-support")]
     QueueProbe,
 }
@@ -402,7 +410,15 @@ struct ShutdownRequest {
 }
 
 enum BridgeSignal {
-    ServerRequest { generation: u64, frame: RpcFrame },
+    ServerRequest {
+        generation: u64,
+        frame: RpcFrame,
+    },
+    TurnTerminal {
+        generation: u64,
+        thread_id: String,
+        turn_id: String,
+    },
 }
 
 /// Reserves terminal faults outside the server-request queue so a burst of
@@ -1174,6 +1190,15 @@ impl RuntimeBridge {
         self.call(|reply| BridgeCommand::TurnStart { params, reply })
     }
 
+    /// Enqueues a typed approval decision; the actor resolves the private
+    /// server request ID from the current generation's bounded map.
+    pub fn approval_respond(
+        &self,
+        input: ApprovalResponseInput,
+    ) -> Result<(), RuntimeCommandError> {
+        self.call(|reply| BridgeCommand::ApprovalRespond { input, reply })
+    }
+
     /// Enqueues a no-I/O probe through the production bounded command lane;
     /// its test-only shape cannot block on an unconsumed reply while proving
     /// the exact capacity boundary.
@@ -1272,11 +1297,28 @@ struct RunningRuntime {
     event_drain: EventDrain,
     generation: u64,
     server_instance_id: String,
+    /// Maps UI business identities to private server-request IDs for this
+    /// generation; it is dropped with the runtime and never serialized.
+    pending_approvals: HashMap<String, PendingApproval>,
+    /// Retains a bounded tombstone set so late or duplicate approvals cannot
+    /// consume a fresh request slot after turn/generation cleanup.
+    retired_approvals: HashSet<String>,
+    retired_approval_order: VecDeque<String>,
+    next_approval_sequence: u64,
+}
+
+/// Keeps the private request correlation and the exact turn/expiry ownership
+/// needed for local cleanup; no generic RPC registry is introduced.
+struct PendingApproval {
+    request_id: String,
+    thread_id: String,
+    turn_id: String,
+    expires_at: String,
 }
 
 enum QuarantineOwner {
-    Runtime(RunningRuntime),
-    Pending(SidecarSupervisor),
+    Runtime(Box<RunningRuntime>),
+    Pending(Box<SidecarSupervisor>),
 }
 
 /// Keeps an unconfirmed process owner reachable after the actor's shared exit
@@ -1312,7 +1354,7 @@ impl ExitQuarantine {
             .owner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(QuarantineOwner::Runtime(current));
+            Some(QuarantineOwner::Runtime(Box::new(current)));
         *self
             .status
             .lock()
@@ -1328,7 +1370,7 @@ impl ExitQuarantine {
             .owner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(QuarantineOwner::Pending(supervisor));
+            Some(QuarantineOwner::Pending(Box::new(supervisor)));
         *self
             .status
             .lock()
@@ -1544,7 +1586,13 @@ fn actor_loop(
             }
             continue;
         }
-        drain_signals(&mut runtime, &signal_receiver);
+        drain_signals(
+            &context.config,
+            &context.sink,
+            &mut runtime,
+            &signal_receiver,
+            &context.terminal_fault,
+        );
         drain_terminal_fault(
             TerminalCleanupContext {
                 config: &context.config,
@@ -1653,6 +1701,9 @@ fn actor_loop(
                     params,
                     &context.exit_control,
                 ));
+            }
+            Ok(BridgeCommand::ApprovalRespond { input, reply }) => {
+                let _ = reply.send(respond_approval(&mut runtime, input, &context.exit_control));
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -1774,6 +1825,119 @@ struct StartRuntimeContext<'a> {
     shutdown_failure_injector: Option<Arc<AtomicUsize>>,
 }
 
+/// Replays the one frozen workspace/MCP/profile snapshot in protocol order;
+/// each request is completed before the next one is admitted so activation
+/// cannot observe a partially configured AgentScope graph.
+fn replay_configuration(
+    session: &Session,
+    config: &LaunchConfig,
+    deadline: Instant,
+) -> Result<(), RuntimeCommandError> {
+    let Some(replay) = config.replay.as_ref() else {
+        return Ok(());
+    };
+    let root_path = replay
+        .root_path
+        .to_str()
+        .ok_or_else(RuntimeCommandError::configuration)?;
+    let mut workspace = json!({
+        "workspaceId": replay.workspace_id,
+        "rootPath": root_path,
+        "trust": replay.trust,
+    });
+    if let Some(display_name) = &replay.display_name {
+        workspace["displayName"] = Value::String(display_name.clone());
+    }
+    replay_request(session, config, "workspace/open", workspace, deadline)?;
+    for server in &replay.mcp_servers {
+        replay_request(
+            session,
+            config,
+            "mcp/save",
+            json!({"server": RuntimeReplayConfig::mcp_params(server)}),
+            deadline,
+        )?;
+    }
+    replay_request(
+        session,
+        config,
+        "profile/save",
+        json!({"profile": replay.profile_params()}),
+        deadline,
+    )?;
+    replay_request(
+        session,
+        config,
+        "profile/activate",
+        json!({"profileRevision": replay.profile.profile_revision}),
+        deadline,
+    )?;
+    Ok(())
+}
+
+/// Performs one replay request with the only nested request currently legal
+/// during startup: secret/resolve handled inside the Rust actor boundary.
+fn replay_request(
+    session: &Session,
+    config: &LaunchConfig,
+    method: &str,
+    params: Value,
+    deadline: Instant,
+) -> Result<(), RuntimeCommandError> {
+    let timeout = remaining_deadline(deadline)?;
+    let response = session
+        .request_with_server_request_handler(method, params, timeout, |nested, frame| {
+            if frame.method() == Some("secret/resolve") {
+                respond_secret_request(config, nested, &frame);
+            } else {
+                let _ = nested.respond_error(
+                    frame.id(),
+                    -32_006,
+                    "method not found",
+                    "METHOD_NOT_FOUND",
+                    false,
+                );
+            }
+        })
+        .map_err(|error| RuntimeCommandError::from_process(&error))?;
+    let value = frame_to_value(&response).map_err(|_| RuntimeCommandError::unavailable())?;
+    if let Some(error) = value.get("error") {
+        return Err(command_error_from_rpc(error));
+    }
+    value
+        .get("result")
+        .ok_or_else(RuntimeCommandError::unavailable)
+        .map(|_| ())
+}
+
+/// Computes the remaining replay budget for one request without resetting the
+/// activation deadline after each workspace, MCP, or profile step.
+fn remaining_deadline(deadline: Instant) -> Result<Duration, RuntimeCommandError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(RuntimeCommandError::deadline())
+    } else {
+        Ok(remaining)
+    }
+}
+
+/// Creates one bounded replay deadline, shortened when application shutdown
+/// has already established an earlier absolute cancellation boundary.
+fn replay_deadline(exit_control: &ExitControl) -> Result<Instant, RuntimeCommandError> {
+    let configured = Instant::now()
+        .checked_add(REPLAY_DEADLINE)
+        .unwrap_or_else(Instant::now);
+    if let Some(exit_deadline) = exit_control.deadline() {
+        let deadline = configured.min(exit_deadline);
+        if deadline <= Instant::now() {
+            return Err(RuntimeCommandError::shutdown_timeout());
+        }
+        Ok(deadline)
+    } else {
+        Ok(configured)
+    }
+}
+
 /// Starts at most one external generation and emits a token-free ready state.
 fn start_runtime(context: StartRuntimeContext<'_>) -> Result<RuntimeStatus, RuntimeCommandError> {
     let StartRuntimeContext {
@@ -1835,7 +1999,14 @@ fn start_runtime(context: StartRuntimeContext<'_>) -> Result<RuntimeStatus, Runt
         trace_event(test_trace, "start_supervisor_new_error");
         RuntimeCommandError::from_process(&error)
     })?;
-    let session_hook = |session: Session| exit_control.attach_session(session);
+    let replay_session = Arc::new(Mutex::new(None::<Session>));
+    let replay_session_target = Arc::clone(&replay_session);
+    let session_hook = |session: Session| {
+        exit_control.attach_session(session.clone());
+        *replay_session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
+    };
     let _session_cancellation_guard = SessionCancellationGuard::new(exit_control);
     let start_result = if let Some(deadline) = exit_control.deadline() {
         supervisor.start_until_with_session_hook(deadline, Some(&session_hook))
@@ -1923,6 +2094,32 @@ fn start_runtime(context: StartRuntimeContext<'_>) -> Result<RuntimeStatus, Runt
             return Err(RuntimeCommandError::unavailable());
         }
     };
+    let replay_deadline = match replay_deadline(exit_control) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            retain_failed_supervisor(
+                supervisor,
+                pending_cleanup,
+                cleanup_fault,
+                cleanup_deadline(exit_control, config.shutdown_timeout),
+            );
+            return Err(error);
+        }
+    };
+    if let Some(session) = replay_session
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        && let Err(error) = replay_configuration(&session, config, replay_deadline)
+    {
+        retain_failed_supervisor(
+            supervisor,
+            pending_cleanup,
+            cleanup_fault,
+            cleanup_deadline(exit_control, config.shutdown_timeout),
+        );
+        return Err(error);
+    }
     let events = match supervisor.take_event_pump() {
         Ok(events) => events,
         Err(error) => {
@@ -1967,6 +2164,10 @@ fn start_runtime(context: StartRuntimeContext<'_>) -> Result<RuntimeStatus, Runt
         event_drain,
         generation,
         server_instance_id: server_instance_id.clone(),
+        pending_approvals: HashMap::new(),
+        retired_approvals: HashSet::new(),
+        retired_approval_order: VecDeque::new(),
+        next_approval_sequence: 0,
     };
     if let Err(error) = emit_status(
         sink,
@@ -2008,6 +2209,7 @@ fn shutdown_components(
     current: &mut RunningRuntime,
     deadline: Instant,
 ) -> Result<(), RuntimeCommandError> {
+    clear_generation_approvals(current);
     current.event_drain.request_stop();
     let grace_deadline = std::cmp::min(
         deadline,
@@ -2301,17 +2503,26 @@ fn event_drain_loop(mut context: EventDrainContext) {
                     signal_projection_failure(&context.terminal_fault, context.generation);
                     break;
                 }
+                if let Some((thread_id, turn_id)) = terminal_turn_identity(&frame)
+                    && !queue_turn_terminal(
+                        &context.server_request_sender,
+                        context.generation,
+                        thread_id,
+                        turn_id,
+                        &context.terminal_fault,
+                    )
+                {
+                    break;
+                }
             }
             SessionEvent::ServerRequest(frame) => {
-                if context
-                    .server_request_sender
-                    .try_send(BridgeSignal::ServerRequest {
-                        generation: context.generation,
-                        frame,
-                    })
-                    .is_err()
-                {
-                    tracing::error!("runtime server-request signal queue is full");
+                if !queue_server_request(
+                    &context.server_request_sender,
+                    context.generation,
+                    frame,
+                    &context.terminal_fault,
+                ) {
+                    break;
                 }
             }
             SessionEvent::QueueOverflow(_) => {
@@ -2355,6 +2566,66 @@ fn event_drain_loop(mut context: EventDrainContext) {
     }
 }
 
+/// Admits one server request or fails the current generation when the bounded
+/// actor lane is full, preventing Java's request waiter from hanging forever.
+fn queue_server_request(
+    sender: &SyncSender<BridgeSignal>,
+    generation: u64,
+    frame: RpcFrame,
+    terminal_fault: &Arc<TerminalFault>,
+) -> bool {
+    match sender.try_send(BridgeSignal::ServerRequest { generation, frame }) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+            terminal_fault.publish(generation, TERMINAL_SERVER_REQUEST_QUEUE);
+            false
+        }
+    }
+}
+
+/// Routes a terminal turn identity through the same bounded actor lane so
+/// pending approvals retire when Java has closed the corresponding turn.
+fn queue_turn_terminal(
+    sender: &SyncSender<BridgeSignal>,
+    generation: u64,
+    thread_id: String,
+    turn_id: String,
+    terminal_fault: &Arc<TerminalFault>,
+) -> bool {
+    match sender.try_send(BridgeSignal::TurnTerminal {
+        generation,
+        thread_id,
+        turn_id,
+    }) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+            terminal_fault.publish(generation, TERMINAL_SERVER_REQUEST_QUEUE);
+            false
+        }
+    }
+}
+
+/// Extracts only the validated turn identity from a terminal notification;
+/// all other event data remains on the existing WebView projection path.
+fn terminal_turn_identity(frame: &RpcFrame) -> Option<(String, String)> {
+    if frame.method() != Some("turn/completed") {
+        return None;
+    }
+    let params = frame.params()?.as_object()?;
+    let turn = params.get("turn").and_then(Value::as_object);
+    let thread_id = params
+        .get("threadId")
+        .or_else(|| turn.and_then(|value| value.get("threadId")))
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("thr_") && valid_id(value, 128))?;
+    let turn_id = params
+        .get("turnId")
+        .or_else(|| turn.and_then(|value| value.get("turnId")))
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("turn_") && valid_id(value, 128))?;
+    Some((thread_id.to_owned(), turn_id.to_owned()))
+}
+
 /// Checks cancellation both before polling and before emitting an event.
 fn event_is_current(
     cancel_receiver: &Receiver<()>,
@@ -2376,28 +2647,554 @@ fn signal_projection_failure(fault: &Arc<TerminalFault>, generation: u64) {
     fault.publish(generation, TERMINAL_EVENT_DELIVERY);
 }
 
-/// Handles asynchronous terminal facts without allowing a stale generation to
-/// mutate a newly started supervisor.
-fn drain_signals(runtime: &mut Option<RunningRuntime>, receiver: &Receiver<BridgeSignal>) {
+/// Handles asynchronous server requests without allowing a stale generation
+/// to mutate a newly started supervisor or expose its private request ID.
+fn drain_signals(
+    config: &LaunchConfig,
+    sink: &EventSink,
+    runtime: &mut Option<RunningRuntime>,
+    receiver: &Receiver<BridgeSignal>,
+    terminal_fault: &Arc<TerminalFault>,
+) {
+    if let Some(current) = runtime.as_mut() {
+        purge_expired_approvals(current);
+    }
     while let Ok(signal) = receiver.try_recv() {
         match signal {
             BridgeSignal::ServerRequest { generation, frame } => {
-                if runtime
-                    .as_ref()
-                    .is_some_and(|current| current.generation == generation)
-                    && let Some(current) = runtime.as_mut()
-                    && let Ok(client) = current.supervisor.client()
-                {
-                    let _ = client.respond_error(
-                        frame.id(),
-                        -32_006,
-                        "method not found",
-                        "METHOD_NOT_FOUND",
-                        false,
-                    );
+                let Some(current) = runtime.as_mut() else {
+                    continue;
+                };
+                if current.generation != generation {
+                    continue;
+                }
+                let Ok(client) = current.supervisor.client() else {
+                    continue;
+                };
+                match frame.method() {
+                    Some("secret/resolve") => {
+                        respond_secret_request(config, &client, &frame);
+                    }
+                    Some("approval/request") => {
+                        if current.pending_approvals.len() >= MAX_PENDING_APPROVALS {
+                            let _ = client.respond_error(
+                                frame.id(),
+                                -32_042,
+                                "approval already resolved",
+                                "APPROVAL_ALREADY_RESOLVED",
+                                false,
+                            );
+                            continue;
+                        }
+                        let Some(approval_id) = frame
+                            .params()
+                            .and_then(|params| params.get("approvalId"))
+                            .and_then(Value::as_str)
+                            .filter(|value| value.starts_with("appr_") && valid_id(value, 128))
+                        else {
+                            let _ = client.respond_error(
+                                frame.id(),
+                                -32_007,
+                                "invalid params",
+                                "INVALID_PARAMS",
+                                false,
+                            );
+                            continue;
+                        };
+                        if current.pending_approvals.contains_key(approval_id)
+                            || current.retired_approvals.contains(approval_id)
+                        {
+                            let _ = client.respond_error(
+                                frame.id(),
+                                -32_042,
+                                "approval already resolved",
+                                "APPROVAL_ALREADY_RESOLVED",
+                                false,
+                            );
+                            continue;
+                        }
+                        current.next_approval_sequence =
+                            current.next_approval_sequence.saturating_add(1);
+                        let event = match project_approval_request(
+                            &frame,
+                            &current.server_instance_id,
+                            current.next_approval_sequence,
+                        ) {
+                            Ok(event) => event,
+                            Err(_) => {
+                                let _ = client.respond_error(
+                                    frame.id(),
+                                    -32_007,
+                                    "invalid params",
+                                    "INVALID_PARAMS",
+                                    false,
+                                );
+                                continue;
+                            }
+                        };
+                        let Some(details) = pending_approval_from_event(&event, frame.id()) else {
+                            let _ = client.respond_error(
+                                frame.id(),
+                                -32_007,
+                                "invalid params",
+                                "INVALID_PARAMS",
+                                false,
+                            );
+                            continue;
+                        };
+                        current
+                            .pending_approvals
+                            .insert(approval_id.to_owned(), details);
+                        if sink(event).is_err() {
+                            retire_pending_approval(current, approval_id);
+                            let _ = client.respond_error(
+                                frame.id(),
+                                -32_080,
+                                "internal error",
+                                "INTERNAL_ERROR",
+                                false,
+                            );
+                            terminal_fault.publish(current.generation, TERMINAL_EVENT_DELIVERY);
+                        }
+                    }
+                    _ => {
+                        let _ = client.respond_error(
+                            frame.id(),
+                            -32_006,
+                            "method not found",
+                            "METHOD_NOT_FOUND",
+                            false,
+                        );
+                    }
+                }
+            }
+            BridgeSignal::TurnTerminal {
+                generation,
+                thread_id,
+                turn_id,
+            } => {
+                let Some(current) = runtime.as_mut() else {
+                    continue;
+                };
+                if current.generation == generation {
+                    clear_turn_approvals(current, &thread_id, &turn_id);
                 }
             }
         }
+    }
+}
+
+const MAX_PENDING_APPROVALS: usize = 1024;
+const MAX_RETIRED_APPROVALS: usize = 1024;
+
+/// Retires an approval id in a bounded tombstone queue so repeated cancellation
+/// or expiry cannot permanently consume the pending map's capacity.
+fn retire_approval(current: &mut RunningRuntime, approval_id: &str) {
+    record_retired_approval(
+        &mut current.retired_approvals,
+        &mut current.retired_approval_order,
+        approval_id,
+    );
+}
+
+/// Applies one bounded tombstone update to the runtime-owned approval state.
+fn record_retired_approval(
+    retired: &mut HashSet<String>,
+    order: &mut VecDeque<String>,
+    approval_id: &str,
+) {
+    if retired.insert(approval_id.to_owned()) {
+        order.push_back(approval_id.to_owned());
+    }
+    while order.len() > MAX_RETIRED_APPROVALS {
+        if let Some(oldest) = order.pop_front() {
+            retired.remove(&oldest);
+        }
+    }
+}
+
+/// Removes one pending approval and records its late-response tombstone.
+fn retire_pending_approval(current: &mut RunningRuntime, approval_id: &str) {
+    current.pending_approvals.remove(approval_id);
+    retire_approval(current, approval_id);
+}
+
+/// Converts the already sanitized event back into the private correlation
+/// record, avoiding a second parser for untrusted Java fields.
+fn pending_approval_from_event(value: &Value, request_id: &str) -> Option<PendingApproval> {
+    let approval = value.get("params")?.get("approval")?.as_object()?;
+    let thread_id = approval.get("threadId")?.as_str()?.to_owned();
+    let turn_id = approval.get("turnId")?.as_str()?.to_owned();
+    let expires_at = approval.get("expiresAt")?.as_str()?.to_owned();
+    Some(PendingApproval {
+        request_id: request_id.to_owned(),
+        thread_id,
+        turn_id,
+        expires_at,
+    })
+}
+
+/// Retires approvals whose Java-provided expiry has passed and answers each
+/// private request so Java's pending-request registry cannot wait forever.
+fn purge_expired_approvals(current: &mut RunningRuntime) {
+    let expired = current
+        .pending_approvals
+        .iter()
+        .filter(|(_, pending)| approval_expired(&pending.expires_at))
+        .map(|(approval_id, _)| approval_id.clone())
+        .collect::<Vec<_>>();
+    if expired.is_empty() {
+        return;
+    }
+    let client = current.supervisor.client().ok();
+    for approval_id in expired {
+        let request_id = current
+            .pending_approvals
+            .get(&approval_id)
+            .map(|pending| pending.request_id.clone());
+        retire_pending_approval(current, &approval_id);
+        if let (Some(client), Some(request_id)) = (client.as_ref(), request_id) {
+            let _ = client.respond_error(
+                &request_id,
+                -32_041,
+                "approval expired",
+                "APPROVAL_EXPIRED",
+                false,
+            );
+        }
+    }
+}
+
+/// Compares Java's UTC Instant with the host clock at millisecond precision;
+/// accepting optional fractional digits avoids retaining an expired approval.
+fn approval_expired(expires_at: &str) -> bool {
+    let Some(canonical) = canonical_timestamp(expires_at) else {
+        return true;
+    };
+    canonical <= super::projection::now_timestamp()
+}
+
+/// Normalizes the bounded UTC timestamp shape already accepted by projection.
+fn canonical_timestamp(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if !(20..=64).contains(&bytes.len())
+        || !value.ends_with('Z')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    for index in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        if !bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+    }
+    let millis = if bytes.len() == 20 {
+        0_u16
+    } else {
+        if bytes[19] != b'.' || bytes.len() < 22 {
+            return None;
+        }
+        let fraction = &bytes[20..bytes.len() - 1];
+        if fraction.is_empty() || !fraction.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let first = fraction.first().copied().unwrap_or(b'0') - b'0';
+        let second = fraction.get(1).copied().unwrap_or(b'0') - b'0';
+        let third = fraction.get(2).copied().unwrap_or(b'0') - b'0';
+        u16::from(first) * 100 + u16::from(second) * 10 + u16::from(third)
+    };
+    Some(format!("{}.{millis:03}Z", &value[..19]))
+}
+
+/// Clears every approval belonging to a terminal turn and sends a stable
+/// denial response before Java closes the turn's pending request.
+fn clear_turn_approvals(current: &mut RunningRuntime, thread_id: &str, turn_id: &str) {
+    let ids = current
+        .pending_approvals
+        .iter()
+        .filter(|(_, pending)| pending.thread_id == thread_id && pending.turn_id == turn_id)
+        .map(|(approval_id, _)| approval_id.clone())
+        .collect::<Vec<_>>();
+    let client = current.supervisor.client().ok();
+    for approval_id in ids {
+        let request_id = current
+            .pending_approvals
+            .get(&approval_id)
+            .map(|pending| pending.request_id.clone());
+        retire_pending_approval(current, &approval_id);
+        if let (Some(client), Some(request_id)) = (client.as_ref(), request_id) {
+            let _ = client.respond_error(
+                &request_id,
+                -32_040,
+                "approval request was not found",
+                "APPROVAL_NOT_FOUND",
+                false,
+            );
+        }
+    }
+}
+
+/// Clears all pending approvals at generation shutdown; the map is never
+/// retained as a hidden cross-generation response channel.
+fn clear_generation_approvals(current: &mut RunningRuntime) {
+    let ids = current
+        .pending_approvals
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let client = current.supervisor.client().ok();
+    for approval_id in ids {
+        let request_id = current
+            .pending_approvals
+            .get(&approval_id)
+            .map(|pending| pending.request_id.clone());
+        retire_pending_approval(current, &approval_id);
+        if let (Some(client), Some(request_id)) = (client.as_ref(), request_id) {
+            let _ = client.respond_error(
+                &request_id,
+                -32_040,
+                "approval request was not found",
+                "APPROVAL_NOT_FOUND",
+                false,
+            );
+        }
+    }
+}
+
+/// Resolves a typed approval by business identity and only then sends the
+/// response to Java; stale, duplicate, and cross-generation IDs never reach
+/// the generic JSON-RPC layer.
+fn respond_approval(
+    runtime: &mut Option<RunningRuntime>,
+    input: ApprovalResponseInput,
+    exit_control: &ExitControl,
+) -> Result<(), RuntimeCommandError> {
+    if exit_control.is_cancelled() {
+        return Err(RuntimeCommandError::shutdown_timeout());
+    }
+    let current = runtime
+        .as_mut()
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    purge_expired_approvals(current);
+    let request_id = current
+        .pending_approvals
+        .get(&input.approval_id)
+        .map(|pending| pending.request_id.clone())
+        .ok_or_else(|| {
+            if current.retired_approvals.contains(&input.approval_id) {
+                RuntimeCommandError {
+                    code: "APPROVAL_ALREADY_RESOLVED",
+                    message: "approval request was already resolved",
+                    retryable: false,
+                }
+            } else {
+                RuntimeCommandError {
+                    code: "APPROVAL_NOT_FOUND",
+                    message: "approval request was not found",
+                    retryable: false,
+                }
+            }
+        })?;
+    let client = current
+        .supervisor
+        .client()
+        .map_err(|error| RuntimeCommandError::from_process(&error))?;
+    client
+        .respond_result(&request_id, input.result())
+        .map_err(|error| RuntimeCommandError::from_process(&error))?;
+    retire_pending_approval(current, &input.approval_id);
+    Ok(())
+}
+
+/// Sends the only supported nested secret response while keeping the request
+/// inside the actor; no secret frame or error detail is projected to the UI.
+trait RuntimeResponder {
+    fn send_result(
+        &self,
+        id: &str,
+        result: Value,
+    ) -> Result<(), crate::agent_process::AgentProcessError>;
+    fn send_error(
+        &self,
+        id: &str,
+        code: i64,
+        message: &str,
+        ja_code: &str,
+        retryable: bool,
+    ) -> Result<(), crate::agent_process::AgentProcessError>;
+}
+
+impl RuntimeResponder for AgentClient {
+    /// Reuses AgentClient's control-lane response path without exposing its
+    /// session internals to the app-runtime mapper.
+    fn send_result(
+        &self,
+        id: &str,
+        result: Value,
+    ) -> Result<(), crate::agent_process::AgentProcessError> {
+        self.respond_result(id, result)
+    }
+
+    /// Keeps error construction in the foundation's frozen error catalog.
+    fn send_error(
+        &self,
+        id: &str,
+        code: i64,
+        message: &str,
+        ja_code: &str,
+        retryable: bool,
+    ) -> Result<(), crate::agent_process::AgentProcessError> {
+        self.respond_error(id, code, message, ja_code, retryable)
+    }
+}
+
+impl RuntimeResponder for Session {
+    /// Reuses Session's control-lane response path during pre-event-pump replay.
+    fn send_result(
+        &self,
+        id: &str,
+        result: Value,
+    ) -> Result<(), crate::agent_process::AgentProcessError> {
+        self.respond_result(id, result)
+    }
+
+    /// Keeps replay nested-request failures in the same frozen error catalog.
+    fn send_error(
+        &self,
+        id: &str,
+        code: i64,
+        message: &str,
+        ja_code: &str,
+        retryable: bool,
+    ) -> Result<(), crate::agent_process::AgentProcessError> {
+        self.respond_error(id, code, message, ja_code, retryable)
+    }
+}
+
+/// Sends a nested secret response without making the responder type part of
+/// the replay or steady-state bridge API.
+fn respond_secret_request<R: RuntimeResponder>(
+    config: &LaunchConfig,
+    responder: &R,
+    frame: &RpcFrame,
+) {
+    match resolve_secret(config, frame) {
+        Ok(secret) => {
+            let _ = responder.send_result(frame.id(), json!({"secretValue": secret}));
+        }
+        Err(SecretResponseError::NotFound) => {
+            let _ = responder.send_error(
+                frame.id(),
+                -32_050,
+                "secret not found",
+                "SECRET_NOT_FOUND",
+                false,
+            );
+        }
+        Err(SecretResponseError::Denied) => {
+            let _ = responder.send_error(
+                frame.id(),
+                -32_051,
+                "secret access denied",
+                "SECRET_ACCESS_DENIED",
+                false,
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretResponseError {
+    NotFound,
+    Denied,
+}
+
+/// Checks purpose, revision, and credential ownership before touching the
+/// native keyring; the settings snapshot is the sole authorization source.
+fn resolve_secret(config: &LaunchConfig, frame: &RpcFrame) -> Result<String, SecretResponseError> {
+    let params = frame
+        .params()
+        .and_then(Value::as_object)
+        .ok_or(SecretResponseError::Denied)?;
+    let purpose = match params.get("purpose").and_then(Value::as_str) {
+        Some("model") => CredentialPurpose::Model,
+        Some("mcp") => CredentialPurpose::Mcp,
+        _ => return Err(SecretResponseError::Denied),
+    };
+    let credential_ref = params
+        .get("credentialRef")
+        .and_then(Value::as_str)
+        .and_then(|value| CredentialRef::parse(value).ok())
+        .ok_or(SecretResponseError::Denied)?;
+    let profile_revision = params
+        .get("profileRevision")
+        .and_then(Value::as_str)
+        .filter(|value| valid_id(value, 128))
+        .ok_or(SecretResponseError::Denied)?;
+    let replay = config.replay.as_ref().ok_or(SecretResponseError::Denied)?;
+    if replay.profile.profile_revision != profile_revision {
+        return Err(SecretResponseError::Denied);
+    }
+    match purpose {
+        CredentialPurpose::Model => {
+            if params.get("mcpRevision").is_some()
+                || replay.model_credential() != Some(&credential_ref)
+            {
+                return Err(SecretResponseError::Denied);
+            }
+        }
+        CredentialPurpose::Mcp => {
+            let revision = params
+                .get("mcpRevision")
+                .and_then(Value::as_str)
+                .filter(|value| valid_id(value, 128))
+                .ok_or(SecretResponseError::Denied)?;
+            let server = replay.mcp(revision).ok_or(SecretResponseError::Denied)?;
+            if RuntimeReplayConfig::mcp_credential(server) != Some(&credential_ref) {
+                return Err(SecretResponseError::Denied);
+            }
+        }
+    }
+    let vault = CredentialVault::new(Arc::clone(&config.secret_backend));
+    let delivery = vault
+        .resolve(purpose, &credential_ref)
+        .map_err(|error| match error {
+            SecretError::NotFound => SecretResponseError::NotFound,
+            _ => SecretResponseError::Denied,
+        })?;
+    let mut channel = SecretStringChannel::default();
+    delivery
+        .deliver(&mut channel)
+        .map_err(|_| SecretResponseError::Denied)?;
+    channel.take().ok_or(SecretResponseError::Denied)
+}
+
+#[derive(Default)]
+struct SecretStringChannel {
+    value: Option<String>,
+}
+
+impl SecretStringChannel {
+    /// Takes the one transient response value after the delivery capability
+    /// has been consumed; callers cannot clone this channel or serialize it.
+    fn take(mut self) -> Option<String> {
+        self.value.take()
+    }
+}
+
+impl crate::settings::SecretDeliveryChannel for SecretStringChannel {
+    /// Copies only the bounded UTF-8 secret required by the frozen response;
+    /// non-UTF-8 credentials are denied without logging their bytes.
+    fn send_secret(&mut self, secret: &[u8]) -> Result<(), crate::settings::SecretDeliveryError> {
+        self.value = Some(
+            String::from_utf8(secret.to_vec())
+                .map_err(|_| crate::settings::SecretDeliveryError::Rejected)?,
+        );
+        Ok(())
     }
 }
 
@@ -2450,6 +3247,7 @@ fn drain_terminal_fault(context: TerminalCleanupContext<'_>, wake_receiver: &Rec
 fn terminal_reason(reason: u8) -> &'static str {
     match reason {
         TERMINAL_EVENT_DELIVERY => "event_delivery",
+        TERMINAL_SERVER_REQUEST_QUEUE => "server_request_queue_full",
         _ => "sidecar_terminated",
     }
 }
@@ -2572,7 +3370,13 @@ fn valid_id(value: &str, max: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_runtime::config::RuntimeConfigureInput;
+    use crate::settings::{
+        AccessMode, ApiProtocol, CredentialPurpose, CredentialRef, McpServerSetting,
+        ProfileSetting, RuntimeSecretDelivery, SecretBackend, SecretError, SettingsDocument,
+    };
     use serde_json::json;
+    use uuid::Uuid;
 
     /// A missing server identity cannot be treated as current because stale
     /// generations otherwise have no routing boundary.
@@ -2621,6 +3425,89 @@ mod tests {
         assert!(wake_receiver.try_recv().is_ok());
         assert_eq!(fault.take(7), Some(TERMINAL_SIDECAR));
         assert_eq!(server_receiver.try_iter().count(), INTERNAL_QUEUE_CAPACITY);
+    }
+
+    /// A full server-request lane fails closed instead of leaving Java waiting
+    /// on an unanswered approval or secret request.
+    #[test]
+    fn full_server_request_lane_publishes_terminal_fault() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let filler = RpcFrame::notification("filler", json!({})).expect("filler frame");
+        sender
+            .try_send(BridgeSignal::ServerRequest {
+                generation: 7,
+                frame: filler,
+            })
+            .expect("fill bounded lane");
+        let (wake_sender, wake_receiver) = mpsc::sync_channel(1);
+        let fault = Arc::new(TerminalFault::new(wake_sender));
+        let request = RpcFrame::server_request("s:request_1", "approval/request", json!({}))
+            .expect("request frame");
+        assert!(!queue_server_request(&sender, 7, request, &fault));
+        assert!(wake_receiver.try_recv().is_ok());
+        assert_eq!(fault.take(7), Some(TERMINAL_SERVER_REQUEST_QUEUE));
+    }
+
+    /// Terminal and expiry cleanup keep late approvals stable while bounding
+    /// tombstones so repeated turn cancellation cannot exhaust memory.
+    #[test]
+    fn approval_expiry_and_tombstones_are_bounded() {
+        assert!(approval_expired("2000-01-01T00:00:00Z"));
+        assert!(!approval_expired("2999-01-01T00:00:00Z"));
+        let mut retired = HashSet::new();
+        let mut order = VecDeque::new();
+        for index in 0..(MAX_RETIRED_APPROVALS + 1024) {
+            record_retired_approval(&mut retired, &mut order, &format!("appr_{index}"));
+        }
+        assert_eq!(retired.len(), MAX_RETIRED_APPROVALS);
+        assert_eq!(order.len(), MAX_RETIRED_APPROVALS);
+        assert!(!retired.contains("appr_0"));
+        assert!(retired.contains(&format!("appr_{}", MAX_RETIRED_APPROVALS + 1023)));
+    }
+
+    /// Only terminal turn notifications are routed to approval cleanup; an
+    /// unrelated notification cannot retire a live approval identity.
+    #[test]
+    fn terminal_turn_identity_is_strictly_scoped() {
+        let frame = RpcFrame::notification(
+            "turn/completed",
+            json!({
+                "threadId": "thr_one",
+                "turnId": "turn_one",
+                "turn": {"threadId": "thr_one", "turnId": "turn_one"}
+            }),
+        )
+        .expect("terminal notification");
+        assert_eq!(
+            terminal_turn_identity(&frame),
+            Some(("thr_one".to_owned(), "turn_one".to_owned()))
+        );
+        let other = RpcFrame::notification(
+            "turn/started",
+            json!({"threadId": "thr_one", "turnId": "turn_one"}),
+        )
+        .expect("non-terminal notification");
+        assert_eq!(terminal_turn_identity(&other), None);
+    }
+
+    /// Replay keeps a five-second MCP step inside the independent sixty-second
+    /// budget, while an exhausted or shutdown-shortened budget fails stably.
+    #[test]
+    fn replay_deadline_is_independent_and_shutdown_bounded() {
+        let step_deadline = Instant::now() + Duration::from_secs(5);
+        assert!(remaining_deadline(step_deadline).expect("step remains") > Duration::from_secs(4));
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("instant subtraction");
+        assert_eq!(
+            remaining_deadline(expired),
+            Err(RuntimeCommandError::deadline())
+        );
+
+        let control = ExitControl::new(Duration::from_secs(30));
+        let exit = control.trigger();
+        let bounded = replay_deadline(&control).expect("shutdown still has time");
+        assert!(bounded <= exit.deadline);
     }
 
     /// A generation change invalidates an event-pump observation before it is
@@ -2718,5 +3605,135 @@ mod tests {
         assert_eq!(state.generation, 11);
         assert!(quarantine.retry_until(Instant::now(), &fault).is_ok());
         assert!(fault.is_pending());
+    }
+
+    #[derive(Default)]
+    struct SecretFixture {
+        value: Mutex<Option<String>>,
+    }
+
+    impl SecretBackend for SecretFixture {
+        /// Stores only test data; production uses NativeKeyringBackend instead.
+        fn set(
+            &self,
+            _purpose: CredentialPurpose,
+            _reference: &CredentialRef,
+            secret: &str,
+        ) -> Result<(), SecretError> {
+            *self
+                .value
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(secret.to_owned());
+            Ok(())
+        }
+
+        /// Returns the same expiring delivery capability as the native backend.
+        fn get(
+            &self,
+            _purpose: CredentialPurpose,
+            _reference: &CredentialRef,
+        ) -> Result<RuntimeSecretDelivery, SecretError> {
+            self.value
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or(SecretError::NotFound)
+                .and_then(RuntimeSecretDelivery::new)
+        }
+
+        /// Test deletion follows the native backend's idempotent contract.
+        fn delete(
+            &self,
+            _purpose: CredentialPurpose,
+            _reference: &CredentialRef,
+        ) -> Result<(), SecretError> {
+            *self
+                .value
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            Ok(())
+        }
+    }
+
+    /// Builds a replay snapshot with one model credential and no MCP secret.
+    fn secret_fixture_config() -> (LaunchConfig, PathBuf) {
+        let root = std::env::temp_dir().join(format!("ja-secret-runtime-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("secret fixture root");
+        let reference = CredentialRef::parse("cred_model_fixture").expect("credential ref");
+        let settings = SettingsDocument {
+            active_profile_revision: Some("profile_fixture".to_owned()),
+            profiles: vec![ProfileSetting {
+                profile_revision: "profile_fixture".to_owned(),
+                name: "Fixture".to_owned(),
+                provider: "openai".to_owned(),
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                model: "fixture-model".to_owned(),
+                base_url: Some("https://example.test/v1".to_owned()),
+                credential_ref: Some(reference),
+                supports_vision: false,
+                access_mode: AccessMode::Workspace,
+                skill_revisions: Vec::new(),
+                mcp_revisions: Some(Vec::new()),
+            }],
+            mcp_servers: Vec::<McpServerSetting>::new(),
+            ..SettingsDocument::default()
+        };
+        let replay = RuntimeReplayConfig::from_input(RuntimeConfigureInput {
+            workspace_id: "ws_fixture".to_owned(),
+            root_path: root.to_string_lossy().into_owned(),
+            display_name: Some("Fixture".to_owned()),
+            trust: "trusted".to_owned(),
+            settings,
+        })
+        .expect("replay fixture");
+        let backend = Arc::new(SecretFixture::default());
+        backend
+            .set(
+                CredentialPurpose::Model,
+                replay.profile.credential_ref.as_ref().expect("model ref"),
+                "fixture-secret",
+            )
+            .expect("fixture secret");
+        let config =
+            LaunchConfig::for_test(PathBuf::from("ja-fixture.exe"), Vec::new(), root.clone())
+                .with_secret_backend(backend);
+        let mut config = config;
+        config.replay = Some(replay);
+        (config, root)
+    }
+
+    /// A valid model relation resolves only through the native delivery seam.
+    #[test]
+    fn secret_resolution_returns_value_for_matching_profile() {
+        let (config, root) = secret_fixture_config();
+        let frame = RpcFrame::server_request(
+            "s:model_secret_1",
+            "secret/resolve",
+            json!({
+                "credentialRef": "cred_model_fixture",
+                "purpose": "model",
+                "profileRevision": "profile_fixture"
+            }),
+        )
+        .expect("secret request");
+        assert_eq!(
+            resolve_secret(&config, &frame).expect("secret"),
+            "fixture-secret"
+        );
+        let wrong = RpcFrame::server_request(
+            "s:model_secret_2",
+            "secret/resolve",
+            json!({
+                "credentialRef": "cred_model_fixture",
+                "purpose": "model",
+                "profileRevision": "profile_other"
+            }),
+        )
+        .expect("wrong secret request");
+        assert_eq!(
+            resolve_secret(&config, &wrong),
+            Err(SecretResponseError::Denied)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

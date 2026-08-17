@@ -5,7 +5,10 @@ use super::credentials::{
     CredentialPurpose, CredentialVault, NativeKeyringBackend, RuntimeSecretDelivery, SecretBackend,
     SecretDeliveryChannel, SecretDeliveryError, SecretError,
 };
-use super::model::{ApiProtocol, CredentialRef, ProfileSetting, SettingsDocument};
+use super::model::{
+    AccessMode, ApiProtocol, CredentialRef, McpAuthKind, McpAuthSetting, McpServerSetting,
+    ProfileSetting, SettingsDocument,
+};
 use super::store::{LoadSource, SettingsError, SettingsStore};
 use std::collections::HashMap;
 use std::fs;
@@ -149,7 +152,7 @@ fn missing_primary_uses_backup_for_checked_save() {
 fn provider_base_url_rejects_query_and_fragment() {
     let mut document = SettingsDocument::default();
     document.profiles.push(ProfileSetting {
-        profile_revision: "profile-1".to_owned(),
+        profile_revision: "profile_1".to_owned(),
         name: "OpenAI".to_owned(),
         provider: "openai".to_owned(),
         protocol: ApiProtocol::OpenAiResponses,
@@ -157,6 +160,9 @@ fn provider_base_url_rejects_query_and_fragment() {
         base_url: Some("https://example.com/v1?token=hidden".to_owned()),
         credential_ref: None,
         supports_vision: false,
+        access_mode: Default::default(),
+        skill_revisions: Vec::new(),
+        mcp_revisions: None,
     });
     assert!(document.validate().is_err());
 
@@ -168,7 +174,7 @@ fn provider_base_url_rejects_query_and_fragment() {
 fn responses_protocol_is_recognized_but_not_activatable() {
     let mut document = SettingsDocument::default();
     document.profiles.push(ProfileSetting {
-        profile_revision: "profile-responses".to_owned(),
+        profile_revision: "profile_responses".to_owned(),
         name: "Reserved".to_owned(),
         provider: "openai".to_owned(),
         protocol: ApiProtocol::OpenAiResponses,
@@ -176,11 +182,69 @@ fn responses_protocol_is_recognized_but_not_activatable() {
         base_url: Some("https://example.com/v1".to_owned()),
         credential_ref: None,
         supports_vision: false,
+        access_mode: Default::default(),
+        skill_revisions: Vec::new(),
+        mcp_revisions: None,
     });
     assert!(matches!(
         document.validate(),
         Err(super::model::SettingsModelError::UnsupportedProtocol)
     ));
+}
+
+#[test]
+fn structured_profile_and_mcp_references_round_trip() {
+    let credential = CredentialRef::parse("cred_mcp_test").expect("credential reference");
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("MCP_ENDPOINT".to_owned(), "https://example.test".to_owned());
+    let server = McpServerSetting {
+        mcp_revision: "mcp_files".to_owned(),
+        name: "Files".to_owned(),
+        transport: "stdio".to_owned(),
+        endpoint: "mcp-server".to_owned(),
+        protocol_version: "2025-06-18".to_owned(),
+        args: vec!["--stdio".to_owned()],
+        env,
+        headers: std::collections::BTreeMap::new(),
+        query_params: std::collections::BTreeMap::new(),
+        auth: Some(McpAuthSetting {
+            kind: McpAuthKind::Env,
+            name: Some("MCP_TOKEN".to_owned()),
+            credential_ref: Some(credential.clone()),
+        }),
+        credential_ref: None,
+        enabled: true,
+    };
+    let document = SettingsDocument {
+        active_profile_revision: Some("profile_main".to_owned()),
+        profiles: vec![ProfileSetting {
+            profile_revision: "profile_main".to_owned(),
+            name: "Main".to_owned(),
+            provider: "openai".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "gpt-test".to_owned(),
+            base_url: Some("https://api.example.test/v1".to_owned()),
+            credential_ref: None,
+            supports_vision: false,
+            access_mode: AccessMode::ReadOnly,
+            skill_revisions: vec!["skill_default".to_owned()],
+            mcp_revisions: Some(vec!["mcp_files".to_owned()]),
+        }],
+        mcp_servers: vec![server],
+        ..SettingsDocument::default()
+    };
+    document.validate().expect("structured settings validate");
+    let encoded = serde_json::to_vec(&document).expect("settings json");
+    let decoded: SettingsDocument = serde_json::from_slice(&encoded).expect("settings decode");
+    assert_eq!(decoded, document);
+    assert_eq!(decoded.profiles[0].access_mode, AccessMode::ReadOnly);
+    assert_eq!(
+        decoded.profiles[0]
+            .mcp_revisions
+            .as_ref()
+            .expect("mcp selection"),
+        &vec!["mcp_files".to_owned()]
+    );
 }
 
 #[test]

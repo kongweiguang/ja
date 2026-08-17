@@ -18,6 +18,156 @@ pub(super) fn emit_frame(sink: &EventSink, frame: &RpcFrame) -> Result<(), Runti
     sink(sanitize_webview_value(value)?).map_err(|_| RuntimeCommandError::event_delivery())
 }
 
+/// Maps Java's private approval request into the existing timeline event shape.
+/// The server request id is deliberately omitted; identity, bounded action data,
+/// and the approval expiry are the only fields the WebView needs to render it.
+pub(super) fn project_approval_request(
+    frame: &RpcFrame,
+    server_instance_id: &str,
+    sequence: u64,
+) -> Result<Value, RuntimeCommandError> {
+    if sequence == 0 || !server_instance_id.starts_with("srv_") {
+        return Err(RuntimeCommandError::invalid_params());
+    }
+    let params = frame
+        .params()
+        .and_then(Value::as_object)
+        .ok_or_else(RuntimeCommandError::invalid_params)?;
+    let approval_id = required_id(params, "approvalId", "appr_")?;
+    let thread_id = required_id(params, "threadId", "thr_")?;
+    let turn_id = required_id(params, "turnId", "turn_")?;
+    let item_id = required_id(params, "itemId", "item_")?;
+    let action = project_action(params.get("action"))?;
+    let risk = params
+        .get("risk")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "low" | "medium" | "high" | "critical"))
+        .ok_or_else(RuntimeCommandError::invalid_params)?;
+    let access_mode = params
+        .get("accessMode")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "read_only" | "workspace" | "full_access"))
+        .ok_or_else(RuntimeCommandError::invalid_params)?;
+    let expires_at = params
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .filter(|value| valid_timestamp(value))
+        .ok_or_else(RuntimeCommandError::invalid_params)?;
+    let event = json!({
+        "jsonrpc": "2.0",
+        "method": "approval/requested",
+        "params": {
+            "serverInstanceId": server_instance_id,
+            "threadId": thread_id,
+            "seq": sequence,
+            "eventId": format!("evt_approval_{sequence}"),
+            "occurredAt": now_timestamp(),
+            "approval": {
+                "approvalId": approval_id,
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": item_id,
+                "action": action,
+                "risk": risk,
+                "accessMode": access_mode,
+                "expiresAt": expires_at,
+            }
+        }
+    });
+    sanitize_webview_value(event)
+}
+
+/// Projects only the action vocabulary accepted by the frontend approval DTO.
+fn project_action(value: Option<&Value>) -> Result<Value, RuntimeCommandError> {
+    let object = value
+        .and_then(Value::as_object)
+        .ok_or_else(RuntimeCommandError::invalid_params)?;
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            matches!(
+                *value,
+                "file_read" | "file_write" | "file_delete" | "shell" | "mcp_tool" | "external_tool"
+            )
+        })
+        .ok_or_else(RuntimeCommandError::invalid_params)?;
+    let mut action = json!({"kind": kind});
+    for key in ["command", "cwd"] {
+        if let Some(value) = object.get(key) {
+            let text = value
+                .as_str()
+                .filter(|value| value.len() <= 4096 && !value.chars().any(char::is_control))
+                .ok_or_else(RuntimeCommandError::invalid_params)?;
+            action[key] = Value::String(text.to_owned());
+        }
+    }
+    if let Some(values) = object.get("relativePaths") {
+        let values = values
+            .as_array()
+            .filter(|values| values.len() <= 128)
+            .ok_or_else(RuntimeCommandError::invalid_params)?;
+        let paths = values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| value.len() <= 4096 && !value.chars().any(char::is_control))
+                    .map(str::to_owned)
+                    .ok_or_else(RuntimeCommandError::invalid_params)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        action["relativePaths"] = json!(paths);
+    }
+    Ok(action)
+}
+
+/// Reads one bounded protocol id while preserving its domain prefix.
+fn required_id(
+    params: &serde_json::Map<String, Value>,
+    key: &str,
+    prefix: &str,
+) -> Result<String, RuntimeCommandError> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.starts_with(prefix)
+                && value.len() <= 128
+                && value.len() > prefix.len()
+                && value[prefix.len()..].chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+                })
+        })
+        .map(str::to_owned)
+        .ok_or_else(RuntimeCommandError::invalid_params)
+}
+
+/// Accepts Java Instant's UTC representation without introducing a date crate.
+fn valid_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if !(20..=64).contains(&bytes.len()) || bytes[10] != b'T' || !value.ends_with('Z') {
+        return false;
+    }
+    for index in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        if !bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            return false;
+        }
+    }
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return false;
+    }
+    if bytes.len() == 20 {
+        return true;
+    }
+    bytes[19] == b'.' && bytes[20..bytes.len() - 1].iter().all(u8::is_ascii_digit)
+}
+
 /// Converts a validated foundation frame back to JSON without duplicating its
 /// parser or writer; the trailing newline is removed only at the IPC edge.
 pub(super) fn frame_to_value(frame: &RpcFrame) -> Result<Value, codec::CodecError> {
@@ -112,7 +262,7 @@ pub(super) fn emit_status(
 
 /// Uses a dependency-free UTC formatter so lifecycle events remain bounded and
 /// deterministic without adding a second time/date abstraction.
-fn now_timestamp() -> String {
+pub(super) fn now_timestamp() -> String {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -174,5 +324,55 @@ mod tests {
         let error = emit_status(&sink, RuntimeStatusKind::Ready, 1, Some("srv_1"), "ready")
             .expect_err("event failure must be observable");
         assert_eq!(error.code, "RUNTIME_EVENT_DELIVERY_FAILED");
+    }
+
+    /// Approval projections retain the business identity but never expose the
+    /// private server request ID that the native bridge uses for correlation.
+    #[test]
+    fn approval_projection_hides_private_request_id() {
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let target = std::sync::Arc::clone(&received);
+        let sink: EventSink = std::sync::Arc::new(move |value| {
+            target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(value);
+            Ok(())
+        });
+        let frame = RpcFrame::server_request(
+            "s:approval_1",
+            "approval/request",
+            json!({
+                "approvalId": "appr_1",
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "item_1",
+                "action": {
+                    "kind": "shell",
+                    "command": "echo hi",
+                    "cwd": "workspace",
+                    "relativePaths": ["src/main.rs"]
+                },
+                "risk": "high",
+                "accessMode": "workspace",
+                "expiresAt": "2026-08-16T00:00:00Z"
+            }),
+        )
+        .expect("approval request");
+        let projected =
+            project_approval_request(&frame, "srv_current", 1).expect("approval projection");
+        sink(projected).expect("approval projection sink");
+        let value = &received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[0];
+        assert!(value.get("id").is_none());
+        assert_eq!(value["method"], "approval/requested");
+        assert_eq!(value["params"]["serverInstanceId"], "srv_current");
+        assert_eq!(value["params"]["approval"]["approvalId"], "appr_1");
+        assert_eq!(value["params"]["approval"]["action"]["cwd"], "workspace");
+        assert_eq!(
+            value["params"]["approval"]["action"]["relativePaths"][0],
+            "src/main.rs"
+        );
     }
 }

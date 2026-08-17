@@ -3,12 +3,17 @@
 
 //! Real Java25 process coverage for the Rust/Tauri host bridge.
 
+use base64::Engine;
 #[cfg(feature = "tauri-smoke")]
 use ja_lib::app_runtime::RuntimeStatus;
 use ja_lib::app_runtime::{
     BridgeTestTrace, EventEmitError, EventSink, LaunchConfig, ManualRecoveryConfirmation,
-    ManualRecoveryReason, RuntimeBridge, RuntimeHost, RuntimeStatusKind, TurnInputPart,
-    TurnStartInput,
+    ManualRecoveryReason, RuntimeBridge, RuntimeConfigureInput, RuntimeHost, RuntimeStatusKind,
+    TurnInputPart, TurnStartInput,
+};
+use ja_lib::settings::{
+    ApiProtocol, CredentialPurpose, CredentialRef, ProfileSetting, RuntimeSecretDelivery,
+    SecretBackend, SecretError, SettingsDocument,
 };
 use serde_json::Value;
 use std::ffi::OsString;
@@ -17,8 +22,7 @@ use std::process::Command;
 use std::sync::Arc;
 #[cfg(feature = "tauri-smoke")]
 use std::sync::OnceLock;
-#[cfg(feature = "tauri-smoke")]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -115,6 +119,79 @@ fn marked_fixture_config(run_dir: &TempRunDir, marker: &str) -> LaunchConfig {
         ],
         run_dir.0.clone(),
     )
+}
+
+/// Builds the production-mode Java fixture with the same explicit executable and
+/// arguments shape as the packaged native launch, keeping the replay test on
+/// the real production protocol rather than the fake runtime shortcut.
+fn production_fixture_config(run_dir: &TempRunDir) -> LaunchConfig {
+    let data_dir = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(run_dir.0.to_string_lossy().as_bytes());
+    LaunchConfig::for_test(
+        java_executable(),
+        vec![
+            OsString::from("-jar"),
+            test_jar().into_os_string(),
+            OsString::from("--runtime=production"),
+            OsString::from(format!("--data-dir-base64={data_dir}")),
+        ],
+        run_dir.0.clone(),
+    )
+}
+
+/// Provides one deterministic model credential through the same opaque
+/// delivery seam used by the native keyring, while recording that Java really
+/// requested the purpose-bound secret during profile activation.
+#[derive(Default)]
+struct ReplaySecretFixture {
+    resolves: AtomicUsize,
+}
+
+impl SecretBackend for ReplaySecretFixture {
+    /// Test writes are intentionally rejected because this fixture represents
+    /// an already-provisioned credential and must not persist any secret.
+    fn set(
+        &self,
+        _purpose: CredentialPurpose,
+        _reference: &CredentialRef,
+        _secret: &str,
+    ) -> Result<(), SecretError> {
+        Err(SecretError::StoreUnavailable)
+    }
+
+    /// Returns a short-lived opaque delivery only for the expected model
+    /// reference; any other purpose or reference proves the relation check is
+    /// not being bypassed by the integration fixture.
+    fn get(
+        &self,
+        purpose: CredentialPurpose,
+        reference: &CredentialRef,
+    ) -> Result<RuntimeSecretDelivery, SecretError> {
+        if purpose != CredentialPurpose::Model || reference.as_str() != "cred_replay_fixture" {
+            return Err(SecretError::InvalidReference);
+        }
+        self.resolves.fetch_add(1, Ordering::SeqCst);
+        RuntimeSecretDelivery::fixture("fixture-secret")
+    }
+
+    /// Deletion is unsupported because the fixture owns no persistent store.
+    fn delete(
+        &self,
+        _purpose: CredentialPurpose,
+        _reference: &CredentialRef,
+    ) -> Result<(), SecretError> {
+        Err(SecretError::StoreUnavailable)
+    }
+}
+
+/// Builds a production-mode replay config with only a test SecretBackend
+/// substitution; all Java handshake, replay ordering, and secret response
+/// handling remain the production host path.
+fn production_replay_fixture_config(
+    run_dir: &TempRunDir,
+    backend: Arc<ReplaySecretFixture>,
+) -> LaunchConfig {
+    production_fixture_config(run_dir).with_secret_backend(backend)
 }
 
 /// Resolves the test-only JVM and always verifies major 25, including an
@@ -749,6 +826,61 @@ fn real_java_turn_and_shutdown_close_without_token_leak() {
             == Some("stopped")
     });
     bridge.shutdown().expect("actor shutdown");
+}
+
+/// Proves configuration replay reaches the real Java sidecar before the first
+/// fake turn, while the host still owns all process and event cleanup.
+#[test]
+fn real_java_configuration_replay_activates_before_turn() {
+    let run_dir = TempRunDir::create("replay");
+    let backend = Arc::new(ReplaySecretFixture::default());
+    let (sink, receiver) = event_sink();
+    let host = RuntimeHost::new(
+        production_replay_fixture_config(&run_dir, Arc::clone(&backend)),
+        sink,
+    );
+    let configured = host
+        .configure(RuntimeConfigureInput {
+            workspace_id: "ws_replay".to_owned(),
+            root_path: run_dir.0.to_string_lossy().into_owned(),
+            display_name: None,
+            trust: "trusted".to_owned(),
+            settings: SettingsDocument {
+                schema_version: 1,
+                active_profile_revision: Some("profile_replay".to_owned()),
+                profiles: vec![ProfileSetting {
+                    profile_revision: "profile_replay".to_owned(),
+                    name: "Replay".to_owned(),
+                    provider: "fixture".to_owned(),
+                    protocol: ApiProtocol::OpenAiChatCompletions,
+                    model: "fixture-model".to_owned(),
+                    base_url: Some("http://127.0.0.1:8080/v1".to_owned()),
+                    credential_ref: Some(
+                        CredentialRef::parse("cred_replay_fixture")
+                            .expect("replay credential reference"),
+                    ),
+                    supports_vision: false,
+                    access_mode: Default::default(),
+                    skill_revisions: Vec::new(),
+                    mcp_revisions: Some(Vec::new()),
+                }],
+                ..SettingsDocument::default()
+            },
+        })
+        .expect("configuration replay snapshot");
+    assert_eq!(configured.profile_revision, "profile_replay");
+    let started = host.start().expect("configured sidecar ready");
+    assert_eq!(started.status, RuntimeStatusKind::Ready);
+    host.shutdown().expect("configured host shutdown");
+    assert_eq!(backend.resolves.load(Ordering::SeqCst), 1);
+    let events = receiver.try_iter().collect::<Vec<_>>();
+    let event_text = serde_json::to_string(&events).expect("serialize observed events");
+    assert!(!event_text.contains("fixture-secret"));
+    assert!(
+        events
+            .iter()
+            .all(|event| { event.get("method").and_then(Value::as_str) != Some("secret/resolve") })
+    );
 }
 
 /// Holds a Windows sidecar before handshake to prove priority shutdown does

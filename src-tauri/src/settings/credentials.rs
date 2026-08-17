@@ -6,6 +6,7 @@
 use super::model::CredentialRef;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const KEYRING_SERVICE: &str = "io.github.kongweiguang.ja";
@@ -114,6 +115,13 @@ impl RuntimeSecretDelivery {
         })
     }
 
+    /// Creates the same opaque delivery capability for deterministic integration fixtures;
+    /// production callers remain on `NativeKeyringBackend` and cannot use this test-only seam.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture(secret: &str) -> Result<Self, SecretError> {
+        Self::new(secret.to_owned())
+    }
+
     /// Consumes the delivery object so a caller cannot retain a second copy
     /// after the sidecar channel accepts the secret.
     pub fn deliver(self, channel: &mut dyn SecretDeliveryChannel) -> Result<(), SecretError> {
@@ -157,6 +165,38 @@ pub trait SecretBackend: Send + Sync {
         purpose: CredentialPurpose,
         reference: &CredentialRef,
     ) -> Result<(), SecretError>;
+}
+
+/// Lets the runtime keep one shared backend instance while reusing the vault
+/// façade; Arc forwarding does not create a second credential-store policy.
+impl<T: SecretBackend + ?Sized> SecretBackend for Arc<T> {
+    /// Forwards writes to the single owner without cloning secret contents.
+    fn set(
+        &self,
+        purpose: CredentialPurpose,
+        reference: &CredentialRef,
+        secret: &str,
+    ) -> Result<(), SecretError> {
+        (**self).set(purpose, reference, secret)
+    }
+
+    /// Forwards one short-lived delivery capability from the shared backend.
+    fn get(
+        &self,
+        purpose: CredentialPurpose,
+        reference: &CredentialRef,
+    ) -> Result<RuntimeSecretDelivery, SecretError> {
+        (**self).get(purpose, reference)
+    }
+
+    /// Forwards deletion while preserving the backend's native error policy.
+    fn delete(
+        &self,
+        purpose: CredentialPurpose,
+        reference: &CredentialRef,
+    ) -> Result<(), SecretError> {
+        (**self).delete(purpose, reference)
+    }
 }
 
 /// The production backend delegates to Windows Credential Manager or Apple

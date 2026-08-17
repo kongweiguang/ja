@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,25 +44,65 @@ pub struct SidecarConfig {
     executable_identity: Arc<Mutex<Option<ExecutableIdentity>>>,
 }
 
+/// Retains only the matrix-proven OS runtime values for the native sidecar; credentials, proxy
+/// settings, and arbitrary user environment remain excluded after env_clear. PATH and ComSpec
+/// are non-secret coding-runtime inputs needed by AgentScope shell/MCP command lookup. The
+/// Windows matrix showed that `SystemRoot` plus either temporary alias is sufficient, so both
+/// aliases point at the already-owned sidecar run directory instead of inheriting user temp.
+fn default_runtime_environment(run_dir: &Path) -> BTreeMap<OsString, OsString> {
+    default_runtime_environment_from(run_dir, |name| std::env::var_os(name))
+}
+
+/// Builds the fixed environment from a lookup seam so tests can inject a process environment
+/// without mutating the host process while production still reads only the current process.
+fn default_runtime_environment_from<F>(run_dir: &Path, lookup: F) -> BTreeMap<OsString, OsString>
+where
+    F: for<'a> Fn(&'a str) -> Option<OsString>,
+{
+    let mut environment = BTreeMap::new();
+    #[cfg(windows)]
+    {
+        for name in ["SystemRoot", "PATH", "ComSpec"] {
+            if let Some(value) = lookup(name) {
+                environment.insert(OsString::from(name), value);
+            }
+        }
+        let temporary = run_dir.as_os_str().to_owned();
+        environment.insert(OsString::from("TEMP"), temporary.clone());
+        environment.insert(OsString::from("TMP"), temporary);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Java's macOS temp property is sourced from TMPDIR; HOME and locale
+        // inheritance stays off until a real native fixture proves it is needed.
+        if let Some(value) = lookup("PATH") {
+            environment.insert(OsString::from("PATH"), value);
+        }
+        environment.insert(OsString::from("TMPDIR"), run_dir.as_os_str().to_owned());
+    }
+    environment
+}
+
 impl SidecarConfig {
     /// 用符合 v1 Schema 的最小 initialize 参数建立可审计默认配置。
     pub fn new(executable: impl Into<PathBuf>, run_dir: impl Into<PathBuf>) -> Self {
         let limits = Limits::default();
         let executable = executable.into();
         let run_dir = run_dir.into();
+        let canonical_run_dir = fs::canonicalize(&run_dir).unwrap_or_else(|_| run_dir.clone());
         Self {
             executable: fs::canonicalize(&executable).unwrap_or_else(|_| executable.clone()),
             args: Vec::new(),
-            run_dir: fs::canonicalize(&run_dir).unwrap_or_else(|_| run_dir.clone()),
+            run_dir: canonical_run_dir.clone(),
             workspace_root: None,
-            env: BTreeMap::new(),
+            env: default_runtime_environment(&canonical_run_dir),
             initialize_params: default_initialize_params(&limits),
             limits,
             ready_timeout: Duration::from_secs(10),
             shutdown_timeout: Duration::from_secs(3),
             restart: RestartPolicy::default(),
             canonical_executable: fs::canonicalize(&executable).unwrap_or(executable),
-            canonical_run_dir: fs::canonicalize(&run_dir).unwrap_or(run_dir),
+            canonical_run_dir,
             canonical_workspace_root: None,
             #[cfg(windows)]
             executable_identity: Arc::new(Mutex::new(None)),
@@ -154,7 +194,8 @@ impl SidecarConfig {
             let name = name.to_string_lossy();
             if !allowed_env_name(&name)
                 || contains_secret_marker(&name)
-                || contains_secret_marker(&value.to_string_lossy())
+                || (!matches!(name.as_ref(), "PATH" | "ComSpec")
+                    && contains_secret_marker(&value.to_string_lossy()))
             {
                 return Err(AgentProcessError::InvalidConfig);
             }
@@ -193,6 +234,118 @@ impl SidecarConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SidecarConfig, default_runtime_environment_from};
+    use crate::agent_process::AgentProcessError;
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
+    use std::path::PathBuf;
+
+    /// Locks the Windows launch baseline to the matrix-proven OS/runtime values and prevents
+    /// PATH or an unrelated user variable from becoming an implicit sidecar capability.
+    #[test]
+    fn default_runtime_environment_is_narrow() {
+        let run_dir = PathBuf::from("ja-owned-run-dir");
+        let process_env = BTreeMap::from([
+            ("SystemRoot".to_owned(), OsString::from("C:\\Windows")),
+            (
+                "PATH".to_owned(),
+                OsString::from("C:\\secret-project\\bin;C:\\Windows\\System32"),
+            ),
+            (
+                "ComSpec".to_owned(),
+                OsString::from("C:\\Windows\\System32\\cmd.exe"),
+            ),
+            (
+                "OPENAI_API_KEY".to_owned(),
+                OsString::from("should-not-cross"),
+            ),
+            (
+                "HTTP_PROXY".to_owned(),
+                OsString::from("http://proxy.invalid"),
+            ),
+        ]);
+        let environment =
+            default_runtime_environment_from(&run_dir, |name| process_env.get(name).cloned());
+        let names = environment
+            .keys()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        #[cfg(windows)]
+        assert!(names.iter().all(|name| matches!(
+            name.as_str(),
+            "SystemRoot" | "PATH" | "ComSpec" | "TEMP" | "TMP"
+        )));
+        #[cfg(windows)]
+        assert_eq!(
+            environment.get(OsStr::new("PATH")),
+            Some(&OsString::from(
+                "C:\\secret-project\\bin;C:\\Windows\\System32"
+            ))
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            environment.get(OsStr::new("ComSpec")),
+            Some(&OsString::from("C:\\Windows\\System32\\cmd.exe"))
+        );
+        #[cfg(windows)]
+        for name in ["TEMP", "TMP"] {
+            assert_eq!(
+                environment.get(OsStr::new(name)).map(OsString::as_os_str),
+                Some(run_dir.as_os_str())
+            );
+        }
+        #[cfg(target_os = "macos")]
+        assert!(
+            names
+                .iter()
+                .all(|name| matches!(name.as_str(), "PATH" | "TMPDIR"))
+        );
+        #[cfg(any(windows, target_os = "macos"))]
+        assert_eq!(
+            environment.get(OsStr::new("PATH")),
+            Some(&OsString::from(
+                "C:\\secret-project\\bin;C:\\Windows\\System32"
+            ))
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            environment
+                .get(OsStr::new("TMPDIR"))
+                .map(OsString::as_os_str),
+            Some(run_dir.as_os_str())
+        );
+        #[cfg(not(any(windows, target_os = "macos")))]
+        assert!(names.is_empty());
+        assert!(!names.iter().any(|name| name == "OPENAI_API_KEY"));
+        assert!(!names.iter().any(|name| name == "HTTP_PROXY"));
+    }
+
+    /// Accepts a PATH directory containing a marker-like name while still rejecting arbitrary
+    /// credential variables, because PATH/ComSpec are exact non-secret runtime slots only.
+    #[cfg(windows)]
+    #[test]
+    fn coding_runtime_environment_validates_without_secret_value_false_positive() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let run_dir = std::env::temp_dir();
+        let mut config = SidecarConfig::new(&executable, &run_dir);
+        config.env.insert(
+            OsString::from("PATH"),
+            OsString::from("C:\\secret-project\\bin;C:\\Windows\\System32"),
+        );
+        config.env.insert(
+            OsString::from("ComSpec"),
+            OsString::from("C:\\Windows\\System32\\cmd.exe"),
+        );
+        assert!(config.validate().is_ok());
+        config
+            .env
+            .insert(OsString::from("OPENAI_API_KEY"), OsString::from("sk-test"));
+        assert_eq!(config.validate(), Err(AgentProcessError::InvalidConfig));
     }
 }
 

@@ -53,6 +53,7 @@ thiserror = "=2.0.20"
 uuid = { version = "=1.24.1", features = ["serde", "v4"] }
 url = { version = "=2.5.8", features = ["serde"] }
 sha2 = "=0.11.0"
+base64 = "=0.22.1"
 
 # Tokio owns bounded asynchronous child-process and JSONL I/O once the
 # sidecar adapter is introduced; codec stays separate from the protocol model.

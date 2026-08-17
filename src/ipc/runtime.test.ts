@@ -121,6 +121,60 @@ describe("RuntimeHost typed adapter", () => {
     expect(event).toMatchObject({ kind: "timeline", event: { method: "turn/started" } });
   });
 
+  it("accepts the complete approval projection and keeps action details bounded", () => {
+    const event = parseRuntimeHostEvent(timelineFrame("approval/requested", 2, {
+      approval: {
+        approvalId: "appr_fixture",
+        threadId: "thr_fixture",
+        turnId: "turn_fixture",
+        itemId: "item_fixture",
+        action: {
+          kind: "shell",
+          command: "echo hi",
+          cwd: "workspace",
+          relativePaths: ["src/main.rs"],
+        },
+        risk: "high",
+        accessMode: "workspace",
+        expiresAt: "2026-08-18T00:00:00Z",
+      },
+    }));
+    expect(event).toMatchObject({
+      kind: "timeline",
+      event: {
+        method: "approval/requested",
+        params: { approval: { approvalId: "appr_fixture", action: { cwd: "workspace" } } },
+      },
+    });
+  });
+
+  it("responds through the typed approval command without exposing a request id", async () => {
+    const invoke = vi.fn(async (command: string) => {
+      if (command === JA_RUNTIME_COMMANDS.approvalRespond) {
+        return null;
+      }
+      return readyStatus;
+    });
+    const bridge: RuntimeNativeBridge = {
+      invoke: invoke as RuntimeNativeBridge["invoke"],
+      listen: vi.fn(async () => () => undefined),
+    };
+    const adapter = new TauriRuntimeHostAdapter(bridge);
+    await expect(adapter.approvalRespond({
+      approvalId: "appr_fixture",
+      decision: "allow_once",
+      resolvedAt: "2026-08-18T00:00:00Z",
+    })).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.approvalRespond, {
+      input: {
+        approvalId: "appr_fixture",
+        decision: "allow_once",
+        resolvedAt: "2026-08-18T00:00:00Z",
+      },
+    });
+    expect(JSON.stringify(invoke.mock.calls)).not.toContain("s:approval_");
+  });
+
   it("normalizes Rust's shutting_down event spelling to the command status", () => {
     const event = parseRuntimeHostEvent({
       ...readyFrame(),
