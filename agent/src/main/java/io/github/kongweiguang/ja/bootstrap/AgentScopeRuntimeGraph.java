@@ -12,6 +12,7 @@ import io.github.kongweiguang.ja.persistence.SqlitePersistenceConfig;
 import io.github.kongweiguang.ja.mcp.McpLimits;
 import io.github.kongweiguang.ja.mcp.McpProcessPort;
 import io.github.kongweiguang.ja.mcp.McpRuntime;
+import io.github.kongweiguang.ja.mcp.McpServerDefinition;
 import io.github.kongweiguang.ja.runtime.TurnEvent;
 import io.github.kongweiguang.ja.runtime.TurnHandle;
 import io.github.kongweiguang.ja.runtime.TurnRuntime;
@@ -27,7 +28,10 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -123,6 +127,24 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
                                               String profileAccessMode,
                                               Model model,
                                               List<String> skillRevisions) {
+        return open(workspace, dataDirectory, serverInstanceId, wireProfileRevision,
+                workspaceTrust, profileAccessMode, model, skillRevisions, List.of());
+    }
+
+    /**
+     * Opens one generation after freezing selected MCP definitions and
+     * connecting every server on the shared AgentScope Toolkit.  A Harness is
+     * created only after all clients are READY, so one failed server cannot
+     * leave a half-registered agent graph visible to the host.
+     */
+    public static AgentScopeRuntimeGraph open(Path workspace, Path dataDirectory,
+                                              ServerInstanceId serverInstanceId,
+                                              String wireProfileRevision,
+                                              String workspaceTrust,
+                                              String profileAccessMode,
+                                              Model model,
+                                              List<String> skillRevisions,
+                                              List<McpActivation> mcpActivations) {
         Path root = requireDirectory(workspace, "workspace");
         Path data = requireDataDirectory(dataDirectory);
         Objects.requireNonNull(serverInstanceId, "serverInstanceId");
@@ -147,16 +169,42 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
             // unknown/stale references therefore fail atomically without a half-installed engine.
             skillSources.freeze(skillRevisions == null ? List.of() : skillRevisions);
             Toolkit toolkit = new Toolkit();
-            mcpRuntime = new McpRuntime(reference -> {
-                throw new IllegalArgumentException("secret_ref_unavailable");
-            }, McpProcessPort.restricted(root), toolkit, McpLimits.DEFAULT);
-            HarnessFactory factory = new HarnessFactory(HarnessFactory.Config.defaults(),
-                    filesystem, root, skillSources, persistence.agentState(), toolkit);
-            AgentScopeTurnRuntime turns = new AgentScopeTurnRuntime(
-                    factory.createEngine(model), serverInstanceId);
-            return new AgentScopeRuntimeGraph(persistence, filesystem, skillSources, factory, turns,
-                    mcpRuntime, toolkit, serverInstanceId, wireProfileRevision,
-                    workspaceTrust, profileAccessMode);
+            List<McpActivation> frozenMcp = freezeMcpActivations(mcpActivations);
+            Map<String, String> secretMarkers = new HashMap<>();
+            try {
+                for (McpActivation activation : frozenMcp) {
+                    if (activation.secret() != null) {
+                        secretMarkers.put("secret-ref://" + activation.definition().credentialRef(),
+                                activation.secret());
+                    }
+                }
+                mcpRuntime = new McpRuntime(reference -> {
+                    String secret = secretMarkers.get(reference);
+                    if (secret == null) {
+                        throw new IllegalArgumentException("secret_ref_unavailable");
+                    }
+                    return secret;
+                }, McpProcessPort.restricted(root), toolkit, McpLimits.DEFAULT);
+                for (McpActivation activation : frozenMcp) {
+                    McpServerDefinition definition = activation.definition();
+                    McpRuntime.ServerStatus status = mcpRuntime.connect(definition.revision(),
+                            definition.toConfig(), definition.protocolVersion());
+                    if (status.state() != McpRuntime.State.READY) {
+                        throw new IllegalStateException("mcp_server_unavailable");
+                    }
+                }
+                HarnessFactory factory = new HarnessFactory(HarnessFactory.Config.defaults(),
+                        filesystem, root, skillSources, persistence.agentState(), toolkit);
+                AgentScopeTurnRuntime turns = new AgentScopeTurnRuntime(
+                        factory.createEngine(model), serverInstanceId);
+                return new AgentScopeRuntimeGraph(persistence, filesystem, skillSources, factory, turns,
+                        mcpRuntime, toolkit, serverInstanceId, wireProfileRevision,
+                        workspaceTrust, profileAccessMode);
+            } finally {
+                // The official MCP transports have consumed credentials; no failure path may
+                // retain the composition-only marker map until graph cleanup runs.
+                secretMarkers.clear();
+            }
         } catch (IOException failure) {
             IllegalStateException wrapped = new IllegalStateException("skill_sources_invalid", failure);
             closeAfterOpenFailure(mcpRuntime, filesystem, skillSources, persistence, wrapped);
@@ -165,6 +213,25 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
             closeAfterOpenFailure(mcpRuntime, filesystem, skillSources, persistence, failure);
             throw failure;
         }
+    }
+
+    /**
+     * Copies the selected MCP snapshot and rejects duplicate/disabled entries
+     * before any transport starts; this is the graph's final atomicity guard.
+     */
+    private static List<McpActivation> freezeMcpActivations(List<McpActivation> activations) {
+        if (activations == null || activations.isEmpty()) {
+            return List.of();
+        }
+        Map<String, McpActivation> unique = new LinkedHashMap<>();
+        for (McpActivation activation : activations) {
+            Objects.requireNonNull(activation, "mcp_activation_required");
+            McpServerDefinition definition = activation.definition();
+            if (!definition.enabled() || unique.put(definition.revision(), activation) != null) {
+                throw new IllegalStateException("mcp_server_unavailable");
+            }
+        }
+        return List.copyOf(unique.values());
     }
 
     /** Shares the event identity with the stdio handshake instead of creating a second server id. */
@@ -448,6 +515,28 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
             } catch (RuntimeException cleanup) {
                 failure.addSuppressed(cleanup);
             }
+        }
+    }
+
+    /** Secret-bearing activation input is short-lived and never serialized or logged. */
+    public record McpActivation(McpServerDefinition definition, String secret) {
+        /** Validates the final secret boundary without allowing a secret-less client to ask Rust. */
+        public McpActivation {
+            Objects.requireNonNull(definition, "mcp_definition_required");
+            if (definition.requiresSecret()
+                    && (secret == null || secret.isEmpty())) {
+                throw new IllegalArgumentException("mcp_secret_missing");
+            }
+            if (!definition.requiresSecret() && secret != null) {
+                throw new IllegalArgumentException("mcp_secret_unexpected");
+            }
+        }
+
+        /** Redacts the credential while keeping activation diagnostics useful for revisions. */
+        @Override
+        public String toString() {
+            return "McpActivation[revision=" + definition.revision() + ", secret="
+                    + (secret == null ? "<none>" : "<redacted>") + "]";
         }
     }
 }

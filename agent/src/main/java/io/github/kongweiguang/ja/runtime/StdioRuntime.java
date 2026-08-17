@@ -51,6 +51,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
@@ -879,6 +880,34 @@ public final class StdioRuntime implements AutoCloseable {
         return requested;
     }
 
+    /** Freezes profile-selected definitions before the first asynchronous secret request. */
+    private List<McpServerDefinition> freezeActivationMcp(SavedProfile profile) {
+        List<McpServerDefinition> definitions = new java.util.ArrayList<>();
+        for (String revision : profile.mcpRevisions()) {
+            McpServerDefinition definition = mcpServers.get(revision);
+            if (definition == null || !definition.enabled()) {
+                throw new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
+            }
+            definitions.add(definition);
+        }
+        return List.copyOf(definitions);
+    }
+
+    /** Revalidates workspace, profile and definition identity before each SDK-bound step. */
+    private void ensureActivationCurrent(ActivationAttempt attempt) {
+        WorkspaceBinding currentWorkspace = workspaceBinding;
+        SavedProfile currentProfile = savedProfile;
+        if (currentWorkspace == null || !currentWorkspace.equals(attempt.workspace())) {
+            throw new ProtocolException(JaErrorCode.INVALID_STATE);
+        }
+        if (currentProfile == null || !currentProfile.equals(attempt.profile())) {
+            throw new ProtocolException(JaErrorCode.CONFLICT);
+        }
+        if (!freezeActivationMcp(attempt.profile()).equals(attempt.mcpDefinitions())) {
+            throw new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
+        }
+    }
+
     /** Builds the exact MCP secret request shape and keeps the value out of all ordinary state. */
     private static ObjectNode mcpSecretResolveParams(McpServerDefinition definition,
                                                      String profileRevision) {
@@ -932,6 +961,7 @@ public final class StdioRuntime implements AutoCloseable {
      */
     private void handleProfileActivate(RpcRequest request) {
         final SavedProfile profile;
+        boolean activationStarted = false;
         try {
             if (workspaceBinding == null) {
                 throw new ProtocolException(JaErrorCode.INVALID_STATE);
@@ -953,15 +983,18 @@ public final class StdioRuntime implements AutoCloseable {
             if (!activationInProgress.compareAndSet(false, true)) {
                 throw new ProtocolException(JaErrorCode.CONFLICT);
             }
+            activationStarted = true;
             if (configuration.dataDirectory() == null) {
                 activationInProgress.set(false);
                 throw new ProtocolException(JaErrorCode.INVALID_STATE);
             }
+            List<McpServerDefinition> selectedMcp = freezeActivationMcp(profile);
             ActivationAttempt attempt = new ActivationAttempt(request, profile,
-                    workspaceBinding, configuration.dataDirectory());
+                    workspaceBinding, configuration.dataDirectory(), selectedMcp,
+                    null, new LinkedHashMap<>(), 0, false);
             SecretRef secretRef = profile.model().secretRef();
             if (secretRef == null) {
-                submitActivation(attempt, null);
+                submitActivation(attempt);
                 return;
             }
             String id = "s:secret_" + secretRequestSequence.incrementAndGet();
@@ -969,15 +1002,18 @@ public final class StdioRuntime implements AutoCloseable {
                     secretResolveParams(secretRef, profile.wireRevision()));
             pendingRequests.register(secretRequest, response -> {
                 try {
-                    activationLane.execute(() -> completeActivation(attempt, response));
+                    activationLane.execute(() -> completeModelSecret(attempt, response));
                 } catch (RejectedExecutionException exception) {
                     activationInProgress.set(false);
                     sendFailure(request, new ProtocolException(JaErrorCode.SHUTTING_DOWN));
                 }
             });
-            scheduleSecretDeadline(attempt, secretRequest.id());
+            scheduleActivationSecretDeadline(attempt, secretRequest.id());
             sendResponse(secretRequest);
         } catch (ProtocolException exception) {
+            if (activationStarted) {
+                activationInProgress.set(false);
+            }
             sendFailure(request, exception);
         } catch (RuntimeException exception) {
             activationInProgress.set(false);
@@ -985,10 +1021,10 @@ public final class StdioRuntime implements AutoCloseable {
         }
     }
 
-    /** Schedules credential-free activation on the same bounded lane as secret-backed activation. */
-    private void submitActivation(ActivationAttempt attempt, RpcResponse response) {
+    /** Schedules the next activation step without blocking the control or reader lane. */
+    private void submitActivation(ActivationAttempt attempt) {
         try {
-            activationLane.execute(() -> completeActivation(attempt, response));
+            activationLane.execute(() -> requestNextMcpSecret(attempt));
         } catch (RejectedExecutionException exception) {
             activationInProgress.set(false);
             sendFailure(attempt.request(), new ProtocolException(JaErrorCode.SHUTTING_DOWN));
@@ -999,31 +1035,112 @@ public final class StdioRuntime implements AutoCloseable {
      * Bounds the Rust secret round-trip without blocking the reader or control lane. The delayed
      * executor only marks the existing pending tombstone and releases activation for a retry.
      */
-    private void scheduleSecretDeadline(ActivationAttempt attempt, String requestId) {
+    private void scheduleActivationSecretDeadline(ActivationAttempt attempt, String requestId) {
         CompletableFuture.delayedExecutor(SECRET_RESOLVE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
                 .execute(() -> {
                     if (!pendingRequests.deadline(requestId)) {
                         return;
                     }
                     if (activationInProgress.compareAndSet(true, false) && !stopping.get()) {
-                        sendFailure(attempt.request(), new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE));
+                        sendFailure(attempt.request(), new ProtocolException(
+                                attempt.pendingMcpSecret() ? JaErrorCode.MCP_SERVER_UNAVAILABLE
+                                        : JaErrorCode.MODEL_UNAVAILABLE));
                     }
                 });
     }
 
-    /** Builds and atomically installs one graph only after model and secret validation succeed. */
-    private void completeActivation(ActivationAttempt attempt, RpcResponse response) {
+    /** Completes the model credential phase before requesting any MCP credential in profile order. */
+    private void completeModelSecret(ActivationAttempt attempt, RpcResponse response) {
+        try {
+            String secret = secretValue(response);
+            submitActivation(attempt.withModelSecret(secret));
+        } catch (ProtocolException failure) {
+            activationInProgress.set(false);
+            sendFailure(attempt.request(), failure);
+        }
+    }
+
+    /**
+     * Validates the frozen definition again and asks for exactly one MCP secret
+     * at a time, preserving PendingRequestRegistry as the only correlation map.
+     */
+    private void requestNextMcpSecret(ActivationAttempt attempt) {
+        try {
+            ensureActivationCurrent(attempt);
+            int secretIndex = nextMcpSecretIndex(attempt);
+            if (secretIndex < 0) {
+                completeActivation(attempt);
+                return;
+            }
+            McpServerDefinition definition = attempt.mcpDefinitions().get(secretIndex);
+            ActivationAttempt waiting = attempt.withNextMcpIndex(secretIndex + 1)
+                    .withPendingMcpSecret(true);
+            String id = "s:mcp_activation_secret_" + secretRequestSequence.incrementAndGet();
+            RpcRequest secretRequest = RpcRequest.server(id, "secret/resolve",
+                    mcpSecretResolveParams(definition, attempt.profile().wireRevision()));
+            pendingRequests.register(secretRequest, response -> {
+                try {
+                    activationLane.execute(() -> completeMcpSecret(waiting, definition, response));
+                } catch (RejectedExecutionException exception) {
+                    activationInProgress.set(false);
+                    sendFailure(attempt.request(), new ProtocolException(JaErrorCode.SHUTTING_DOWN));
+                }
+            });
+            scheduleActivationSecretDeadline(waiting, secretRequest.id());
+            sendResponse(secretRequest);
+        } catch (ProtocolException failure) {
+            activationInProgress.set(false);
+            sendFailure(attempt.request(), failure);
+        } catch (RuntimeException failure) {
+            activationInProgress.set(false);
+            sendFailure(attempt.request(), new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE));
+        }
+    }
+
+    /** Stores one MCP credential only in the short-lived activation object, never in wire state. */
+    private void completeMcpSecret(ActivationAttempt attempt, McpServerDefinition definition,
+                                   RpcResponse response) {
+        try {
+            ensureActivationCurrent(attempt);
+            String secret = mcpSecretValue(response);
+            Map<String, String> nextSecrets = new LinkedHashMap<>(attempt.mcpSecrets());
+            nextSecrets.put(definition.revision(), secret);
+            submitActivation(attempt.withMcpSecret(nextSecrets));
+        } catch (ProtocolException failure) {
+            activationInProgress.set(false);
+            sendFailure(attempt.request(), failure);
+        }
+    }
+
+    /** Selects the next secret-bearing definition in the exact profile mcpRevisions order. */
+    private static int nextMcpSecretIndex(ActivationAttempt attempt) {
+        List<McpServerDefinition> definitions = attempt.mcpDefinitions();
+        for (int index = attempt.nextMcpIndex(); index < definitions.size(); index++) {
+            McpServerDefinition definition = definitions.get(index);
+            if (definition.requiresSecret()) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
+    /** Builds and atomically installs one graph only after every frozen secret and definition is valid. */
+    private void completeActivation(ActivationAttempt attempt) {
         AgentScopeRuntimeGraph graph = null;
         try {
             if (stopping.get()) {
                 throw new ProtocolException(JaErrorCode.SHUTTING_DOWN);
             }
-            String secret = attempt.profile().model().secretRef() == null
-                    ? null : secretValue(response);
-            ModelHandle handle = modelBuilder.build(attempt.profile().model(), secret);
+            ensureActivationCurrent(attempt);
+            ModelHandle handle = modelBuilder.build(attempt.profile().model(), attempt.modelSecret());
+            List<AgentScopeRuntimeGraph.McpActivation> mcpActivations = attempt.mcpDefinitions().stream()
+                    .map(definition -> new AgentScopeRuntimeGraph.McpActivation(definition,
+                            attempt.mcpSecrets().get(definition.revision())))
+                    .toList();
             graph = AgentScopeRuntimeGraph.open(attempt.workspace().rootPath(), attempt.dataDirectory(),
                     serverInstanceId, attempt.profile().wireRevision(), attempt.workspace().trust(),
-                    attempt.profile().accessMode(), handle.model(), attempt.profile().skillRevisions());
+                    attempt.profile().accessMode(), handle.model(), attempt.profile().skillRevisions(),
+                    mcpActivations);
             graph.setApprovalSink(this::requestApproval);
             if (stopping.get() || !activeTurnRuntime.compareAndSet(null, graph)) {
                 graph.close();
@@ -1057,7 +1174,9 @@ public final class StdioRuntime implements AutoCloseable {
             if (graph != null) {
                 graph.close();
             }
-            sendFailure(attempt.request(), new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE));
+            sendFailure(attempt.request(), "mcp_server_unavailable".equals(exception.getMessage())
+                    ? new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE)
+                    : new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE));
         } finally {
             activationInProgress.set(false);
         }
@@ -1145,6 +1264,11 @@ public final class StdioRuntime implements AutoCloseable {
         }
         if ("SKILL_INVALID".equals(exception.getMessage())) {
             return new ProtocolException(JaErrorCode.SKILL_INVALID);
+        }
+        if ("mcp_server_unavailable".equals(exception.getMessage())
+                || "mcp_tool_alias_collision".equals(exception.getMessage())
+                || "mcp_secret_missing".equals(exception.getMessage())) {
+            return new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
         }
         return new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE);
     }
@@ -1495,7 +1619,7 @@ public final class StdioRuntime implements AutoCloseable {
                 List.of("read_only", "workspace", "full_access"),
                 List.of("user_message", "agent_message", "commentary", "tool_call", "command", "file_change", "approval"),
                 new McpCapabilities(List.of("2024-11-05", "2025-03-26", "2025-06-18"),
-                        List.of("stdio", "streamable_http"), List.of("tools_list")));
+                        List.of("stdio", "streamable_http"), List.of("tools_list", "tools_call")));
     }
 
     /** Serializes the shared immutable capability offer without another mapper. */
@@ -1525,9 +1649,51 @@ public final class StdioRuntime implements AutoCloseable {
                                     String trust) {
     }
 
-    /** Carries one activation request across the asynchronous secret/model construction lane. */
+    /** Carries the frozen activation snapshot across the asynchronous secret lane. */
     private record ActivationAttempt(RpcRequest request, SavedProfile profile,
-                                     WorkspaceBinding workspace, Path dataDirectory) {
+                                     WorkspaceBinding workspace, Path dataDirectory,
+                                     List<McpServerDefinition> mcpDefinitions,
+                                     String modelSecret, Map<String, String> mcpSecrets,
+                                     int nextMcpIndex, boolean pendingMcpSecret) {
+        private ActivationAttempt {
+            mcpDefinitions = mcpDefinitions == null ? List.of() : List.copyOf(mcpDefinitions);
+            mcpSecrets = mcpSecrets == null ? Map.of() : Map.copyOf(mcpSecrets);
+        }
+
+        /** Carries the resolved model credential into the ordered MCP phase. */
+        private ActivationAttempt withModelSecret(String secret) {
+            return new ActivationAttempt(request, profile, workspace, dataDirectory,
+                    mcpDefinitions, secret, mcpSecrets, nextMcpIndex, false);
+        }
+
+        /** Advances one MCP definition while retaining only the current secret snapshot. */
+        private ActivationAttempt withNextMcpIndex(int index) {
+            return new ActivationAttempt(request, profile, workspace, dataDirectory,
+                    mcpDefinitions, modelSecret, mcpSecrets, index, pendingMcpSecret);
+        }
+
+        /** Marks a single pending MCP request so timeout maps to the stable MCP error. */
+        private ActivationAttempt withPendingMcpSecret(boolean pending) {
+            return new ActivationAttempt(request, profile, workspace, dataDirectory,
+                    mcpDefinitions, modelSecret, mcpSecrets, nextMcpIndex, pending);
+        }
+
+        /** Adds one resolved MCP credential and releases the next ordered request. */
+        private ActivationAttempt withMcpSecret(Map<String, String> secrets) {
+            return new ActivationAttempt(request, profile, workspace, dataDirectory,
+                    mcpDefinitions, modelSecret, secrets, nextMcpIndex, false);
+        }
+
+        /** Redacts model/MCP credentials while retaining enough revision data for diagnostics. */
+        @Override
+        public String toString() {
+            List<String> revisions = mcpDefinitions.stream()
+                    .map(McpServerDefinition::revision).toList();
+            return "ActivationAttempt[requestId=" + request.id()
+                    + ", profileRevision=" + profile.wireRevision()
+                    + ", mcpRevisions=" + revisions
+                    + ", modelSecret=<redacted>, mcpSecretCount=" + mcpSecrets.size() + "]";
+        }
     }
 
     /** Captures the exact definition/workspace/profile checked before a probe can publish. */

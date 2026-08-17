@@ -535,9 +535,23 @@ class McpRuntimeTest {
 
     /** Trusted local JVM fixture used only to verify official process cleanup. */
     public static final class StdioFixture {
-        /** Speaks the minimal MCP request set and exits when the parent closes stdin. */
+        /**
+         * Speaks the minimal MCP request set and exits when the parent closes stdin.
+         * Optional identity/protocol arguments let graph tests prove alias routing and atomic
+         * failure without introducing a second bespoke MCP transport fixture.
+         */
         public static void main(String[] args) throws Exception {
             Path pidFile = Path.of(args[0]);
+            String identity = args.length > 1 ? args[1] : "ok";
+            String configuredProtocol = args.length > 2 ? args[2] : "2024-11-05";
+            String behavior = args.length > 3 ? args[3] : "normal";
+            Path behaviorMarker = args.length > 4 ? Path.of(args[4]) : null;
+            boolean failOnce = "fail-once".equals(behavior)
+                    && behaviorMarker != null && Files.notExists(behaviorMarker);
+            if (failOnce) {
+                Files.writeString(behaviorMarker, "failed", StandardCharsets.UTF_8);
+            }
+            String protocol = failOnce ? "2025-03-26" : configuredProtocol;
             Files.writeString(pidFile, Long.toString(ProcessHandle.current().pid()), StandardCharsets.UTF_8);
             try (BufferedReader reader = new BufferedReader(
                     new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
@@ -549,9 +563,14 @@ class McpRuntimeTest {
                     String id = line.replaceFirst("(?s).*\"id\"\\s*:\\s*(\"[^\"]+\"|[0-9]+).*", "$1");
                     String method = line.replaceFirst("(?s).*\"method\"\\s*:\\s*\"([^\"]+)\".*", "$1");
                     String result = switch (method) {
-                        case "initialize" -> "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"stdio\",\"version\":\"1\"}}";
-                        case "tools/list" -> "{\"tools\":[{\"name\":\"echo\",\"description\":\"echo\",\"inputSchema\":{\"type\":\"object\"}}]}";
-                        case "tools/call" -> "{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":false}";
+                        case "initialize" -> "{\"protocolVersion\":\"" + protocol
+                                + "\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\""
+                                + identity + "\",\"version\":\"1\"}}";
+                        case "tools/list" -> "{\"tools\":[{\"name\":\"echo\",\"description\":\""
+                                + identity + "\",\"inputSchema\":{\"type\":\"object\"},"
+                                + "\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false}}]}";
+                        case "tools/call" -> "{\"content\":[{\"type\":\"text\",\"text\":\""
+                                + identity + "\"}],\"isError\":false}";
                         default -> "{}";
                     };
                     System.out.println("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result + "}");

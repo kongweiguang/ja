@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEvent;
 import io.agentscope.core.event.AgentEventType;
+import io.agentscope.core.event.AgentEndEvent;
 import io.agentscope.core.event.AgentStartEvent;
 import io.agentscope.core.event.ConfirmResult;
 import io.agentscope.core.event.RequireUserConfirmEvent;
@@ -348,8 +349,8 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         try {
             // Emit a product-owned start boundary even if a provider stream
             // omits AgentStart; the normalizer suppresses a later duplicate.
-            publishNormalized(run, new AgentStartEvent(run.sessionKey.sessionId(),
-                    run.turnId.value(), "ja"));
+            publishNormalized(run, run.subscriptionEpoch.get(), new AgentStartEvent(
+                    run.sessionKey.sessionId(), run.turnId.value(), "ja"));
             if (run.finished.get() || run.cancelled.get()) {
                 return;
             }
@@ -359,34 +360,53 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         }
     }
 
-    /** Subscribes one stream without blocking the control lane or the session FIFO. */
+    /**
+     * Reserves one callback generation before subscribing so a synchronous provider cannot
+     * publish into a stream that a later approval resume has already replaced.
+     */
     private void subscribeStream(Run run, Flux<AgentEvent> stream) {
+        subscribeStream(run, stream, run.subscriptionEpoch.incrementAndGet());
+    }
+
+    /**
+     * Subscribes one stream without blocking the control lane or the session FIFO. Every callback
+     * captures the reserved epoch; this keeps a late asking Flux from completing a resumed stream.
+     */
+    private void subscribeStream(Run run, Flux<AgentEvent> stream, long epoch) {
         Objects.requireNonNull(stream, "stream");
         Disposable subscription = stream.subscribe(
-                event -> publishNormalized(run, event),
-                error -> streamFailed(run, error),
-                () -> streamCompleted(run));
+                event -> publishNormalized(run, epoch, event),
+                error -> streamFailed(run, epoch, error),
+                () -> streamCompleted(run, epoch));
         synchronized (run) {
+            if (run.subscriptionEpoch.get() != epoch) {
+                subscription.dispose();
+                return;
+            }
+            Disposable previous = run.subscription;
             run.subscription = subscription;
+            if (previous != null && previous != subscription) {
+                previous.dispose();
+            }
             if (run.cancelled.get() || run.finished.get()) {
                 subscription.dispose();
             }
         }
     }
 
-    /** Publishes normalized events while suppressing callbacks after cancellation. */
-    private void publishNormalized(Run run, AgentEvent event) {
-        if (run.finished.get() || run.cancelled.get()) {
+    /** Publishes only the current stream generation while suppressing callbacks after cancellation. */
+    private void publishNormalized(Run run, long epoch, AgentEvent event) {
+        if (!isCurrentStream(run, epoch) || run.finished.get() || run.cancelled.get()) {
             return;
         }
         if (deadlineExpired(run)) {
             cancelInternal(run.turnId, "deadline_exceeded");
             return;
         }
-        if (run.waitingApproval.get() && isPermissionPauseStop(event)) {
+        if (run.waitingApproval.get() && isPermissionPauseTerminal(event)) {
             // AgentScope closes the asking Flux with REQUEST_STOP after emitting the HITL event;
-            // treating that provider bookkeeping as terminal would release the FIFO lane before
-            // the host response and make the later confirmation impossible to resume.
+            // some versions also emit AgentEnd before completion. Neither is a real JA terminal
+            // while the host still owns the approval decision.
             return;
         }
         try {
@@ -396,7 +416,7 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                 if (!run.finished.get() && !run.cancelled.get()) {
                     if (!terminalBatch && !admitOutput(run, output)) {
                         run.resourceOverflow.set(true);
-                        streamFailed(run, new IllegalStateException("event budget exceeded"));
+                        streamFailed(run, epoch, new IllegalStateException("event budget exceeded"));
                         return;
                     }
                     run.publisher.accept(output);
@@ -406,13 +426,14 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                 registerApproval(run, confirmation);
             }
         } catch (RuntimeException exception) {
-            streamFailed(run, exception);
+            streamFailed(run, epoch, exception);
         }
     }
 
-    /** Keeps AgentScope's permission-pause bookkeeping non-terminal until the host decision arrives. */
-    private static boolean isPermissionPauseStop(AgentEvent event) {
-        return event != null && event.getType() == AgentEventType.REQUEST_STOP;
+    /** Keeps AgentScope permission-pause bookkeeping non-terminal until the host decision arrives. */
+    private static boolean isPermissionPauseTerminal(AgentEvent event) {
+        return event != null && (event.getType() == AgentEventType.REQUEST_STOP
+                || event instanceof AgentEndEvent);
     }
 
     /**
@@ -466,8 +487,36 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         }
         PendingApproval pending = run.pendingApproval;
         if (pending == null || !pending.prompt.approvalId().equals(approvalId)
-                || !pending.resolved.compareAndSet(false, true)) {
+                || pending.resolved.get()) {
             return;
+        }
+        // The response may race AgentScope's asking-stream completion. Store the decision only
+        // after winning the one-shot gate; the resume is submitted by tryScheduleApprovalResume
+        // once both the decision and the upstream state-save boundary are complete.
+        synchronized (pending) {
+            if (!pending.resolved.compareAndSet(false, true)) {
+                return;
+            }
+            pending.decision = decision;
+        }
+        tryScheduleApprovalResume(run, pending);
+    }
+
+    /**
+     * Resumes only after both HITL inputs are closed: a decision and completion of the asking
+     * Flux. AgentScope persists the pending tool state after that Flux completes; waiting here
+     * prevents a fast stdio response from reloading a stale state snapshot and issuing the tool
+     * call a second time.
+     */
+    private void tryScheduleApprovalResume(Run run, PendingApproval pending) {
+        TurnRuntime.ApprovalDecision decision;
+        synchronized (pending) {
+            if (!pending.resolved.get() || !pending.askingCompleted.get()
+                    || pending.decision == null
+                    || !pending.resumeScheduled.compareAndSet(false, true)) {
+                return;
+            }
+            decision = pending.decision;
         }
         try {
             workers.submit(() -> resumeAfterApproval(run, pending, decision));
@@ -499,10 +548,13 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                     .textContent(allowed ? "approved" : "denied")
                     .metadata(metadata)
                     .build();
+            // Reserve the replacement generation before changing waitingApproval. A late callback
+            // from the asking Flux can then never observe a resumable run as a fresh terminal.
+            long resumeEpoch = run.subscriptionEpoch.incrementAndGet();
             approvals.remove(pending.prompt.approvalId(), run);
             run.pendingApproval = null;
             run.waitingApproval.set(false);
-            subscribeStream(run, engine.resume(resume, run.context));
+            subscribeStream(run, engine.resume(resume, run.context), resumeEpoch);
         } catch (RuntimeException exception) {
             streamFailed(run, exception);
         }
@@ -553,25 +605,47 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         return value.length() <= maxLength ? value : value.substring(0, maxLength);
     }
 
-    /** Completes an event stream with a successful terminal status when needed. */
-    private void streamCompleted(Run run) {
+    /** Completes the current event stream while ignoring stale asking-stream callbacks. */
+    private void streamCompleted(Run run, long epoch) {
+        if (!isCurrentStream(run, epoch)) {
+            return;
+        }
         if (run.waitingApproval.get()) {
-            // AgentScope intentionally completes the asking Flux with PERMISSION_ASKING. The
-            // session lane remains occupied so a same-session turn cannot bypass the pending tool.
+            // AgentScope intentionally completes the asking Flux with PERMISSION_ASKING. Marking
+            // that boundary lets a response which arrived first resume only after state persistence
+            // has drained; the session lane remains occupied until that resume becomes terminal.
+            PendingApproval pending = run.pendingApproval;
+            if (pending != null) {
+                pending.askingCompleted.set(true);
+                tryScheduleApprovalResume(run, pending);
+            }
             return;
         }
         finish(run, run.cancelled.get() ? "interrupted" : "completed",
                 run.cancelled.get() ? "cancelled" : null);
     }
 
-    /** Reduces provider/callback exceptions to a stable, non-secret terminal reason. */
-    private void streamFailed(Run run, Throwable error) {
+    /** Reduces current-provider exceptions while ignoring only callbacks from stale epochs. */
+    private void streamFailed(Run run, long epoch, Throwable error) {
+        if (!isCurrentStream(run, epoch)) {
+            return;
+        }
         String reason = run.resourceOverflow.get()
                 || (run.normalized != null && run.normalized.isOverflowed())
                 ? "event_budget_exceeded"
                 : deadlineExpired(run) ? "deadline_exceeded" : "provider_error";
         finish(run, run.cancelled.get() ? "interrupted" : "failed",
                 run.cancelled.get() ? (deadlineExpired(run) ? "deadline_exceeded" : "cancelled") : reason);
+    }
+
+    /** Routes control-lane failures to the currently reserved generation. */
+    private void streamFailed(Run run, Throwable error) {
+        streamFailed(run, run.subscriptionEpoch.get(), error);
+    }
+
+    /** Rejects callbacks from an asking stream after a newer resume stream is reserved. */
+    private static boolean isCurrentStream(Run run, long epoch) {
+        return run.subscriptionEpoch.get() == epoch;
     }
 
     /** Tests the monotonic absolute deadline rather than relying on wall-clock changes. */
@@ -809,6 +883,7 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         private final AtomicBoolean finished = new AtomicBoolean();
         private final AtomicBoolean resourceOverflow = new AtomicBoolean();
         private final AtomicBoolean waitingApproval = new AtomicBoolean();
+        private final AtomicLong subscriptionEpoch = new AtomicLong();
         private volatile SessionLane lane;
         private volatile long deadlineNanos;
         private volatile ScheduledFuture<?> deadlineTask;
@@ -835,6 +910,9 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         private final TurnRuntime.ApprovalPrompt prompt;
         private final List<ToolUseBlock> toolCalls;
         private final AtomicBoolean resolved = new AtomicBoolean();
+        private final AtomicBoolean askingCompleted = new AtomicBoolean();
+        private final AtomicBoolean resumeScheduled = new AtomicBoolean();
+        private volatile TurnRuntime.ApprovalDecision decision;
 
         private PendingApproval(TurnRuntime.ApprovalPrompt prompt, List<ToolUseBlock> toolCalls) {
             this.prompt = Objects.requireNonNull(prompt, "prompt");

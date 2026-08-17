@@ -67,7 +67,7 @@ final class StdioMcpProbeIntegrationTest {
                     .path("transports").size());
             assertTrue(contains(initialized.path("result").path("capabilities").path("mcp")
                     .path("features"), "tools_list"));
-            assertFalse(contains(initialized.path("result").path("capabilities").path("mcp")
+            assertTrue(contains(initialized.path("result").path("capabilities").path("mcp")
                     .path("features"), "tools_call"));
             session.workspace();
             session.send(request("c:save", "mcp/save", serverParams(
@@ -600,7 +600,7 @@ final class StdioMcpProbeIntegrationTest {
             params.put("protocolMinor", 0);
             params.put("minimumCompatibleMinor", 0);
             params.put("clientVersion", "mcp-probe-test");
-            params.set("capabilities", JSON.readTree("{\"methods\":[\"initialize\",\"version\",\"capabilities/read\",\"health/read\",\"shutdown\",\"workspace/open\",\"profile/save\",\"profile/activate\",\"skill/list\",\"mcp/list\",\"mcp/save\",\"mcp/delete\",\"mcp/test\",\"mcp/tools/read\",\"turn/start\"],\"events\":[],\"accessModes\":[\"read_only\",\"workspace\",\"full_access\"],\"itemKinds\":[],\"mcp\":{\"protocolVersions\":[\"2024-11-05\",\"2025-03-26\",\"2025-06-18\"],\"transports\":[\"stdio\",\"streamable_http\"],\"features\":[\"tools_list\"]}}"));
+            params.set("capabilities", JSON.readTree("{\"methods\":[\"initialize\",\"version\",\"capabilities/read\",\"health/read\",\"shutdown\",\"workspace/open\",\"profile/save\",\"profile/activate\",\"skill/list\",\"mcp/list\",\"mcp/save\",\"mcp/delete\",\"mcp/test\",\"mcp/tools/read\",\"turn/start\"],\"events\":[],\"accessModes\":[\"read_only\",\"workspace\",\"full_access\"],\"itemKinds\":[],\"mcp\":{\"protocolVersions\":[\"2024-11-05\",\"2025-03-26\",\"2025-06-18\"],\"transports\":[\"stdio\",\"streamable_http\"],\"features\":[\"tools_list\",\"tools_call\"]}}"));
             params.set("limits", JSON.readTree("{\"maxFrameBytes\":4194304,\"maxInboundQueueFrames\":256,\"maxOutboundQueueFrames\":1024,\"maxInFlightRequests\":64,\"maxPendingRequests\":64,\"maxItemDeltaBytes\":65536,\"maxInlineToolOutputBytes\":1048576,\"maxLogBytes\":1048576,\"defaultRequestDeadlineMs\":120000,\"defaultApprovalDeadlineMs\":300000}"));
             return request("c:init", "initialize", params);
         }

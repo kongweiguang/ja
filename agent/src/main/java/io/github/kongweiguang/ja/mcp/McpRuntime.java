@@ -115,13 +115,25 @@ public final class McpRuntime implements AutoCloseable {
         try {
             String selectedProtocol = McpConfigSupport.validateProtocolVersion(protocolVersion);
             McpServerConfig resolved = McpConfigSupport.resolve(name, config, secretResolver, limits);
-            wrapper = new McpResultBoundedWrapper(
-                    buildWrapper(name, resolved, selectedProtocol), limits);
-            removeRegistered(name);
-            clients.remove(name);
+            McpResultBoundedWrapper bounded = new McpResultBoundedWrapper(
+                    buildWrapper(name, resolved, selectedProtocol), limits, name, true);
+            wrapper = bounded;
+            // Prepare once before Toolkit registration so alias collisions fail before the
+            // upstream manager can replace a same-named raw tool from another server.
+            bounded.initialize().block(resolved.getInitializationTimeout());
+            bounded.listTools().block(resolved.getTimeout());
+            if (clients.containsKey(name)) {
+                removeRegistered(name);
+                clients.remove(name);
+            }
+            if (bounded.aliases().stream().anyMatch(toolkit.getToolNames()::contains)) {
+                throw new IllegalArgumentException("mcp_tool_alias_collision");
+            }
             Toolkit.ToolRegistration registration = toolkit.registration().mcpClient(wrapper);
             if (resolved.getEnableTools() != null && !resolved.getEnableTools().isEmpty()) {
-                registration.enableTools(resolved.getEnableTools());
+                registration.enableTools(resolved.getEnableTools().stream()
+                        .map(bounded::providerName)
+                        .toList());
             }
             registration.apply();
             clients.put(name, wrapper);
@@ -154,7 +166,7 @@ public final class McpRuntime implements AutoCloseable {
             selectedProtocol = McpConfigSupport.validateProtocolVersion(protocolVersion);
             McpServerConfig resolved = McpConfigSupport.resolve(name, config, secretResolver, limits);
             wrapper = new McpResultBoundedWrapper(
-                    buildWrapper(name, resolved, selectedProtocol), limits);
+                    buildWrapper(name, resolved, selectedProtocol), limits, name, false);
             Duration initializationTimeout = resolved.getInitializationTimeout();
             Duration requestTimeout = resolved.getTimeout();
             wrapper.initialize().block(initializationTimeout);

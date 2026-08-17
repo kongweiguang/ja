@@ -13,6 +13,8 @@ import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ToolSchema;
+import io.agentscope.core.tool.ToolCallParam;
+import io.github.kongweiguang.ja.mcp.McpServerDefinition;
 import io.github.kongweiguang.ja.protocol.RpcRequest;
 import io.github.kongweiguang.ja.protocol.RpcDirection;
 import io.github.kongweiguang.ja.domain.ServerInstanceId;
@@ -245,6 +247,41 @@ final class AgentScopeRuntimeGraphIntegrationTest {
         }
     }
 
+    /** Connects a real stdio MCP fixture before Harness creation and calls its aliased tool. */
+    @Test
+    void graphActivatesMcpOnSharedToolkitAndReapsChild(@TempDir Path temp) throws Exception {
+        Path workspace = Files.createDirectory(temp.resolve("workspace-mcp"));
+        Path data = Files.createDirectory(temp.resolve("data-mcp"));
+        Path pidFile = temp.resolve("mcp.pid");
+        McpServerDefinition definition = new McpServerDefinition(
+                "mcp_graph_fixture", "graph fixture", "stdio", javaExecutable(),
+                "2024-11-05", List.of("-cp", absoluteClasspath(),
+                        "io.github.kongweiguang.ja.mcp.McpRuntimeTest$StdioFixture",
+                        pidFile.toString()), Map.of(), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true);
+        AgentScopeRuntimeGraph graph = AgentScopeRuntimeGraph.open(workspace, data,
+                new ServerInstanceId("srv_mcp_graph"), "profile_mcp_graph", "trusted",
+                "full_access", new ToolModel(), List.of(),
+                List.of(new AgentScopeRuntimeGraph.McpActivation(definition, null)));
+        long pid;
+        try {
+            String alias = graph.toolkit().getToolNames().stream()
+                    .filter(name -> name.startsWith("ja_mcp_graph_fixture_echo_"))
+                    .findFirst().orElseThrow();
+            ToolResultBlock result = graph.toolkit().callTool(ToolCallParam.builder()
+                    .toolUseBlock(ToolUseBlock.builder().id("mcp-call").name(alias)
+                            .input(Map.of()).content("{}").build())
+                    .input(Map.of()).build()).block(Duration.ofSeconds(3));
+            assertNotNull(result);
+            assertFalse(result.isSuspended());
+            assertTrue(Files.exists(pidFile));
+            pid = Long.parseLong(Files.readString(pidFile));
+        } finally {
+            graph.close();
+        }
+        assertTrue(awaitProcessExit(pid), "MCP stdio child remained after graph close");
+    }
+
     /** Runs a bounded patch turn and returns the fixture for a mode-specific file assertion. */
     private static Path runPermissionProbe(Path temp, String accessMode, ProbeKind kind)
             throws Exception {
@@ -365,6 +402,32 @@ final class AgentScopeRuntimeGraphIntegrationTest {
     /** Computes the expected-hash value used by the JA apply_patch adapter. */
     private static String sha256(byte[] content) throws Exception {
         return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(content));
+    }
+
+    /** Resolves the Java executable used by the isolated stdio fixture child. */
+    private static String javaExecutable() {
+        return Path.of(System.getProperty("java.home"), "bin",
+                System.getProperty("os.name", "").toLowerCase().contains("win")
+                        ? "java.exe" : "java").toString();
+    }
+
+    /** Keeps the fixture command short enough for the MCP settings bound. */
+    private static String absoluteClasspath() {
+        Path base = Path.of(System.getProperty("user.dir", "."))
+                .toAbsolutePath().normalize();
+        String separator = System.getProperty("path.separator");
+        return base.resolve("target/test-classes") + separator + base.resolve("target/classes");
+    }
+
+    /** Confirms official MCP transport cleanup without inventing a process manager. */
+    private static boolean awaitProcessExit(long pid) throws InterruptedException {
+        for (int attempt = 0; attempt < 100; attempt++) {
+            if (!ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false)) {
+                return true;
+            }
+            Thread.sleep(20);
+        }
+        return false;
     }
 
     /** Builds the protocol envelope accepted by the production handshake. */

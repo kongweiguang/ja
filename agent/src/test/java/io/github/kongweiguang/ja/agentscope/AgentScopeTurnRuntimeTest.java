@@ -12,9 +12,11 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEndEvent;
 import io.agentscope.core.event.AgentEvent;
 import io.agentscope.core.event.AgentStartEvent;
+import io.agentscope.core.event.RequireUserConfirmEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.event.TextBlockEndEvent;
 import io.agentscope.core.event.TextBlockStartEvent;
+import io.agentscope.core.message.ToolUseBlock;
 import io.github.kongweiguang.ja.domain.ServerInstanceId;
 import io.github.kongweiguang.ja.domain.TurnId;
 import io.github.kongweiguang.ja.protocol.JsonNodes;
@@ -23,6 +25,7 @@ import io.github.kongweiguang.ja.protocol.ProtocolException;
 import io.github.kongweiguang.ja.protocol.RpcDirection;
 import io.github.kongweiguang.ja.protocol.RpcRequest;
 import io.github.kongweiguang.ja.runtime.TurnEvent;
+import io.github.kongweiguang.ja.runtime.TurnRuntime;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -34,6 +37,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
@@ -215,6 +219,61 @@ final class AgentScopeTurnRuntimeTest {
         }
     }
 
+    /**
+     * A fast approval is held until AgentScope closes its asking stream, then resumes exactly once
+     * without allowing the permission pause to publish a premature terminal.
+     */
+    @Test
+    void approvalResumeWaitsForAskingCompletionWithoutTimingSleep() throws Exception {
+        ApprovalRaceEngine engine = new ApprovalRaceEngine(false);
+        AgentScopeTurnRuntime runtime = runtime(engine, AgentScopeTurnRuntime.Config.defaults());
+        List<TurnEvent> events = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AtomicReference<java.util.function.Consumer<TurnRuntime.ApprovalDecision>> resolver =
+                new AtomicReference<>();
+        runtime.setApprovalSink((prompt, callback) -> resolver.set(callback));
+        try {
+            runtime.start(request("thr_epoch", "session_epoch", "epoch"), events::add);
+            assertTrue(engine.askingStarted.await(2, TimeUnit.SECONDS));
+            assertTrue(engine.approvalObserved.await(2, TimeUnit.SECONDS));
+            resolver.get().accept(new TurnRuntime.ApprovalDecision("allow_once", Instant.now()));
+            assertEquals(1, engine.resumeStarted.getCount(),
+                    "resume must wait for the asking Flux completion");
+            assertTrue(events.stream().noneMatch(event -> "turn/completed".equals(event.method())));
+            engine.completeAsking();
+            assertTrue(engine.resumeStarted.await(2, TimeUnit.SECONDS));
+
+            engine.releaseResume.countDown();
+            assertTrue(runtime.awaitQuiescence(java.time.Duration.ofSeconds(2)));
+            assertEquals(1, events.stream().filter(event -> "turn/completed".equals(event.method()))
+                    .count());
+            assertEquals("completed", events.getLast().params().path("turn")
+                    .path("terminalStatus").textValue());
+        } finally {
+            runtime.close();
+        }
+    }
+
+    /** A current asking-stream error still fails the turn instead of leaving approval pending. */
+    @Test
+    void currentAskingStreamErrorFailsApprovalTurn() throws Exception {
+        ApprovalRaceEngine engine = new ApprovalRaceEngine(true);
+        AgentScopeTurnRuntime runtime = runtime(engine, AgentScopeTurnRuntime.Config.defaults());
+        List<TurnEvent> events = new java.util.concurrent.CopyOnWriteArrayList<>();
+        runtime.setApprovalSink((prompt, callback) -> { });
+        try {
+            runtime.start(request("thr_epoch_error", "session_epoch_error", "epoch-error"),
+                    events::add);
+            assertTrue(engine.askingStarted.await(2, TimeUnit.SECONDS));
+            assertTrue(runtime.awaitQuiescence(java.time.Duration.ofSeconds(2)));
+            assertEquals("failed", events.getLast().params().path("turn")
+                    .path("terminalStatus").textValue());
+            assertEquals("provider_error", events.getLast().params().path("turn")
+                    .path("reason").textValue());
+        } finally {
+            runtime.close();
+        }
+    }
+
     /** Creates a runtime with deterministic instance and event timestamps. */
     private static AgentScopeTurnRuntime runtime(AgentScopeEngine engine,
                                                  AgentScopeTurnRuntime.Config config) {
@@ -318,5 +377,75 @@ final class AgentScopeTurnRuntimeTest {
         }
 
         private record Gate(CountDownLatch started, CountDownLatch release) { }
+    }
+
+    /** Coordinates asking/resume Fluxes so callback order is deterministic without sleeps. */
+    private static final class ApprovalRaceEngine implements AgentScopeEngine {
+        private final boolean failAsking;
+        private final CountDownLatch askingStarted = new CountDownLatch(1);
+        private final CountDownLatch approvalObserved = new CountDownLatch(1);
+        private final CountDownLatch resumeStarted = new CountDownLatch(1);
+        private final CountDownLatch releaseResume = new CountDownLatch(1);
+        private final AtomicReference<FluxSink<AgentEvent>> askingSink = new AtomicReference<>();
+
+        private ApprovalRaceEngine(boolean failAsking) {
+            this.failAsking = failAsking;
+        }
+
+        /** Emits one approval and optionally fails the still-current asking stream. */
+        @Override
+        public Flux<AgentEvent> stream(String input, RuntimeContext context) {
+            return Flux.create(sink -> {
+                askingSink.set(sink);
+                askingStarted.countDown();
+                ToolUseBlock tool = new ToolUseBlock("race-tool", "execute",
+                        Map.of("command", "echo race"));
+                sink.next(new RequireUserConfirmEvent("reply_asking", List.of(tool)));
+                sink.next(new AgentEndEvent("reply_asking"));
+                approvalObserved.countDown();
+                if (failAsking) {
+                    sink.error(new IllegalStateException("asking stream failed"));
+                }
+            });
+        }
+
+        /** Holds the resumed stream until the test has delivered a stale asking completion. */
+        @Override
+        public Flux<AgentEvent> resume(io.agentscope.core.message.Msg confirmation,
+                                      RuntimeContext context) {
+            return Flux.create(sink -> {
+                resumeStarted.countDown();
+                try {
+                    if (!releaseResume.await(2, TimeUnit.SECONDS)) {
+                        sink.error(new IllegalStateException("resume barrier timed out"));
+                        return;
+                    }
+                    sink.next(new AgentEndEvent("reply_resumed"));
+                    sink.complete();
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    sink.error(exception);
+                }
+            });
+        }
+
+        /** Completes only the old asking Flux after the replacement epoch is active. */
+        private void completeAsking() {
+            FluxSink<AgentEvent> sink = askingSink.get();
+            if (sink == null) {
+                throw new AssertionError("asking Flux was not subscribed");
+            }
+            sink.complete();
+        }
+
+        /** Cancellation is represented by the Flux lifecycle in this deterministic engine. */
+        @Override
+        public void interrupt(RuntimeContext context) {
+        }
+
+        /** Releases no external resources in this in-memory engine. */
+        @Override
+        public void close() {
+        }
     }
 }
