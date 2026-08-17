@@ -14,11 +14,16 @@ export interface TerminalSize {
 
 export interface TerminalOutputChunk {
   /**
-   * The PTY event identity, rather than its text, makes identical consecutive
-   * chunks observable while allowing a replayed event to stay idempotent.
+   * The PTY event identity, rather than its payload, makes identical
+   * consecutive chunks observable while allowing a replayed event to stay idempotent.
    */
   sequence: number | string;
-  text: string;
+  /**
+   * Raw PTY bytes. Tauri currently may expose `Vec<u8>` as a number array, so
+   * the equivalent array shape is accepted at this boundary and normalized
+   * without decoding it as text.
+   */
+  data: Uint8Array | readonly number[];
 }
 
 export interface TerminalPanelProps {
@@ -29,7 +34,7 @@ export interface TerminalPanelProps {
   initialText?: string;
   /**
    * One append-only PTY output event. The sequence is part of the event
-   * identity because two consecutive chunks may contain identical text.
+   * identity because two consecutive chunks may contain identical bytes.
    */
   output?: TerminalOutputChunk;
   theme?: ITheme;
@@ -121,14 +126,16 @@ export function TerminalPanel({ initialText = "", output, theme = DEFAULT_THEME,
   }, [theme]);
 
   /**
-   * Output identity is sequence-based so equal text from separate PTY events
-   * is preserved, while a replay of the same event cannot duplicate output.
+   * Output identity is sequence-based so equal byte payloads from separate PTY
+   * events are preserved, while a replay cannot duplicate output.
    */
   useEffect(() => {
     const terminal = terminalRef.current;
     if (terminal !== null && output !== undefined && output.sequence !== lastOutputSequenceRef.current) {
-      if (output.text.length > 0) {
-        terminal.write(output.text);
+      if (output.data.length > 0) {
+        // Keep the PTY bytes intact: xterm must see split UTF-8 and ANSI
+        // sequences in their original order so it can decode statefully.
+        terminal.write(output.data instanceof Uint8Array ? output.data : Uint8Array.from(output.data));
       }
       lastOutputSequenceRef.current = output.sequence;
     }
