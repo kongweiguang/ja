@@ -12,33 +12,27 @@ import java.util.Map;
 import java.util.Objects;
 
 /** Immutable turn state with an explicit, contract-checked finite-state machine. */
-public record TurnState(TurnId turnId, ThreadId threadId, TurnStatus status, TurnMode mode,
+public record TurnState(TurnId turnId, ThreadId threadId, TurnStatus status, TurnMode accessMode,
                         PermissionMode permissionMode, Instant startedAt, Instant completedAt) {
     private static final Map<TurnStatus, EnumSet<TurnStatus>> TRANSITIONS = Map.of(
-            TurnStatus.QUEUED, EnumSet.of(TurnStatus.WAITING_WORKSPACE, TurnStatus.RUNNING,
+            TurnStatus.QUEUED, EnumSet.of(TurnStatus.RUNNING,
                     TurnStatus.INTERRUPTING, TurnStatus.INTERRUPTED, TurnStatus.FAILED,
-                    TurnStatus.RECOVERY_REQUIRED, TurnStatus.ABORTED_BY_RUNTIME),
-            TurnStatus.WAITING_WORKSPACE, EnumSet.of(TurnStatus.RUNNING, TurnStatus.INTERRUPTING,
-                    TurnStatus.INTERRUPTED, TurnStatus.FAILED, TurnStatus.RECOVERY_REQUIRED,
                     TurnStatus.ABORTED_BY_RUNTIME),
             TurnStatus.RUNNING, EnumSet.of(TurnStatus.WAITING_APPROVAL, TurnStatus.COMPLETED,
-                    TurnStatus.FAILED, TurnStatus.INTERRUPTING, TurnStatus.RECOVERY_REQUIRED,
-                    TurnStatus.ABORTED_BY_RUNTIME),
+                    TurnStatus.FAILED, TurnStatus.INTERRUPTING, TurnStatus.ABORTED_BY_RUNTIME),
             TurnStatus.WAITING_APPROVAL, EnumSet.of(TurnStatus.RUNNING, TurnStatus.INTERRUPTING,
-                    TurnStatus.FAILED, TurnStatus.RECOVERY_REQUIRED, TurnStatus.ABORTED_BY_RUNTIME),
-            TurnStatus.INTERRUPTING, EnumSet.of(TurnStatus.INTERRUPTED, TurnStatus.RECOVERY_REQUIRED,
-                    TurnStatus.ABORTED_BY_RUNTIME),
+                    TurnStatus.FAILED, TurnStatus.ABORTED_BY_RUNTIME),
+            TurnStatus.INTERRUPTING, EnumSet.of(TurnStatus.INTERRUPTED, TurnStatus.ABORTED_BY_RUNTIME),
             TurnStatus.COMPLETED, EnumSet.noneOf(TurnStatus.class),
             TurnStatus.INTERRUPTED, EnumSet.noneOf(TurnStatus.class),
             TurnStatus.FAILED, EnumSet.noneOf(TurnStatus.class),
-            TurnStatus.ABORTED_BY_RUNTIME, EnumSet.noneOf(TurnStatus.class),
-            TurnStatus.RECOVERY_REQUIRED, EnumSet.noneOf(TurnStatus.class));
+            TurnStatus.ABORTED_BY_RUNTIME, EnumSet.noneOf(TurnStatus.class));
 
     public TurnState {
         Objects.requireNonNull(turnId, "turnId");
         Objects.requireNonNull(threadId, "threadId");
         Objects.requireNonNull(status, "status");
-        Objects.requireNonNull(mode, "mode");
+        Objects.requireNonNull(accessMode, "accessMode");
         Objects.requireNonNull(permissionMode, "permissionMode");
         Objects.requireNonNull(startedAt, "startedAt");
         if (completedAt != null && completedAt.isBefore(startedAt)) {
@@ -53,9 +47,19 @@ public record TurnState(TurnId turnId, ThreadId threadId, TurnStatus status, Tur
     }
 
     /** Creates the only valid initial turn state. */
-    public static TurnState queued(TurnId turnId, ThreadId threadId, TurnMode mode,
+    public static TurnState queued(TurnId turnId, ThreadId threadId, TurnMode accessMode,
                                    PermissionMode permissionMode, Instant startedAt) {
-        return new TurnState(turnId, threadId, TurnStatus.QUEUED, mode, permissionMode, startedAt, null);
+        return new TurnState(turnId, threadId, TurnStatus.QUEUED, accessMode, permissionMode, startedAt, null);
+    }
+
+    /** Supplies the default ask policy while keeping access mode as the only wire permission. */
+    public static TurnState queued(TurnId turnId, ThreadId threadId, TurnMode accessMode, Instant startedAt) {
+        return queued(turnId, threadId, accessMode, PermissionMode.ASK, startedAt);
+    }
+
+    /** Keeps old internal callers source-compatible while the serialized name is accessMode. */
+    public TurnMode mode() {
+        return accessMode;
     }
 
     /** Applies a lifecycle transition and timestamps terminal states once. */
@@ -69,7 +73,7 @@ public record TurnState(TurnId turnId, ThreadId threadId, TurnStatus status, Tur
         if (at.isBefore(startedAt)) {
             throw new IllegalArgumentException("transition time precedes start");
         }
-        return new TurnState(turnId, threadId, next, mode, permissionMode, startedAt,
+        return new TurnState(turnId, threadId, next, accessMode, permissionMode, startedAt,
                 next.terminal() ? at : null);
     }
 }

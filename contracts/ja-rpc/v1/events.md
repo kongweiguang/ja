@@ -15,7 +15,7 @@ Rust/React 执行；缺口必须走 snapshot/resync，不能猜测补齐。
 | --- | --- | --- |
 | `runtime/statusChanged` | `serverInstanceId`、`eventId`、`occurredAt`、`status` (`starting/ready/degraded/shutting_down/stopped/crashed`)、`readyToken`（仅 `status=ready` 条件必填；非 ready 禁止）、`reason?`、`health?` | sidecar 生命周期；ready 必须带当前 generation 的 challenge；不带 Thread seq |
 | `runtime/notice` | runtime 基础字段、稳定 `code`、脱敏 `message`、`threadId?`、`turnId?` | 说明恢复、重连、resync 或 enforcement，不改变事实状态 |
-| `runtime/overload` | runtime 基础字段、`queue`、`retryable`、`retryAfterMs?` | 说明 inbound/outbound/pending/artifact/tool_output 超限；关键事实不能静默丢弃 |
+| `runtime/overload` | runtime 基础字段、`queue`、`retryable`、`retryAfterMs?` | 说明 inbound/outbound/pending/tool_output 超限；关键事实不能静默丢弃 |
 
 `runtime/statusChanged(ready)` 只能在 `initialize`/`initialized` 完成且数据库、能力和
 limits 已确定后发送，并且必须原样回显 `initialized.params.readyToken`。schema 只负责
@@ -33,13 +33,13 @@ limits 已确定后发送，并且必须原样回显 `initialized.params.readyTo
 | method | params 核心字段 | 说明 |
 | --- | --- | --- |
 | `thread/changed` | thread event 基础字段、`thread`、`change` (`created/updated/archived/deleted`) | Thread 元数据变化；最后 `lastSeq` 必须与事件序列一致 |
-| `turn/started` | thread event 基础字段、`turn` | Turn 进入 running；等待 Workspace lease 用 `turn/waiting` |
-| `turn/waiting` | thread event 基础字段、`turn` | `waiting_workspace` 或 `waiting_approval`，原因放在 Turn/metadata |
-| `turn/completed` | thread event 基础字段、`turn`、`terminalStatus` | 唯一 Turn terminal event；status 为 completed/interrupted/failed/aborted_by_runtime/recovery_required |
+| `turn/started` | thread event 基础字段、`turn` | Turn 进入 running；同一 Thread 串行，不同 Thread 可并行 |
+| `turn/waiting` | thread event 基础字段、`turn` | 仅表示 `waiting_approval`，原因放在 Turn/metadata |
+| `turn/completed` | thread event 基础字段、`turn`、`terminalStatus` | 唯一 Turn terminal event；status 为 completed/interrupted/failed/aborted_by_runtime |
 
 `turn/completed` 必须 exactly-once。`turn/cancel` 的 ACK、模型流结束、Java 进程退出
-都不能替代它。终态发送前，AgentScope state durability barrier、Tool operation、
-Workspace lease 和数据库写入必须完成或显式标记 recovery_required。
+都不能替代它。终态发送前，AgentScope、Tool operation 和数据库写入必须完成；异常以
+`aborted_by_runtime` 或 `failed` 结束。
 
 ## Item 时间线
 
@@ -47,20 +47,20 @@ Workspace lease 和数据库写入必须完成或显式标记 recovery_required�
 | --- | --- | --- |
 | `item/started` | thread event 基础字段、完整 `item` | 创建稳定 `itemId`；重复 eventId 幂等 |
 | `item/delta` | thread event 基础字段、`itemId`、`delta`、`deltaBytes?` | 短期流式增量；每条受 `maxItemDeltaBytes` 限制，可合并 |
-| `item/updated` | thread event 基础字段、完整 `item` | Plan/tool/progress 等可变 Item 更新 |
+| `item/updated` | thread event 基础字段、完整 `item` | Tool/progress 等可变 Item 更新 |
 | `item/completed` | thread event 基础字段、完整 `item` | 最终可展示快照，必须覆盖完整结果 |
 
-首发 `item.kind` 为：`user_message`、`agent_message`、`commentary`、
-`reasoning_summary`、`plan`、`tool_call`、`command`、`file_change`、`approval`、
-`subagent`、`context_compaction`、`runtime_notice`。隐藏 chain-of-thought 不得透传。
-大命令输出、Diff、图片和二进制使用 artifact metadata，不把完整内容塞入 delta。
+首发 `item.kind` 为：`user_message`、`agent_message`、`commentary`、`tool_call`、
+`command`、`file_change`、`approval`。AgentScope 的 Plan、Subagent 和 compaction
+信号映射为普通 `commentary`，隐藏 chain-of-thought 不得透传。大输出只使用有界的
+inline 内容和截断标记，不新增句柄或产品级输出对象。
 
 ## Approval 与 External Tool 领域事件
 
 | method | params 核心字段 | 说明 |
 | --- | --- | --- |
 | `approval/requested` | thread event 基础字段、`approval`（approvalId、action、risk、expiresAt） | Java 已在同一事务保存审批后发送；仅用于可恢复 UI 投影 |
-| `approval/resolved` | thread event 基础字段、approvalId、decision、scope、resolvedAt | 决定已经记录；不代表 Tool 成功 |
+| `approval/resolved` | thread event 基础字段、approvalId、decision、resolvedAt | 决定已经记录；不代表 Tool 成功 |
 | `externalTool/requested` | thread event 基础字段、externalRequestId、toolName、thread/turn/item 可选 | 与 Java→Rust `externalTool/request` request 对应的可恢复投影 |
 
 Approval 领域事件不是第二个应答协议。Rust 必须以 `approvalId` 合并 request 与

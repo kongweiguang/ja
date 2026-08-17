@@ -30,12 +30,11 @@ pub(super) fn default_initialize_params(limits: &Limits) -> Value {
         "capabilities": {
             "methods": [],
             "events": [],
-            "permissionModes": ["plan", "workspace", "full_access"],
+            "accessModes": ["read_only", "workspace", "full_access"],
             "itemKinds": [],
             "mcp": {"protocolVersions": [], "transports": [], "features": []}
         },
         "limits": limits.to_value(),
-        "workspacePolicy": {"mode": "plan", "network": "disabled", "enforcement": "unavailable", "protectedRoots": []}
     })
 }
 
@@ -70,7 +69,6 @@ pub(super) fn contains_secret_marker(value: &str) -> bool {
 pub(super) fn validate_initialize_params(
     value: &Value,
     local: &Limits,
-    workspace_enforcement_verified: bool,
 ) -> Result<(), AgentProcessError> {
     let object = value.as_object().ok_or(AgentProcessError::InvalidConfig)?;
     if object.get("protocolMajor").and_then(Value::as_i64) != Some(1) {
@@ -92,49 +90,6 @@ pub(super) fn validate_initialize_params(
     validate_capabilities(object.get("capabilities"))?;
     validate_remote_limits(object.get("limits"), local)
         .map_err(|_| AgentProcessError::InvalidConfig)?;
-    validate_workspace_policy(
-        object.get("workspacePolicy"),
-        workspace_enforcement_verified,
-    )
-    .map_err(|_| AgentProcessError::InvalidConfig)?;
-    Ok(())
-}
-
-/// 校验 workspace policy 的有限枚举与 root 字符串，避免握手声明绕过宿主边界。
-pub(super) fn validate_workspace_policy(
-    value: Option<&Value>,
-    workspace_enforcement_verified: bool,
-) -> Result<(), AgentProcessError> {
-    let policy = value
-        .and_then(Value::as_object)
-        .ok_or(AgentProcessError::ProtocolFault)?;
-    if !matches!(
-        policy.get("mode").and_then(Value::as_str),
-        Some("plan" | "workspace" | "full_access")
-    ) || !matches!(
-        policy.get("network").and_then(Value::as_str),
-        Some("disabled" | "restricted" | "enabled")
-    ) || !matches!(
-        policy.get("enforcement").and_then(Value::as_str),
-        Some("os_enforced" | "partial" | "unavailable")
-    ) {
-        return Err(AgentProcessError::ProtocolFault);
-    }
-    if policy.get("enforcement").and_then(Value::as_str) == Some("os_enforced")
-        && !workspace_enforcement_verified
-    {
-        return Err(AgentProcessError::ProtocolFault);
-    }
-    if let Some(roots) = policy.get("protectedRoots") {
-        let roots = roots.as_array().ok_or(AgentProcessError::ProtocolFault)?;
-        if roots.len() > 32
-            || roots
-                .iter()
-                .any(|root| root.as_str().is_none_or(|path| path.len() > 4096))
-        {
-            return Err(AgentProcessError::ProtocolFault);
-        }
-    }
     Ok(())
 }
 
@@ -253,10 +208,10 @@ pub(super) fn validate_capabilities(value: Option<&Value>) -> Result<(), AgentPr
     validate_string_array(object.get("methods"), 256, 128, None)?;
     validate_string_array(object.get("events"), 256, 128, None)?;
     validate_string_array(
-        object.get("permissionModes"),
+        object.get("accessModes"),
         3,
         32,
-        Some(&["plan", "workspace", "full_access"]),
+        Some(&["read_only", "workspace", "full_access"]),
     )?;
     validate_string_array(object.get("itemKinds"), 64, 64, None)?;
     let Some(mcp) = object.get("mcp").and_then(Value::as_object) else {
@@ -466,7 +421,6 @@ pub(super) fn validate_remote_limits(
     let item_delta = number("maxItemDeltaBytes").ok_or(AgentProcessError::ProtocolFault)?;
     let inline_output =
         number("maxInlineToolOutputBytes").ok_or(AgentProcessError::ProtocolFault)?;
-    let artifact = number("maxArtifactBytes").ok_or(AgentProcessError::ProtocolFault)?;
     let logs = number("maxLogBytes").ok_or(AgentProcessError::ProtocolFault)?;
     let request_deadline =
         number("defaultRequestDeadlineMs").ok_or(AgentProcessError::ProtocolFault)?;
@@ -479,7 +433,6 @@ pub(super) fn validate_remote_limits(
         || !(1..=1_024).contains(&pending)
         || !(256..=1_048_576).contains(&item_delta)
         || !(1_024..=16_777_216).contains(&inline_output)
-        || !(1_048_576..=1_073_741_824).contains(&artifact)
         || !(4_096..=67_108_864).contains(&logs)
         || !(1_000..=3_600_000).contains(&request_deadline)
         || !(1_000..=3_600_000).contains(&approval_deadline)
@@ -490,7 +443,6 @@ pub(super) fn validate_remote_limits(
         || pending != local.max_pending_requests
         || item_delta != 65_536
         || inline_output != 1_048_576
-        || artifact != 268_435_456
         || logs != local.max_log_bytes as u64
         || request_deadline != local.request_deadline_ms
         || approval_deadline != local.approval_deadline_ms

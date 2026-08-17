@@ -18,7 +18,7 @@ Codex app-server、ACP、WebSocket 或通用插件协议。可机器校验的根
 - 每端各自维护永久 reader、single-writer queue 和 pending request registry。业务线程不能直接写 stdout 或另一端的 stdin。
 - reader 先做 UTF-8、LF、JSON object、frame bytes 和 envelope 结构校验，再把工作交给有界 dispatcher；reader 不等待模型、数据库、Tool 或审批。
 - `maxFrameBytes` 以 UTF-8 JSON bytes 计，不含末尾 LF；协商值必须在 1 KiB 至 16 MiB 内，首发基线为 `4194304`。
-- 4 MiB 以上的命令输出、Diff、图片和二进制必须落为 `artifact`，frame 只传 opaque `artifactId`、大小、媒体类型和 SHA-256。
+- 大命令输出、Diff、图片和二进制必须遵守协商的 inline 上限并带截断标记；v1 不定义产品级内容句柄。
 
 协议 frame 不携带明文认证信息。它运行在同一 Tauri 进程创建的匿名 pipe 上；“同机管理员或调试器无法读取进程内存”不属于本协议的安全承诺。
 
@@ -27,7 +27,7 @@ Codex app-server、ACP、WebSocket 或通用插件协议。可机器校验的根
 ### Request
 
 ```json
-{"jsonrpc":"2.0","id":"c:req-1","method":"turn/start","params":{"threadId":"thr_demo","input":[{"type":"text","text":"检查测试"}],"mode":"plan","permissionMode":"ask","profileRevision":"profile_demo"}}
+{"jsonrpc":"2.0","id":"c:req-1","method":"turn/start","params":{"threadId":"thr_demo","input":[{"type":"text","text":"检查测试"}],"accessMode":"read_only","profileRevision":"profile_demo"}}
 ```
 
 `id` 必须存在且是全局唯一的有限字符串。Rust 发起的 request 使用 `c:` 前缀，Java 发起的 request 使用 `s:` 前缀；两端只接受自己 pending registry 中登记过的 response。请求 ID 最大 98 字节。
@@ -75,9 +75,8 @@ Java -> shutdown(response)
 | `protocolMinor` | 非负整数；server 选择双方可兼容的 minor |
 | `minimumCompatibleMinor` | client 能理解的最低 minor |
 | `clientVersion` | UI/host 版本字符串 |
-| `capabilities` | 方法、事件、Item、权限模式和 MCP Tools 能力集合 |
-| `limits` | frame、队列、pending、delta、artifact、日志和 deadline 上限 |
-| `workspacePolicy` | 当前技术 enforcement 摘要，不等同于用户 approval |
+| `capabilities` | 方法、事件、Item、访问模式和 MCP Tools 能力集合 |
+| `limits` | frame、队列、pending、delta、inline 输出、日志和 deadline 上限 |
 
 `initialize.result` 返回 `protocolMajor/protocolMinor/serverVersion/serverInstanceId`、
 AgentScope/Java/runtime/native-image/os/arch 信息、最终能力集合和最终 limits。
@@ -126,13 +125,11 @@ result、provider/tool failure payload）出现 `readyToken` 键，或把当前/
 | `item_...` | Java | 可更新的时间线对象 |
 | `evt_...` | Java | 事件唯一标识 |
 | `appr_...` | Java | 一次审批，exactly-once 决策键 |
-| `artifact_...` | Java | 大输出、Diff 或附件内容句柄 |
-| `att_...` | Java | 不可变附件句柄 |
 | `profile_...`/`skill_...`/`mcp_...` | Java | 不可变能力 revision |
 | `srv_...` | Java | 一次 sidecar 实例；重启后必须变化 |
 
 Java/SQLite 是 Workspace、Thread、Turn、Item、Approval、AgentScope state、Profile、
-Skill、MCP revision 和 artifact metadata 的唯一持久权威。Rust 只持有桌面布局、窗口、
+Skill 和 MCP revision 的唯一持久权威。Rust 只持有桌面布局、窗口、
 用户 PTY、Preview、Secret 和 sidecar 生命周期状态。React 只缓存 snapshot 与增量，
 不能把自己的 reducer 当成事实源。
 
@@ -141,29 +138,28 @@ Skill、MCP revision 和 artifact metadata 的唯一持久权威。Rust 只持�
 ### Turn
 
 `turn/start` 只返回 `accepted`/`queued` 和 `turnId`。同一 Thread 同时最多一个 active
-Turn；同一 Workspace 的可写 Turn 通过 Java mutation lease 串行，Plan/Read-only 可并行。
-active Turn 收到新输入时必须显式选择 `queue`、`steer` 或 `followUp`；首发 UI 默认只暴露
-`queue`，若 steer 探针未通过不得将 queue 伪装成 steer。
+Turn；不同 Thread 可以并行。active Turn 收到新输入时由客户端排队到后续 Turn，v1 不
+提供 steer 或 follow-up。
 
 推荐状态：
 
 ```text
-queued -> waiting_workspace -> running -> waiting_approval -> running
+queued -> running -> waiting_approval -> running
 running -> completed | failed | interrupting
-interrupting -> interrupted | recovery_required
-任何运行态 --sidecar 崩溃--> recovery_required
+interrupting -> interrupted | aborted_by_runtime
+任何运行态 --sidecar 崩溃--> aborted_by_runtime
 ```
 
 `turn/cancel` response 只是 ACK；只有 `turn/completed` 的 `terminalStatus` 为
-`interrupted`、`failed`、`aborted_by_runtime` 或 `recovery_required` 才是终止事实。
+`interrupted`、`failed` 或 `aborted_by_runtime` 才是终止事实。
 取消必须同时处理 AgentScope interrupt、Reactor subscription、Java Tool operation 和
 完整子进程树；只停止模型流不算取消成功。
 
 ### Item
 
-首发 Item kind 是 `user_message`、`agent_message`、`commentary`、`reasoning_summary`、
-`plan`、`tool_call`、`command`、`file_change`、`approval`、`subagent`、
-`context_compaction`、`runtime_notice`。每个 Item 遵循 `started -> delta/update ->
+首发 Item kind 是 `user_message`、`agent_message`、`commentary`、`tool_call`、`command`、
+`file_change`、`approval`。AgentScope 内部的 Plan、Subagent 和 compaction 信号均映射
+为普通 commentary。每个 Item 遵循 `started -> delta/update ->
 completed/failed/cancelled`；`item/completed` 是完整可展示快照，delta 可以合并、丢弃或
 短暂缓存，但不能替代最终快照。隐藏 chain-of-thought 不属于可发送的 Item 内容。
 
@@ -193,13 +189,13 @@ notification。Rust 必须先创建本地 sink/缓冲，再发 snapshot request�
 Approval 唯一决定通道是 Java -> Rust 的 `approval/request` JSON-RPC request 和 Rust ->
 Java 的标准 response。Java 先在同一个 SQLite 事务保存 Approval 与
 `approval/requested` 事件，再发 request；Rust/React 将二者合并为一张卡片。response
-只表示 `allow_once`、`allow_scope`、`deny` 等决定已经记录，不代表 Tool 成功；Java
+只表示 `allow_once`、`allow_session` 或 `deny` 等决定已经记录，不代表 Tool 成功；Java
 随后发送 `approval/resolved`，最终结果仍由 Tool Item 给出。
 
 同一 `approvalId` 只有一个有效决定。超时、断开、未知 id、重复 response 和迟到 response
 全部 fail-closed，使用 `APPROVAL_EXPIRED`、`DUPLICATE_RESPONSE`、`UNKNOWN_REQUEST_ID`
 或 `LATE_RESPONSE` 等稳定错误/诊断，不得再次执行 Tool。approval request 必须包括
-规范化动作、风险、权限来源、scope 选项、关联 Thread/Turn/Item 和到期时间。
+规范化动作、风险、当前 accessMode、关联 Thread/Turn/Item 和到期时间。
 
 ### Secret
 
@@ -216,14 +212,13 @@ response。它不是 Java 把 Agent Shell 委托给 Rust；coding Agent 的文�
 仍由 Java Tool runtime 和 Java-owned Tool Worker 执行。External Tool 只用于已明确纳入
 能力协商的桌面桥接（例如 Secret 或未来平台能力），未知 Tool 必须拒绝。
 
-## 7. Skills、MCP 与附件
+## 7. Skills 与 MCP
 
 - `skill/import` 只导入 built-in、user 或 workspace 本地目录/归档，校验 `SKILL.md`、编码、大小、来源和 hash；激活以不可变 revision 原子切换，坏 revision 保留 last-good。
 - Skill 脚本不会因导入而执行；后续执行必须重新进入 Java permission/approval/sandbox Tool 链路。
 - MCP 首发仅 `tools/list` 与 `tools/call`，传输仅 stdio 与 Streamable HTTP；Server 进程受限于生命周期、输出、timeout、Secret 和 sandbox policy。
 - MCP OAuth、Resources、Prompts、Sampling、Roots、Elicitation、Apps 和插件市场不属于 v1；对应 capability 显示 unsupported，不能把认证 token 放进 URL。
-- `attachment/import` 接收 Rust 原生选择器生成的一次性 `sourceToken`、文件名、媒体类型、大小和 hash；Java 复制为不可变 artifact，历史只保存 `att_...`。协议不接受任意 Agent 提供的绝对路径。
-- 模型不支持图片或该媒体类型时，发送前返回明确能力错误，不得静默丢弃附件。
+- v1 输入仅接受有界文本；图片和二进制内容能力后置到独立版本。
 
 ## 8. 限额与背压基线
 
@@ -238,12 +233,11 @@ response。它不是 Java 把 Agent Shell 委托给 Rust；coding Agent 的文�
 | pending server requests | 64 |
 | 单 Item delta | 65,536 bytes |
 | inline Tool output | 1,048,576 bytes |
-| 单 artifact | 268,435,456 bytes |
 | 诊断/日志缓存 | 1,048,576 bytes |
 | 普通 request deadline | 120,000 ms |
 | Approval deadline | 300,000 ms |
 
-所有队列、pending、delta、Tool/MCP 输出、artifact、诊断日志、重试和 Subagent budget
+所有队列、pending、delta、Tool/MCP 输出、诊断日志和重试
 必须有界。超过上限返回 `FRAME_TOO_LARGE`、`QUEUE_FULL`、`PAYLOAD_TOO_LARGE` 或
 `BUDGET_EXCEEDED`，并说明 `retryable`；不能无限排队、无限重试或把大数据内联到 JSONL。
 
@@ -259,10 +253,10 @@ response。它不是 Java 把 Agent Shell 委托给 Rust；coding Agent 的文�
 `approvalId` 或其他幂等键区分“未开始、已完成、结果未知”，未知结果不能自动重放。
 
 正常关闭：Rust 发送 `shutdown`，Java 停止接受新 mutation、等待有界 deadline、收口
-Tool/MCP/审批/lease/DB writer 并返回 response，随后发 stopped 状态并 EOF。Rust 到期后
+Tool/MCP/审批/DB writer 并返回 response，随后发 stopped 状态并 EOF。Rust 到期后
 终止完整 sidecar 进程树。意外崩溃只允许有限指数退避重启；版本不兼容、数据目录锁、
 迁移失败、签名/配置错误不得 crash-loop。未产生 terminal event 的 Turn 在新实例中标为
-`aborted_by_runtime` 或 `recovery_required`，不承诺从模型或 Shell 中点继续。
+`aborted_by_runtime`，不承诺从模型或 Shell 中点继续。
 
 ## 10. 未实现能力的稳定边界
 

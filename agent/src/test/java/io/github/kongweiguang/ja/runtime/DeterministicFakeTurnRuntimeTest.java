@@ -85,7 +85,7 @@ class DeterministicFakeTurnRuntimeTest {
     void rejectsWorkerOverflowWithQueueFull() throws Exception {
         CountDownLatch gate = new CountDownLatch(1);
         ProtocolLimits limits = new ProtocolLimits(4 * 1024 * 1024, 1, 1, 1, 1,
-                65_536, 1_048_576, 268_435_456, 1_048_576, 120_000, 300_000);
+                65_536, 1_048_576, 1_048_576, 120_000, 300_000);
         DeterministicFakeTurnRuntime runtime = new DeterministicFakeTurnRuntime(
                 new ServerInstanceId("srv_test_overflow"), CLOCK, gate, limits);
         runtime.start(request("thr_first", "first"), ignored -> { });
@@ -102,8 +102,7 @@ class DeterministicFakeTurnRuntimeTest {
     private static RpcRequest request(String threadId, String text) {
         ObjectNode params = JsonNodes.object();
         params.put("threadId", threadId);
-        params.put("mode", "workspace");
-        params.put("permissionMode", "ask");
+        params.put("accessMode", "workspace");
         params.put("profileRevision", "profile_test");
         params.putArray("input").addObject().put("type", "text").put("text", text);
         return new RpcRequest("c:req_" + threadId, "turn/start", params, RpcDirection.CLIENT_TO_SERVER);

@@ -3,9 +3,9 @@
 
 package io.github.kongweiguang.ja.domain;
 
-/** Separates model intent from technical sandbox enforcement. */
+/** User-visible access modes; the wire exposes these as accessMode. */
 public enum TurnMode {
-    PLAN,
+    READ_ONLY,
     WORKSPACE,
     FULL_ACCESS
 }

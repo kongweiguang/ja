@@ -30,7 +30,7 @@ object key 或 value。`details`
 | code | `jaCode` | retryable | 触发与恢复 |
 | ---: | --- | :---: | --- |
 | -32001 | `INVALID_FRAME` | 否 | JSON 不是 object、UTF-8/LF/frame 结构不合法；关闭连接 |
-| -32002 | `FRAME_TOO_LARGE` | 否 | 超过协商 `maxFrameBytes`；改用 artifact/分片 |
+| -32002 | `FRAME_TOO_LARGE` | 否 | 超过协商 `maxFrameBytes`；按 inline 上限截断或缩小请求 |
 | -32003 | `PROTOCOL_VERSION_UNSUPPORTED` | 否 | major 不兼容或 minor 无交集；停止启动 |
 | -32004 | `NOT_INITIALIZED` | 否 | `initialized` 前调用业务方法 |
 | -32005 | `ALREADY_INITIALIZED` | 否 | 同一 sidecar 重复 initialize |
@@ -53,21 +53,19 @@ object key 或 value。`details`
 | ---: | --- | :---: | --- |
 | -32020 | `SHUTTING_DOWN` | 是 | 关闭阶段拒绝新请求；等待新实例 ready |
 | -32021 | `DATA_DIR_IN_USE` | 否 | 另一实例持有 Java DB lock；聚焦已有实例 |
-| -32022 | `STATE_RECOVERY_REQUIRED` | 否 | Agent state/timeline durability 无法对账；用户检查/导出后重试 |
 | -32023 | `MIGRATION_FAILED` | 否 | DB migration 事务失败；保留旧 DB 和备份，进入恢复页 |
 | -32024 | `SCHEMA_TOO_NEW` | 否 | 数据库由更新版本创建；升级应用，不降级覆盖 |
 | -32025 | `WORKSPACE_NOT_FOUND` | 否 | JA 记录不存在；重新 open |
 | -32026 | `WORKSPACE_UNTRUSTED` | 否 | 未获得 workspace trust；仅可执行受限读取 |
-| -32027 | `WORKSPACE_MUTATION_BUSY` | 是 | 写 Turn 等待同一 workspace lease |
 | -32028 | `CONFLICT` | 是 | profile revision、expected hash 或 workspace 写入冲突；重新读取 |
 | -32029 | `THREAD_NOT_FOUND` | 否 | Thread 不存在或已 purge |
 | -32030 | `THREAD_BUSY` | 是 | 同一 Thread 已有 active Turn；使用 queue/cancel |
-| -32031 | `THREAD_READ_ONLY` | 否 | 归档、Plan 或 Read-only 上下文拒绝写入 |
+| -32031 | `THREAD_READ_ONLY` | 否 | 归档或 Read-only 上下文拒绝写入 |
 | -32032 | `TURN_NOT_FOUND` | 否 | Turn ID 不存在 |
-| -32033 | `TURN_NOT_ACTIVE` | 否 | cancel/steer/followUp 目标不是 active Turn |
+| -32033 | `TURN_NOT_ACTIVE` | 否 | cancel 目标不是 active Turn |
 | -32034 | `INVALID_STATE` | 否 | 状态转换违反状态机 |
 | -32035 | `CANCELLED` | 否 | 操作已按用户或 shutdown 取消；不代表副作用未知可重放 |
-| -32036 | `BUDGET_EXCEEDED` | 否 | 时间、Token、Tool、Subagent、重试或 artifact budget 到达上限 |
+| -32036 | `BUDGET_EXCEEDED` | 否 | 时间、Token、Tool 或重试预算到达上限 |
 
 ## Permission、Tool 与 Sandbox
 
@@ -78,12 +76,11 @@ object key 或 value。`details`
 | -32042 | `APPROVAL_ALREADY_RESOLVED` | 否 | 已有唯一决定；UI 刷新可读取 resolved 事件 |
 | -32043 | `TOOL_DENIED` | 否 | Permission policy 或用户决定拒绝 |
 | -32044 | `TOOL_FAILED` | 否 | Tool 已执行但失败；详情脱敏且不得伪装为协议错误 |
-| -32045 | `SANDBOX_POLICY_UNAVAILABLE` | 否 | 请求的 OS enforcement 不可用；fail-closed，不自动 Full Access |
 | -32046 | `PROCESS_TIMEOUT` | 是 | Tool/Worker 超时并已尝试清理进程树 |
-| -32047 | `PROCESS_OUTPUT_LIMIT` | 否 | stdout/stderr 超过上限；剩余内容写 artifact 或丢弃并标记截断 |
+| -32047 | `PROCESS_OUTPUT_LIMIT` | 否 | stdout/stderr 超过上限；剩余内容丢弃并标记截断 |
 | -32048 | `EXTERNAL_TOOL_UNSUPPORTED` | 否 | 未协商的桌面桥接或错误方向 |
 
-## Secret、Model、Skill、MCP 与附件
+## Secret、Model、Skill 与 MCP
 
 | code | `jaCode` | retryable | 触发与恢复 |
 | ---: | --- | :---: | --- |
@@ -98,10 +95,6 @@ object key 或 value。`details`
 | -32058 | `MCP_PROTOCOL_UNSUPPORTED` | 否 | MCP version/transport/features 不在协商集合 |
 | -32059 | `MCP_TOOL_NOT_FOUND` | 否 | Tool registry revision 不含该 namespaced tool |
 | -32060 | `MCP_TOOL_FAILED` | 否 | Tool call 已执行但失败；不得无条件自动重放副作用 |
-| -32061 | `ATTACHMENT_NOT_FOUND` | 否 | opaque attachmentId 不存在或已清理 |
-| -32062 | `ATTACHMENT_TOO_LARGE` | 否 | 超过单文件或总配额；用户需选择更小文件 |
-| -32063 | `ATTACHMENT_TYPE_UNSUPPORTED` | 否 | 模型/策略不支持媒体类型；不得静默丢失附件 |
-| -32064 | `ARTIFACT_NOT_FOUND` | 否 | 句柄已过期或被 GC；重新执行产生新 artifact |
 
 ## 未实现能力与内部错误
 

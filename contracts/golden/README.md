@@ -23,8 +23,7 @@ response envelope 本身没有 `method`，因此根 Schema 只验证通用
 | `snapshot-live/` | snapshot response 的 `snapshotSeq` 与后续 live event |
 | `secret/` | dummy credential resolve、内存注入 response、clear runtime notice；没有真实 secret |
 | `mcp-skill/` | Skill import/enable、MCP save/tools/read |
-| `attachment/` | opaque picker token 导入和 attachment metadata |
-| `limits/` | 全部有限 queue/frame/delta/output/artifact/deadline 能力 |
+| `limits/` | 全部有限 queue/frame/delta/inline-output/deadline 能力 |
 | `version/` | minor 兼容和 major 拒绝 |
 | `invalid/` | missing/null、方向/id、duplicate/late 与超限语义样例 |
 
@@ -49,7 +48,7 @@ mapping 用 request id 关联 response 进行二次 result 校验。PowerShell
 challenge 原值作为 JSON object key/value 都拒绝，包括 error 外层 meta、runtime notice、
 diagnostics/result/provider/tool failure 扩展。
 
-当前 valid fixture 为 46 帧，invalid/major 为 31 帧；握手专用覆盖为 6 个 valid 帧和
+当前 valid fixture 为 44 帧，invalid/major 为 31 帧；握手专用覆盖为 6 个 valid 帧和
 23 个 invalid cases，包含缺 token、格式错误、非 ready 携带 token、ready 缺失/错误、
 重复 initialized、重复 ready、旧 generation token、ready-before-initialized、无 initialized
 的非 ready 序列、initialized-only、无 ready 的非 ready 序列、notification envelope 字段越界、整帧

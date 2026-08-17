@@ -22,12 +22,16 @@ import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ToolSchema;
 import io.agentscope.core.state.InMemoryAgentStateStore;
+import io.agentscope.harness.agent.filesystem.model.ExecuteResponse;
 import io.agentscope.harness.agent.HarnessAgent;
+import io.agentscope.harness.agent.filesystem.local.LocalFilesystemWithShell;
+import io.agentscope.harness.agent.filesystem.sandbox.AbstractSandboxFilesystem;
 import io.github.kongweiguang.ja.domain.ServerInstanceId;
 import io.github.kongweiguang.ja.protocol.JsonNodes;
 import io.github.kongweiguang.ja.protocol.RpcDirection;
 import io.github.kongweiguang.ja.protocol.RpcRequest;
 import io.github.kongweiguang.ja.runtime.TurnEvent;
+import io.github.kongweiguang.ja.tools.JaSandboxFilesystem;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -36,26 +40,62 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
+import org.junit.jupiter.api.io.TempDir;
+import java.nio.file.Path;
 
 /** Verifies that the product composition boundary uses the real Harness API safely. */
 final class HarnessFactoryTest {
-    /** Ensures default construction is deterministic and does not install file-backed state. */
+    /** Ensures JA adds only its patch/sandbox delta while AgentScope composes the rest. */
     @Test
-    void buildsWithInMemoryStateAndNoImplicitLocalPersistence() {
+    void buildsWithJaStateAndUpstreamCapabilities() {
         HarnessAgent agent = new HarnessFactory().create(new FixedModel());
+        JaSandboxFilesystem filesystem = assertInstanceOf(JaSandboxFilesystem.class,
+                agent.getWorkspaceManager().getFilesystem());
         try {
             assertNotNull(agent);
             assertInstanceOf(InMemoryAgentStateStore.class, agent.getStateStore());
-            assertInstanceOf(InMemoryFilesystem.class, agent.getWorkspaceManager().getFilesystem());
-            assertTrue(agent.getToolkit().getToolNames().isEmpty());
-            assertTrue(agent.getSkillRepositories().isEmpty());
-            assertNull(agent.getCompactionHook());
+            assertInstanceOf(AbstractSandboxFilesystem.class,
+                    agent.getWorkspaceManager().getFilesystem());
+            assertTrue(agent.getToolkit().getToolNames().contains("read_file"));
+            assertTrue(agent.getToolkit().getToolNames().contains("execute"));
+            assertTrue(agent.getToolkit().getToolNames().contains("apply_patch"));
+            assertFalse(agent.getToolkit().getToolNames().contains("agent_spawn"));
+            assertFalse(agent.getToolkit().getToolNames().contains("agent_send"));
+            assertFalse(agent.getSkillRepositories().isEmpty());
+            assertNotNull(agent.getCompactionHook());
             assertNull(agent.getSubagentAgentManager());
-            assertTrue(agent.getDelegate().getMiddlewares().stream()
-                    .map(middleware -> middleware.getClass().getSimpleName().toLowerCase())
-                    .noneMatch(name -> name.contains("subagent") || name.contains("plan")
-                            || name.contains("compaction") || name.contains("workspacecontext")
-                            || name.contains("atpathexpansion") || name.contains("memory")));
+            assertTrue(agent.getDelegate().getPermissionContext() != null);
+            var middlewareNames = agent.getDelegate().getMiddlewares().stream()
+                    .map(middleware -> middleware.getClass().getSimpleName())
+                    .toList();
+            assertTrue(middlewareNames.contains("WorkspaceContextMiddleware"));
+            assertTrue(middlewareNames.contains("HarnessSkillMiddleware"));
+            assertFalse(middlewareNames.contains("DynamicSubagentsMiddleware"));
+            assertFalse(middlewareNames.contains("SubagentsMiddleware"));
+
+            ExecuteResponse environment = filesystem.execute(RuntimeContext.empty(),
+                    environmentCommand(), 5);
+            assertFalse(environment.output().contains("OPENAI_API_KEY"));
+            assertFalse(environment.output().contains("ANTHROPIC_API_KEY"));
+        } finally {
+            agent.close();
+            filesystem.close();
+        }
+    }
+
+    /** Proves a caller-owned upstream filesystem does not receive a false JA patch registration. */
+    @Test
+    void customUpstreamFilesystemKeepsOnlyUpstreamTools(@TempDir Path workspace) {
+        LocalFilesystemWithShell upstream = new LocalFilesystemWithShell(workspace, true,
+                LocalFilesystemWithShell.DEFAULT_EXECUTE_TIMEOUT, 100_000, Map.of(), false);
+        HarnessAgent agent = new HarnessFactory(HarnessFactory.Config.defaults(), upstream, workspace)
+                .create(new FixedModel());
+        try {
+            assertTrue(agent.getToolkit().getToolNames().contains("read_file"));
+            assertTrue(agent.getToolkit().getToolNames().contains("execute"));
+            assertFalse(agent.getToolkit().getToolNames().contains("apply_patch"));
+            assertFalse(agent.getToolkit().getToolNames().contains("agent_spawn"));
+            assertFalse(agent.getToolkit().getToolNames().contains("agent_send"));
         } finally {
             agent.close();
         }
@@ -187,14 +227,12 @@ final class HarnessFactoryTest {
                 new SessionKey("user", "unsafe"), Map.of("filesystem", new Object())));
     }
 
-    /** Prevents a caller from wrapping an arbitrary Harness with the product engine port. */
+    /** Prevents a caller from wrapping a Harness that has no JA filesystem boundary. */
     @Test
     void adapterRejectsHarnessOutsideVerifiedComposition() {
         HarnessAgent unsafe = HarnessAgent.builder()
                 .model(new FixedModel())
                 .stateStore(new InMemoryAgentStateStore())
-                .workspace(InMemoryWorkspacePath.path())
-                .abstractFilesystem(new InMemoryFilesystem())
                 .build();
         try {
             assertThrows(IllegalArgumentException.class, () -> new HarnessEngineAdapter(unsafe));
@@ -267,5 +305,10 @@ final class HarnessFactoryTest {
         params.set("input", input);
         return new RpcRequest("c:harness", "turn/start", params,
                 RpcDirection.CLIENT_TO_SERVER);
+    }
+
+    /** Lists the child environment so the default JA shell boundary cannot inherit model keys. */
+    private static String environmentCommand() {
+        return System.getProperty("os.name", "").toLowerCase().contains("win") ? "set" : "env";
     }
 }

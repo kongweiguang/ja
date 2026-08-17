@@ -91,8 +91,7 @@ describe("RuntimeHost typed adapter", () => {
     await expect(adapter.recoveryState()).resolves.toMatchObject({ required: false });
     await expect(adapter.turnStart({
       threadId: "thr_fixture",
-      mode: "workspace",
-      permissionMode: "ask",
+      accessMode: "workspace",
       profileRevision: "profile_fixture",
       input: [{ type: "text", text: "hello" }],
     })).resolves.toMatchObject({ accepted: true });
@@ -116,8 +115,7 @@ describe("RuntimeHost typed adapter", () => {
         turnId: "turn_fixture",
         threadId: "thr_fixture",
         status: "running",
-        mode: "workspace",
-        permissionMode: "ask",
+        accessMode: "workspace",
       },
     }));
     expect(event).toMatchObject({ kind: "timeline", event: { method: "turn/started" } });

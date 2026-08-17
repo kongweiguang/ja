@@ -134,8 +134,7 @@ function Probe(): ReactElement {
   const { boot, start, stop, startTurn, acknowledgeRecovery } = useJaConnection();
   const turn = (): Promise<unknown> => startTurn({
     threadId: "thr_fixture",
-    mode: "workspace",
-    permissionMode: "ask",
+    accessMode: "workspace",
     profileRevision: "profile_fixture",
     input: [{ type: "text", text: "hello" }],
   });
@@ -164,11 +163,11 @@ describe("ConnectionProvider RuntimeHost lifecycle", () => {
     const { unmount } = render(<ConnectionProvider runtime={fake.runtime}><Probe /></ConnectionProvider>);
     await waitFor(() => expect(screen.getByTestId("boot")).toHaveTextContent("ready"));
     const frames = [
-      { method: "turn/started", params: { turn: { turnId: "turn_fixture", threadId: "thr_fixture", status: "running", mode: "workspace", permissionMode: "ask" } } },
+      { method: "turn/started", params: { turn: { turnId: "turn_fixture", threadId: "thr_fixture", status: "running", accessMode: "workspace" } } },
       { method: "item/started", params: { item: { itemId: "item_fixture", turnId: "turn_fixture", kind: "agent_message", status: "in_progress", text: "" } } },
       { method: "item/delta", params: { itemId: "item_fixture", delta: "hello" } },
       { method: "item/completed", params: { item: { itemId: "item_fixture", turnId: "turn_fixture", kind: "agent_message", status: "completed", text: "hello" } } },
-      { method: "turn/completed", params: { turn: { turnId: "turn_fixture", threadId: "thr_fixture", status: "completed", mode: "workspace", permissionMode: "ask" }, terminalStatus: "completed" } },
+      { method: "turn/completed", params: { turn: { turnId: "turn_fixture", threadId: "thr_fixture", status: "completed", accessMode: "workspace" }, terminalStatus: "completed" } },
     ];
     frames.forEach((frame, index) => {
       const event = parseRuntimeHostEvent({ jsonrpc: "2.0", ...frame, params: { serverInstanceId: "srv_fixture", threadId: "thr_fixture", seq: index + 1, eventId: `evt_fixture${index + 1}`, occurredAt: `2026-08-16T00:00:0${index + 1}Z`, ...frame.params } });
@@ -285,7 +284,7 @@ describe("ConnectionProvider RuntimeHost lifecycle", () => {
         seq: 1,
         eventId: "evt_completed",
         occurredAt: "2026-08-16T00:00:01Z",
-        turn: { turnId: "turn_fixture", threadId: "thr_fixture", status: "completed", mode: "workspace", permissionMode: "ask" },
+        turn: { turnId: "turn_fixture", threadId: "thr_fixture", status: "completed", accessMode: "workspace" },
         terminalStatus: "completed",
       },
     });

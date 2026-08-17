@@ -240,13 +240,13 @@ class StdioRuntimeChildIntegrationTest {
                 "\"clientVersion\":\"child-test\",\"capabilities\":{" +
                 "\"methods\":[\"initialize\",\"turn/start\",\"shutdown\"]," +
                 "\"events\":[\"runtime/statusChanged\",\"turn/started\",\"item/started\",\"item/delta\",\"item/completed\",\"turn/completed\"]," +
-                "\"permissionModes\":[\"plan\",\"workspace\",\"full_access\"]," +
+                "\"accessModes\":[\"read_only\",\"workspace\",\"full_access\"]," +
                 "\"itemKinds\":[\"agent_message\"],\"mcp\":{" +
                 "\"protocolVersions\":[],\"transports\":[],\"features\":[]}}," +
                 "\"limits\":{" +
                 "\"maxFrameBytes\":4194304,\"maxInboundQueueFrames\":256,\"maxOutboundQueueFrames\":1024," +
                 "\"maxInFlightRequests\":64,\"maxPendingRequests\":64,\"maxItemDeltaBytes\":65536," +
-                "\"maxInlineToolOutputBytes\":1048576,\"maxArtifactBytes\":268435456,\"maxLogBytes\":1048576," +
+                "\"maxInlineToolOutputBytes\":1048576,\"maxLogBytes\":1048576," +
                 "\"defaultRequestDeadlineMs\":120000,\"defaultApprovalDeadlineMs\":300000}}}";
     }
 
@@ -276,7 +276,7 @@ class StdioRuntimeChildIntegrationTest {
         return "{\"jsonrpc\":\"2.0\",\"id\":\"c:turn\",\"method\":\"turn/start\",\"params\":{" +
                 "\"threadId\":" + JSON.writeValueAsString(threadId) +
                 ",\"input\":[{\"type\":\"text\",\"text\":" + JSON.writeValueAsString(text) + "}]," +
-                "\"mode\":\"workspace\",\"permissionMode\":\"ask\",\"profileRevision\":\"profile_child\"}}";
+                "\"accessMode\":\"workspace\",\"profileRevision\":\"profile_child\"}}";
     }
 
     /** Writes one complete LF frame and flushes so the child reader can progress immediately. */

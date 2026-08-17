@@ -55,16 +55,6 @@
       "pattern": "^appr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
       "maxLength": 101
     },
-    "artifactId": {
-      "type": "string",
-      "pattern": "^artifact_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
-      "maxLength": 105
-    },
-    "attachmentId": {
-      "type": "string",
-      "pattern": "^att_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
-      "maxLength": 99
-    },
     "profileRevision": {
       "type": "string",
       "pattern": "^profile_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
@@ -119,7 +109,6 @@
         "maxPendingRequests",
         "maxItemDeltaBytes",
         "maxInlineToolOutputBytes",
-        "maxArtifactBytes",
         "maxLogBytes",
         "defaultRequestDeadlineMs",
         "defaultApprovalDeadlineMs"
@@ -132,7 +121,6 @@
         "maxPendingRequests": { "type": "integer", "minimum": 1, "maximum": 1024 },
         "maxItemDeltaBytes": { "type": "integer", "minimum": 256, "maximum": 1048576 },
         "maxInlineToolOutputBytes": { "type": "integer", "minimum": 1024, "maximum": 16777216 },
-        "maxArtifactBytes": { "type": "integer", "minimum": 1048576, "maximum": 1073741824 },
         "maxLogBytes": { "type": "integer", "minimum": 4096, "maximum": 67108864 },
         "defaultRequestDeadlineMs": { "type": "integer", "minimum": 1000, "maximum": 3600000 },
         "defaultApprovalDeadlineMs": { "type": "integer", "minimum": 1000, "maximum": 3600000 }
@@ -141,11 +129,11 @@
     },
     "capabilities": {
       "type": "object",
-      "required": ["methods", "events", "permissionModes", "itemKinds", "mcp"],
+      "required": ["methods", "events", "accessModes", "itemKinds", "mcp"],
       "properties": {
         "methods": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 128 }, "maxItems": 256, "uniqueItems": true },
         "events": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 128 }, "maxItems": 256, "uniqueItems": true },
-        "permissionModes": { "type": "array", "items": { "enum": ["plan", "workspace", "full_access"] }, "maxItems": 3, "uniqueItems": true },
+        "accessModes": { "type": "array", "items": { "enum": ["read_only", "workspace", "full_access"] }, "maxItems": 3, "uniqueItems": true },
         "itemKinds": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 64 }, "maxItems": 64, "uniqueItems": true },
         "mcp": {
           "type": "object",
@@ -203,8 +191,7 @@
         "minimumCompatibleMinor": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
         "clientVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
         "capabilities": { "$ref": "#/$defs/capabilities" },
-        "limits": { "$ref": "#/$defs/limits" },
-        "workspacePolicy": { "$ref": "#/$defs/workspacePolicy" }
+        "limits": { "$ref": "#/$defs/limits" }
       },
       "additionalProperties": true
     },
@@ -302,14 +289,12 @@
     },
     "turnStartParams": {
       "type": "object",
-      "required": ["threadId", "input", "mode", "permissionMode", "profileRevision"],
+      "required": ["threadId", "input", "accessMode", "profileRevision"],
       "properties": {
         "threadId": { "$ref": "#/$defs/threadId" },
         "input": { "type": "array", "items": { "$ref": "#/$defs/inputPart" }, "minItems": 1, "maxItems": 128 },
-        "mode": { "enum": ["plan", "workspace", "full_access"] },
-        "permissionMode": { "enum": ["allow", "ask", "deny"] },
+        "accessMode": { "enum": ["read_only", "workspace", "full_access"] },
         "profileRevision": { "$ref": "#/$defs/profileRevision" },
-        "attachmentIds": { "type": "array", "items": { "$ref": "#/$defs/attachmentId" }, "maxItems": 64, "uniqueItems": true },
         "clientRequestKey": { "type": "string", "minLength": 1, "maxLength": 128 }
       },
       "additionalProperties": true
@@ -318,12 +303,6 @@
       "type": "object",
       "required": ["threadId", "turnId"],
       "properties": { "threadId": { "$ref": "#/$defs/threadId" }, "turnId": { "$ref": "#/$defs/turnId" }, "reason": { "type": "string", "maxLength": 512 } },
-      "additionalProperties": true
-    },
-    "turnInputParams": {
-      "type": "object",
-      "required": ["threadId", "input"],
-      "properties": { "threadId": { "$ref": "#/$defs/threadId" }, "turnId": { "$ref": "#/$defs/turnId" }, "input": { "type": "array", "items": { "$ref": "#/$defs/inputPart" }, "minItems": 1, "maxItems": 128 } },
       "additionalProperties": true
     },
     "profileRevisionParams": {
@@ -379,21 +358,9 @@
       "properties": { "mcpRevision": { "$ref": "#/$defs/mcpRevision" }, "toolName": { "type": "string", "minLength": 1, "maxLength": 256 }, "policy": { "enum": ["allow", "ask", "deny"] } },
       "additionalProperties": true
     },
-    "attachmentImportParams": {
-      "type": "object",
-      "required": ["sourceToken", "fileName", "mimeType", "sizeBytes", "sha256"],
-      "properties": { "sourceToken": { "type": "string", "pattern": "^pick_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 100 }, "fileName": { "type": "string", "minLength": 1, "maxLength": 512 }, "mimeType": { "type": "string", "minLength": 1, "maxLength": 128 }, "sizeBytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 }, "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" } },
-      "additionalProperties": true
-    },
-    "attachmentIdParams": {
-      "type": "object",
-      "required": ["attachmentId"],
-      "properties": { "attachmentId": { "$ref": "#/$defs/attachmentId" } },
-      "additionalProperties": true
-    },
     "approvalRequestParams": {
       "type": "object",
-      "required": ["approvalId", "threadId", "turnId", "itemId", "action", "risk", "policySource", "expiresAt"],
+      "required": ["approvalId", "threadId", "turnId", "itemId", "action", "risk", "accessMode", "expiresAt"],
       "properties": {
         "approvalId": { "$ref": "#/$defs/approvalId" },
         "threadId": { "$ref": "#/$defs/threadId" },
@@ -401,8 +368,7 @@
         "itemId": { "$ref": "#/$defs/itemId" },
         "action": { "$ref": "#/$defs/action" },
         "risk": { "enum": ["low", "medium", "high", "critical"] },
-        "policySource": { "type": "string", "minLength": 1, "maxLength": 256 },
-        "scopeOptions": { "type": "array", "items": { "enum": ["once", "thread", "workspace"] }, "maxItems": 3, "uniqueItems": true },
+        "accessMode": { "enum": ["read_only", "workspace", "full_access"] },
         "expiresAt": { "$ref": "#/$defs/timestamp" },
         "reason": { "type": "string", "maxLength": 2048 }
       },
@@ -442,8 +408,6 @@
         { "$ref": "#/$defs/threadPurgeRequest" },
         { "$ref": "#/$defs/turnStartRequest" },
         { "$ref": "#/$defs/turnCancelRequest" },
-        { "$ref": "#/$defs/turnSteerRequest" },
-        { "$ref": "#/$defs/turnFollowUpRequest" },
         { "$ref": "#/$defs/profileListRequest" },
         { "$ref": "#/$defs/profileReadRequest" },
         { "$ref": "#/$defs/profileSaveRequest" },
@@ -461,10 +425,7 @@
         { "$ref": "#/$defs/mcpTestRequest" },
         { "$ref": "#/$defs/mcpReloadRequest" },
         { "$ref": "#/$defs/mcpToolsReadRequest" },
-        { "$ref": "#/$defs/mcpToolPolicySetRequest" },
-        { "$ref": "#/$defs/attachmentImportRequest" },
-        { "$ref": "#/$defs/attachmentReadRequest" },
-        { "$ref": "#/$defs/attachmentDeleteRequest" }
+        { "$ref": "#/$defs/mcpToolPolicySetRequest" }
       ]
     },
     "serverRequest": {
@@ -494,8 +455,6 @@
     "threadPurgeRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "thread/purge" }, "params": { "$ref": "#/$defs/threadIdParams" } }, "required": ["method", "params"] } ] },
     "turnStartRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "turn/start" }, "params": { "$ref": "#/$defs/turnStartParams" } }, "required": ["method", "params"] } ] },
     "turnCancelRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "turn/cancel" }, "params": { "$ref": "#/$defs/turnControlParams" } }, "required": ["method", "params"] } ] },
-    "turnSteerRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "turn/steer" }, "params": { "$ref": "#/$defs/turnInputParams" } }, "required": ["method", "params"] } ] },
-    "turnFollowUpRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "turn/followUp" }, "params": { "$ref": "#/$defs/turnInputParams" } }, "required": ["method", "params"] } ] },
     "profileListRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "profile/list" }, "params": { "$ref": "#/$defs/emptyParams" } }, "required": ["method", "params"] } ] },
     "profileReadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "profile/read" }, "params": { "$ref": "#/$defs/profileRevisionParams" } }, "required": ["method", "params"] } ] },
     "profileSaveRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "profile/save" }, "params": { "$ref": "#/$defs/profileSaveParams" } }, "required": ["method", "params"] } ] },
@@ -514,9 +473,6 @@
     "mcpReloadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "mcp/reload" }, "params": { "$ref": "#/$defs/mcpIdParams" } }, "required": ["method", "params"] } ] },
     "mcpToolsReadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "mcp/tools/read" }, "params": { "$ref": "#/$defs/mcpIdParams" } }, "required": ["method", "params"] } ] },
     "mcpToolPolicySetRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "mcp/toolPolicy/set" }, "params": { "$ref": "#/$defs/mcpToolPolicyParams" } }, "required": ["method", "params"] } ] },
-    "attachmentImportRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "attachment/import" }, "params": { "$ref": "#/$defs/attachmentImportParams" } }, "required": ["method", "params"] } ] },
-    "attachmentReadRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "attachment/read" }, "params": { "$ref": "#/$defs/attachmentIdParams" } }, "required": ["method", "params"] } ] },
-    "attachmentDeleteRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseClient" }, { "type": "object", "properties": { "method": { "const": "attachment/delete" }, "params": { "$ref": "#/$defs/attachmentIdParams" } }, "required": ["method", "params"] } ] },
     "approvalRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseServer" }, { "type": "object", "properties": { "method": { "const": "approval/request" }, "params": { "$ref": "#/$defs/approvalRequestParams" } }, "required": ["method", "params"] } ] },
     "secretResolveRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseServer" }, { "type": "object", "properties": { "method": { "const": "secret/resolve" }, "params": { "$ref": "#/$defs/secretResolveParams" } }, "required": ["method", "params"] } ] },
     "externalToolRequest": { "allOf": [ { "$ref": "#/$defs/requestBaseServer" }, { "type": "object", "properties": { "method": { "const": "externalTool/request" }, "params": { "$ref": "#/$defs/externalToolRequestParams" } }, "required": ["method", "params"] } ] },
@@ -620,22 +576,16 @@
     "runtimeStatusChangedNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "runtime/statusChanged" }, "params": { "allOf": [ { "$ref": "#/$defs/runtimeEventBase" }, { "$ref": "#/$defs/runtimeStatusParams" } ] } }, "required": ["method", "params"] } ] },
     "runtimeNoticeNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "runtime/notice" }, "params": { "allOf": [ { "$ref": "#/$defs/runtimeEventBase" }, { "$ref": "#/$defs/runtimeNoticeParams" } ] } }, "required": ["method", "params"] } ] },
     "runtimeOverloadNotification": { "allOf": [ { "$ref": "#/$defs/notificationBase" }, { "type": "object", "properties": { "method": { "const": "runtime/overload" }, "params": { "allOf": [ { "$ref": "#/$defs/runtimeEventBase" }, { "$ref": "#/$defs/runtimeOverloadParams" } ] } }, "required": ["method", "params"] } ] },
-    "workspacePolicy": {
-      "type": "object",
-      "required": ["mode", "network", "enforcement"],
-      "properties": { "mode": { "enum": ["plan", "workspace", "full_access"] }, "network": { "enum": ["disabled", "restricted", "enabled"] }, "enforcement": { "enum": ["os_enforced", "partial", "unavailable"] }, "protectedRoots": { "type": "array", "items": { "type": "string", "maxLength": 4096 }, "maxItems": 32 } },
-      "additionalProperties": true
-    },
     "inputPart": {
       "type": "object",
       "required": ["type"],
-      "properties": { "type": { "enum": ["text", "attachment"] }, "text": { "type": "string", "maxLength": 1048576 }, "attachmentId": { "$ref": "#/$defs/attachmentId" } },
+      "properties": { "type": { "const": "text" }, "text": { "type": "string", "maxLength": 1048576 } },
       "additionalProperties": true
     },
     "action": {
       "type": "object",
-      "required": ["kind", "fingerprint"],
-      "properties": { "kind": { "enum": ["file_read", "file_write", "file_delete", "shell", "mcp_tool", "external_tool", "network" ] }, "fingerprint": { "type": "string", "pattern": "^act_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", "maxLength": 100 }, "command": { "type": "string", "maxLength": 4096 }, "relativePaths": { "type": "array", "items": { "type": "string", "maxLength": 4096 }, "maxItems": 128 }, "networkTargets": { "type": "array", "items": { "type": "string", "maxLength": 2048 }, "maxItems": 64 } },
+      "required": ["kind"],
+      "properties": { "kind": { "enum": ["file_read", "file_write", "file_delete", "shell", "mcp_tool", "external_tool" ] }, "command": { "type": "string", "maxLength": 4096 }, "cwd": { "type": "string", "maxLength": 4096 }, "relativePaths": { "type": "array", "items": { "type": "string", "maxLength": 4096 }, "maxItems": 128 } },
       "additionalProperties": true
     },
     "workspace": {
@@ -647,31 +597,25 @@
     "thread": {
       "type": "object",
       "required": ["threadId", "workspaceId", "title", "status", "lastSeq"],
-      "properties": { "threadId": { "$ref": "#/$defs/threadId" }, "workspaceId": { "$ref": "#/$defs/workspaceId" }, "title": { "type": "string", "maxLength": 512 }, "status": { "enum": ["idle", "running", "waiting_approval", "recovery_required", "archived"] }, "lastSeq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "activeTurnId": { "$ref": "#/$defs/turnId" } },
+      "properties": { "threadId": { "$ref": "#/$defs/threadId" }, "workspaceId": { "$ref": "#/$defs/workspaceId" }, "title": { "type": "string", "maxLength": 512 }, "status": { "enum": ["idle", "running", "waiting_approval", "archived"] }, "lastSeq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "activeTurnId": { "$ref": "#/$defs/turnId" } },
       "additionalProperties": true
     },
     "turn": {
       "type": "object",
-      "required": ["turnId", "threadId", "status", "mode", "permissionMode"],
-      "properties": { "turnId": { "$ref": "#/$defs/turnId" }, "threadId": { "$ref": "#/$defs/threadId" }, "status": { "enum": ["queued", "waiting_workspace", "running", "waiting_approval", "interrupting", "completed", "interrupted", "failed", "aborted_by_runtime", "recovery_required"] }, "mode": { "enum": ["plan", "workspace", "full_access"] }, "permissionMode": { "enum": ["allow", "ask", "deny"] }, "startedAt": { "$ref": "#/$defs/timestamp" }, "completedAt": { "$ref": "#/$defs/timestamp" }, "error": { "$ref": "#/$defs/error" } },
+      "required": ["turnId", "threadId", "status", "accessMode"],
+      "properties": { "turnId": { "$ref": "#/$defs/turnId" }, "threadId": { "$ref": "#/$defs/threadId" }, "status": { "enum": ["queued", "running", "waiting_approval", "interrupting", "completed", "interrupted", "failed", "aborted_by_runtime"] }, "accessMode": { "enum": ["read_only", "workspace", "full_access"] }, "startedAt": { "$ref": "#/$defs/timestamp" }, "completedAt": { "$ref": "#/$defs/timestamp" }, "error": { "$ref": "#/$defs/error" } },
       "additionalProperties": true
     },
     "item": {
       "type": "object",
       "required": ["itemId", "turnId", "kind", "status"],
-      "properties": { "itemId": { "$ref": "#/$defs/itemId" }, "turnId": { "$ref": "#/$defs/turnId" }, "kind": { "enum": ["user_message", "agent_message", "commentary", "reasoning_summary", "plan", "tool_call", "command", "file_change", "approval", "subagent", "context_compaction", "runtime_notice" ] }, "status": { "enum": ["started", "in_progress", "completed", "failed", "cancelled"] }, "title": { "type": "string", "maxLength": 512 }, "text": { "type": "string", "maxLength": 1048576 }, "artifact": { "$ref": "#/$defs/artifact" }, "metadata": { "type": "object", "additionalProperties": true } },
-      "additionalProperties": true
-    },
-    "artifact": {
-      "type": "object",
-      "required": ["artifactId", "sizeBytes", "sha256", "mediaType"],
-      "properties": { "artifactId": { "$ref": "#/$defs/artifactId" }, "sizeBytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 }, "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" }, "mediaType": { "type": "string", "minLength": 1, "maxLength": 128 }, "displayName": { "type": "string", "maxLength": 512 } },
+      "properties": { "itemId": { "$ref": "#/$defs/itemId" }, "turnId": { "$ref": "#/$defs/turnId" }, "kind": { "enum": ["user_message", "agent_message", "commentary", "tool_call", "command", "file_change", "approval" ] }, "status": { "enum": ["started", "in_progress", "completed", "failed", "cancelled"] }, "title": { "type": "string", "maxLength": 512 }, "text": { "type": "string", "maxLength": 1048576 }, "metadata": { "type": "object", "additionalProperties": true } },
       "additionalProperties": true
     },
     "profile": {
       "type": "object",
-      "required": ["profileRevision", "name", "model", "mode"],
-      "properties": { "profileRevision": { "$ref": "#/$defs/profileRevision" }, "name": { "type": "string", "minLength": 1, "maxLength": 256 }, "model": { "$ref": "#/$defs/modelProfile" }, "mode": { "enum": ["plan", "workspace", "full_access"] }, "skillRevisions": { "type": "array", "items": { "$ref": "#/$defs/skillRevision" }, "maxItems": 128, "uniqueItems": true }, "mcpRevisions": { "type": "array", "items": { "$ref": "#/$defs/mcpRevision" }, "maxItems": 128, "uniqueItems": true } },
+      "required": ["profileRevision", "name", "model", "accessMode"],
+      "properties": { "profileRevision": { "$ref": "#/$defs/profileRevision" }, "name": { "type": "string", "minLength": 1, "maxLength": 256 }, "model": { "$ref": "#/$defs/modelProfile" }, "accessMode": { "enum": ["read_only", "workspace", "full_access"] }, "skillRevisions": { "type": "array", "items": { "$ref": "#/$defs/skillRevision" }, "maxItems": 128, "uniqueItems": true }, "mcpRevisions": { "type": "array", "items": { "$ref": "#/$defs/mcpRevision" }, "maxItems": 128, "uniqueItems": true } },
       "additionalProperties": true
     },
     "modelProfile": {
@@ -695,7 +639,7 @@
     "turnCompletedParams": {
       "type": "object",
       "required": ["turn", "terminalStatus"],
-      "properties": { "turn": { "$ref": "#/$defs/turn" }, "terminalStatus": { "enum": ["completed", "interrupted", "failed", "aborted_by_runtime", "recovery_required"] } },
+      "properties": { "turn": { "$ref": "#/$defs/turn" }, "terminalStatus": { "enum": ["completed", "interrupted", "failed", "aborted_by_runtime"] } },
       "additionalProperties": true
     },
     "threadChangedParams": {
@@ -725,13 +669,13 @@
     "approvalResolvedParams": {
       "type": "object",
       "required": ["approvalId", "decision", "resolvedAt"],
-      "properties": { "approvalId": { "$ref": "#/$defs/approvalId" }, "decision": { "enum": ["allow_once", "allow_scope", "deny", "expired", "disconnected"] }, "scope": { "enum": ["once", "thread", "workspace"] }, "resolvedAt": { "$ref": "#/$defs/timestamp" } },
+      "properties": { "approvalId": { "$ref": "#/$defs/approvalId" }, "decision": { "enum": ["allow_once", "allow_session", "deny", "expired", "disconnected"] }, "resolvedAt": { "$ref": "#/$defs/timestamp" } },
       "additionalProperties": true
     },
     "approvalSummary": {
       "type": "object",
-      "required": ["approvalId", "threadId", "turnId", "itemId", "action", "risk", "expiresAt"],
-      "properties": { "approvalId": { "$ref": "#/$defs/approvalId" }, "threadId": { "$ref": "#/$defs/threadId" }, "turnId": { "$ref": "#/$defs/turnId" }, "itemId": { "$ref": "#/$defs/itemId" }, "action": { "$ref": "#/$defs/action" }, "risk": { "enum": ["low", "medium", "high", "critical"] }, "expiresAt": { "$ref": "#/$defs/timestamp" } },
+      "required": ["approvalId", "threadId", "turnId", "itemId", "action", "risk", "accessMode", "expiresAt"],
+      "properties": { "approvalId": { "$ref": "#/$defs/approvalId" }, "threadId": { "$ref": "#/$defs/threadId" }, "turnId": { "$ref": "#/$defs/turnId" }, "itemId": { "$ref": "#/$defs/itemId" }, "action": { "$ref": "#/$defs/action" }, "risk": { "enum": ["low", "medium", "high", "critical"] }, "accessMode": { "enum": ["read_only", "workspace", "full_access"] }, "expiresAt": { "$ref": "#/$defs/timestamp" } },
       "additionalProperties": true
     },
     "externalToolEventParams": {
@@ -773,7 +717,7 @@
     "runtimeOverloadParams": {
       "type": "object",
       "required": ["queue", "retryable"],
-      "properties": { "queue": { "enum": ["inbound", "outbound", "pending", "artifact", "tool_output" ] }, "retryable": { "type": "boolean" }, "retryAfterMs": { "type": "integer", "minimum": 1, "maximum": 3600000 } },
+      "properties": { "queue": { "enum": ["inbound", "outbound", "pending", "tool_output" ] }, "retryable": { "type": "boolean" }, "retryAfterMs": { "type": "integer", "minimum": 1, "maximum": 3600000 } },
       "additionalProperties": true
     },
     "acceptedResult": {
@@ -785,7 +729,7 @@
     "initializeResult": {
       "type": "object",
       "required": ["protocolMajor", "protocolMinor", "serverVersion", "serverInstanceId", "capabilities", "limits"],
-      "properties": { "protocolMajor": { "const": 1 }, "protocolMinor": { "type": "integer", "minimum": 0 }, "serverVersion": { "type": "string", "minLength": 1, "maxLength": 128 }, "serverInstanceId": { "$ref": "#/$defs/serverInstanceId" }, "runtime": { "type": "object", "additionalProperties": true }, "capabilities": { "$ref": "#/$defs/capabilities" }, "limits": { "$ref": "#/$defs/limits" }, "workspacePolicy": { "$ref": "#/$defs/workspacePolicy" } },
+      "properties": { "protocolMajor": { "const": 1 }, "protocolMinor": { "type": "integer", "minimum": 0 }, "serverVersion": { "type": "string", "minLength": 1, "maxLength": 128 }, "serverInstanceId": { "$ref": "#/$defs/serverInstanceId" }, "runtime": { "type": "object", "additionalProperties": true }, "capabilities": { "$ref": "#/$defs/capabilities" } },
       "additionalProperties": true
     },
     "versionResult": {
@@ -809,7 +753,7 @@
     "diagnosticsResult": {
       "type": "object",
       "required": ["status"],
-      "properties": { "status": { "enum": ["available", "degraded", "unavailable"] }, "report": { "type": "object", "additionalProperties": true }, "artifact": { "$ref": "#/$defs/artifact" } },
+      "properties": { "status": { "enum": ["available", "degraded", "unavailable"] }, "report": { "type": "object", "additionalProperties": true } },
       "additionalProperties": true
     },
     "shutdownResult": {
@@ -884,14 +828,8 @@
     "turnCancelResult": {
       "type": "object",
       "required": ["accepted", "turnId", "status"],
-      "properties": { "accepted": { "type": "boolean" }, "turnId": { "$ref": "#/$defs/turnId" }, "status": { "enum": ["interrupting", "interrupted", "recovery_required"] } },
+      "properties": { "accepted": { "type": "boolean" }, "turnId": { "$ref": "#/$defs/turnId" }, "status": { "enum": ["interrupting", "interrupted"] } },
       "additionalProperties": true
-    },
-    "turnSteerResult": {
-      "allOf": [ { "$ref": "#/$defs/turnStartResult" }, { "type": "object", "required": ["turnId"] } ]
-    },
-    "turnFollowUpResult": {
-      "allOf": [ { "$ref": "#/$defs/turnStartResult" }, { "type": "object", "required": ["turnId"] } ]
     },
     "profileListResult": {
       "type": "object",
@@ -1010,34 +948,10 @@
       "properties": { "mcpRevision": { "$ref": "#/$defs/mcpRevision" }, "toolName": { "type": "string", "minLength": 1, "maxLength": 256 }, "policy": { "enum": ["allow", "ask", "deny"] } },
       "additionalProperties": true
     },
-    "attachment": {
-      "type": "object",
-      "required": ["attachmentId", "fileName", "mimeType", "sizeBytes", "sha256", "artifact"],
-      "properties": { "attachmentId": { "$ref": "#/$defs/attachmentId" }, "fileName": { "type": "string", "minLength": 1, "maxLength": 512 }, "mimeType": { "type": "string", "minLength": 1, "maxLength": 128 }, "sizeBytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 }, "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" }, "artifact": { "$ref": "#/$defs/artifact" } },
-      "additionalProperties": true
-    },
-    "attachmentImportResult": {
-      "type": "object",
-      "required": ["attachment"],
-      "properties": { "attachment": { "$ref": "#/$defs/attachment" } },
-      "additionalProperties": true
-    },
-    "attachmentReadResult": {
-      "type": "object",
-      "required": ["attachment"],
-      "properties": { "attachment": { "$ref": "#/$defs/attachment" } },
-      "additionalProperties": true
-    },
-    "attachmentDeleteResult": {
-      "type": "object",
-      "required": ["accepted", "attachmentId"],
-      "properties": { "accepted": { "type": "boolean" }, "attachmentId": { "$ref": "#/$defs/attachmentId" } },
-      "additionalProperties": true
-    },
     "approvalResponseResult": {
       "type": "object",
       "required": ["decision", "resolvedAt"],
-      "properties": { "decision": { "enum": ["allow_once", "allow_scope", "deny", "expired", "disconnected"] }, "scope": { "enum": ["once", "thread", "workspace"] }, "resolvedAt": { "$ref": "#/$defs/timestamp" } },
+      "properties": { "decision": { "enum": ["allow_once", "allow_session", "deny", "expired", "disconnected"] }, "resolvedAt": { "$ref": "#/$defs/timestamp" } },
       "additionalProperties": true
     },
     "secretResolveResult": {
@@ -1049,7 +963,7 @@
     "externalToolResponseResult": {
       "type": "object",
       "required": ["accepted", "status"],
-      "properties": { "accepted": { "type": "boolean" }, "status": { "enum": ["accepted", "completed", "failed", "cancelled"] }, "output": { "type": "object", "additionalProperties": true }, "artifact": { "$ref": "#/$defs/artifact" } },
+      "properties": { "accepted": { "type": "boolean" }, "status": { "enum": ["accepted", "completed", "failed", "cancelled"] }, "output": { "type": "object", "additionalProperties": true } },
       "additionalProperties": true
     }
   }

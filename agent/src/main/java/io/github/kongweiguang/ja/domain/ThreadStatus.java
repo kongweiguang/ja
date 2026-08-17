@@ -8,6 +8,5 @@ public enum ThreadStatus {
     IDLE,
     RUNNING,
     WAITING_APPROVAL,
-    RECOVERY_REQUIRED,
     ARCHIVED
 }

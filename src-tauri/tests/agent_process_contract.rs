@@ -1974,7 +1974,7 @@ fn real_child_invalid_ready_tokens_return_handshake_failed() {
         let script = r#"
 param([string]$Mode)
 $ErrorActionPreference = 'Stop'
-$init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"minimumCompatibleMinor":0,"serverVersion":"fixture-1","serverInstanceId":"srv_fixture","runtime":{"kind":"native-image","agentScopeVersion":"1","javaVersion":"25"},"capabilities":{"methods":[],"events":[],"permissionModes":["plan","workspace","full_access"],"itemKinds":[],"mcp":{"protocolVersions":[],"transports":[],"features":[]}},"limits":{"maxFrameBytes":4194304,"maxInboundQueueFrames":256,"maxOutboundQueueFrames":1024,"maxInFlightRequests":64,"maxPendingRequests":64,"maxItemDeltaBytes":65536,"maxInlineToolOutputBytes":1048576,"maxArtifactBytes":268435456,"maxLogBytes":1048576,"defaultRequestDeadlineMs":120000,"defaultApprovalDeadlineMs":300000}}}'
+$init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"minimumCompatibleMinor":0,"serverVersion":"fixture-1","serverInstanceId":"srv_fixture","runtime":{"kind":"native-image","agentScopeVersion":"1","javaVersion":"25"},"capabilities":{"methods":[],"events":[],"accessModes":["read_only","workspace","full_access"],"itemKinds":[],"mcp":{"protocolVersions":[],"transports":[],"features":[]}},"limits":{"maxFrameBytes":4194304,"maxInboundQueueFrames":256,"maxOutboundQueueFrames":1024,"maxInFlightRequests":64,"maxPendingRequests":64,"maxItemDeltaBytes":65536,"maxInlineToolOutputBytes":1048576,"maxLogBytes":1048576,"defaultRequestDeadlineMs":120000,"defaultApprovalDeadlineMs":300000}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + [char]10)
     $stdout = [Console]::OpenStandardOutput()
@@ -2065,7 +2065,7 @@ fn real_child_shutdown_retries_retained_owner_after_reap_timeout() {
     let script_path = fixture_dir.path.join("retry-shutdown.ps1");
     let script = r#"
 $ErrorActionPreference = 'Stop'
-$init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"minimumCompatibleMinor":0,"serverVersion":"fixture-1","serverInstanceId":"srv_fixture","runtime":{"kind":"native-image","agentScopeVersion":"1","javaVersion":"25"},"capabilities":{"methods":[],"events":[],"permissionModes":["plan","workspace","full_access"],"itemKinds":[],"mcp":{"protocolVersions":[],"transports":[],"features":[]}},"limits":{"maxFrameBytes":4194304,"maxInboundQueueFrames":256,"maxOutboundQueueFrames":1024,"maxInFlightRequests":64,"maxPendingRequests":64,"maxItemDeltaBytes":65536,"maxInlineToolOutputBytes":1048576,"maxArtifactBytes":268435456,"maxLogBytes":1048576,"defaultRequestDeadlineMs":120000,"defaultApprovalDeadlineMs":300000}}}'
+$init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"minimumCompatibleMinor":0,"serverVersion":"fixture-1","serverInstanceId":"srv_fixture","runtime":{"kind":"native-image","agentScopeVersion":"1","javaVersion":"25"},"capabilities":{"methods":[],"events":[],"accessModes":["read_only","workspace","full_access"],"itemKinds":[],"mcp":{"protocolVersions":[],"transports":[],"features":[]}},"limits":{"maxFrameBytes":4194304,"maxInboundQueueFrames":256,"maxOutboundQueueFrames":1024,"maxInFlightRequests":64,"maxPendingRequests":64,"maxItemDeltaBytes":65536,"maxInlineToolOutputBytes":1048576,"maxLogBytes":1048576,"defaultRequestDeadlineMs":120000,"defaultApprovalDeadlineMs":300000}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + [char]10)
     $stdout = [Console]::OpenStandardOutput()
@@ -2183,7 +2183,7 @@ fn real_child_handshake_concurrency_and_job_cleanup() {
     let script = r#"
 param([string]$PidPath)
 $ErrorActionPreference = 'Stop'
-$init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"minimumCompatibleMinor":0,"serverVersion":"fixture-1","serverInstanceId":"srv_fixture","runtime":{"kind":"native-image","agentScopeVersion":"1","javaVersion":"25"},"capabilities":{"methods":[],"events":[],"permissionModes":["plan","workspace","full_access"],"itemKinds":[],"mcp":{"protocolVersions":[],"transports":[],"features":[]}},"limits":{"maxFrameBytes":4194304,"maxInboundQueueFrames":256,"maxOutboundQueueFrames":1024,"maxInFlightRequests":64,"maxPendingRequests":64,"maxItemDeltaBytes":65536,"maxInlineToolOutputBytes":1048576,"maxArtifactBytes":268435456,"maxLogBytes":1048576,"defaultRequestDeadlineMs":120000,"defaultApprovalDeadlineMs":300000}}}'
+$init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"minimumCompatibleMinor":0,"serverVersion":"fixture-1","serverInstanceId":"srv_fixture","runtime":{"kind":"native-image","agentScopeVersion":"1","javaVersion":"25"},"capabilities":{"methods":[],"events":[],"accessModes":["read_only","workspace","full_access"],"itemKinds":[],"mcp":{"protocolVersions":[],"transports":[],"features":[]}},"limits":{"maxFrameBytes":4194304,"maxInboundQueueFrames":256,"maxOutboundQueueFrames":1024,"maxInFlightRequests":64,"maxPendingRequests":64,"maxItemDeltaBytes":65536,"maxInlineToolOutputBytes":1048576,"maxLogBytes":1048576,"defaultRequestDeadlineMs":120000,"defaultApprovalDeadlineMs":300000}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + "`n")
     $stdout = [Console]::OpenStandardOutput()
@@ -2348,7 +2348,7 @@ fn real_child_stdout_eof_kills_tree_without_event_consumer() {
     let script = r#"
 param([string]$PidPath)
 $ErrorActionPreference = 'Stop'
-$init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"minimumCompatibleMinor":0,"serverVersion":"fixture-1","serverInstanceId":"srv_fixture","runtime":{"kind":"native-image","agentScopeVersion":"1","javaVersion":"25"},"capabilities":{"methods":[],"events":[],"permissionModes":["plan","workspace","full_access"],"itemKinds":[],"mcp":{"protocolVersions":[],"transports":[],"features":[]}},"limits":{"maxFrameBytes":4194304,"maxInboundQueueFrames":256,"maxOutboundQueueFrames":1024,"maxInFlightRequests":64,"maxPendingRequests":64,"maxItemDeltaBytes":65536,"maxInlineToolOutputBytes":1048576,"maxArtifactBytes":268435456,"maxLogBytes":1048576,"defaultRequestDeadlineMs":120000,"defaultApprovalDeadlineMs":300000}}}'
+$init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"minimumCompatibleMinor":0,"serverVersion":"fixture-1","serverInstanceId":"srv_fixture","runtime":{"kind":"native-image","agentScopeVersion":"1","javaVersion":"25"},"capabilities":{"methods":[],"events":[],"accessModes":["read_only","workspace","full_access"],"itemKinds":[],"mcp":{"protocolVersions":[],"transports":[],"features":[]}},"limits":{"maxFrameBytes":4194304,"maxInboundQueueFrames":256,"maxOutboundQueueFrames":1024,"maxInFlightRequests":64,"maxPendingRequests":64,"maxItemDeltaBytes":65536,"maxInlineToolOutputBytes":1048576,"maxLogBytes":1048576,"defaultRequestDeadlineMs":120000,"defaultApprovalDeadlineMs":300000}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + "`n")
     $stdout = [Console]::OpenStandardOutput()
@@ -2447,7 +2447,7 @@ fn real_child_blocked_stdin_watchdog_joins_and_reaps_tree() {
     let script = r#"
 param([string]$PidPath)
 $ErrorActionPreference = 'Stop'
-$init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"minimumCompatibleMinor":0,"serverVersion":"fixture-1","serverInstanceId":"srv_fixture","runtime":{"kind":"native-image","agentScopeVersion":"1","javaVersion":"25"},"capabilities":{"methods":[],"events":[],"permissionModes":["plan","workspace","full_access"],"itemKinds":[],"mcp":{"protocolVersions":[],"transports":[],"features":[]}},"limits":{"maxFrameBytes":4194304,"maxInboundQueueFrames":256,"maxOutboundQueueFrames":1024,"maxInFlightRequests":64,"maxPendingRequests":64,"maxItemDeltaBytes":65536,"maxInlineToolOutputBytes":1048576,"maxArtifactBytes":268435456,"maxLogBytes":1048576,"defaultRequestDeadlineMs":120000,"defaultApprovalDeadlineMs":300000}}}'
+$init = '{"jsonrpc":"2.0","id":"c:rpc-1","result":{"protocolMajor":1,"protocolMinor":0,"minimumCompatibleMinor":0,"serverVersion":"fixture-1","serverInstanceId":"srv_fixture","runtime":{"kind":"native-image","agentScopeVersion":"1","javaVersion":"25"},"capabilities":{"methods":[],"events":[],"accessModes":["read_only","workspace","full_access"],"itemKinds":[],"mcp":{"protocolVersions":[],"transports":[],"features":[]}},"limits":{"maxFrameBytes":4194304,"maxInboundQueueFrames":256,"maxOutboundQueueFrames":1024,"maxInFlightRequests":64,"maxPendingRequests":64,"maxItemDeltaBytes":65536,"maxInlineToolOutputBytes":1048576,"maxLogBytes":1048576,"defaultRequestDeadlineMs":120000,"defaultApprovalDeadlineMs":300000}}}'
 function Write-Lf([string]$text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($text + [char]10)
     $stdout = [Console]::OpenStandardOutput()
@@ -2709,25 +2709,6 @@ fn native_only_config_rejects_jre_fallback_environment() {
     long_ready.ready_timeout = Duration::from_secs(601);
     assert_eq!(
         long_ready.validate(),
-        Err(agent_process::AgentProcessError::InvalidConfig)
-    );
-
-    let mut unverified_policy = SidecarConfig::new(&executable, &run_dir);
-    unverified_policy.initialize_params["workspacePolicy"]["enforcement"] = json!("os_enforced");
-    assert_eq!(
-        unverified_policy.validate(),
-        Err(agent_process::AgentProcessError::InvalidConfig)
-    );
-
-    let mut verified_policy = SidecarConfig::new(&executable, &run_dir);
-    verified_policy.workspace_enforcement_verified = true;
-    verified_policy.initialize_params["workspacePolicy"]["enforcement"] = json!("os_enforced");
-    assert!(verified_policy.validate().is_ok());
-
-    let mut workspace_mode = SidecarConfig::new(&executable, &run_dir);
-    workspace_mode.initialize_params["workspacePolicy"]["mode"] = json!("workspace");
-    assert_eq!(
-        workspace_mode.validate(),
         Err(agent_process::AgentProcessError::InvalidConfig)
     );
 

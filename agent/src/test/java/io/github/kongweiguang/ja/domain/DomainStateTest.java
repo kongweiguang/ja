@@ -26,14 +26,14 @@ class DomainStateTest {
     /** Verifies every terminal transition rejects later mutation. */
     @Test
     void turnAndItemFsmRejectsIllegalTransitions() {
-        TurnState turn = TurnState.queued(TURN, THREAD, TurnMode.PLAN, PermissionMode.ASK, START);
+        TurnState turn = TurnState.queued(TURN, THREAD, TurnMode.READ_ONLY, PermissionMode.ASK, START);
         turn = turn.transition(TurnStatus.RUNNING, START.plusSeconds(1));
         turn = turn.transition(TurnStatus.INTERRUPTING, START.plusSeconds(2));
         turn = turn.transition(TurnStatus.INTERRUPTED, START.plusSeconds(3));
         TurnState terminal = turn;
         assertThrows(ProtocolException.class, () -> terminal.transition(TurnStatus.RUNNING, START.plusSeconds(4)));
 
-        TurnState recovered = TurnState.queued(new TurnId("turn_runtime"), THREAD, TurnMode.PLAN,
+        TurnState recovered = TurnState.queued(new TurnId("turn_runtime"), THREAD, TurnMode.READ_ONLY,
                 PermissionMode.ASK, START).transition(TurnStatus.ABORTED_BY_RUNTIME, START.plusSeconds(1));
         assertEquals(TurnStatus.ABORTED_BY_RUNTIME, recovered.status());
 
@@ -321,9 +321,9 @@ class DomainStateTest {
                 resolved.event().outboxKey(), expired.event().outboxKey()).size());
     }
 
-    /** Verifies per-thread serialization, cross-thread release, and workspace budgets. */
+    /** Verifies same-thread serialization and bounded cross-thread admission. */
     @Test
-    void coordinatorAndLeasesSeparateThreadsFromWorkspaceMutations() {
+    void coordinatorSerializesThreads() {
         ThreadTurnCoordinator coordinator = new ThreadTurnCoordinator();
         assertTrue(coordinator.admit(THREAD, TURN).accepted());
         TurnId queued = new TurnId("turn_queued");
@@ -335,33 +335,6 @@ class DomainStateTest {
         assertThrows(ProtocolException.class, () -> limitedCoordinator.admit(
                 new ThreadId("thr_second"), new TurnId("turn_second")));
         limitedCoordinator.release(THREAD, TURN);
-
-        WorkspaceLeaseManager manager = new WorkspaceLeaseManager();
-        WorkspaceId workspace = new WorkspaceId("ws_test");
-        WorkspaceLease read1 = manager.acquire(workspace, LeaseMode.READ_ONLY);
-        WorkspaceLease read2 = manager.acquire(workspace, LeaseMode.PLAN);
-        assertTrue(manager.tryAcquire(workspace, LeaseMode.MUTATION).isEmpty());
-        read1.close();
-        read1.close();
-        assertTrue(manager.tryAcquire(workspace, LeaseMode.MUTATION).isEmpty());
-        read2.close();
-        try (WorkspaceLease mutation = manager.acquire(workspace, LeaseMode.MUTATION)) {
-            assertEquals(LeaseMode.MUTATION, mutation.mode());
-            CompletableFuture.runAsync(mutation::close).join();
-        }
-        WorkspaceLeaseManager limitedManager = new WorkspaceLeaseManager(1);
-        WorkspaceLease limitedLease = limitedManager.acquire(new WorkspaceId("ws_first"), LeaseMode.PLAN);
-        assertThrows(ProtocolException.class, () -> limitedManager.tryAcquire(
-                new WorkspaceId("ws_second"), LeaseMode.PLAN));
-        limitedLease.close();
-        WorkspaceLease releasedLease = limitedManager.tryAcquire(new WorkspaceId("ws_second"), LeaseMode.PLAN)
-                .orElseThrow();
-        releasedLease.close();
-        WorkspaceLeaseManager readerLimited = new WorkspaceLeaseManager(1, 1);
-        WorkspaceId readerWorkspace = new WorkspaceId("ws_reader");
-        WorkspaceLease onlyReader = readerLimited.acquire(readerWorkspace, LeaseMode.READ_ONLY);
-        assertThrows(ProtocolException.class, () -> readerLimited.tryAcquire(readerWorkspace, LeaseMode.PLAN));
-        onlyReader.close();
     }
 
     /** Verifies the per-delta UTF-8 budget and explicit cumulative byte state. */
@@ -531,9 +504,6 @@ class DomainStateTest {
         assertThrows(IllegalArgumentException.class, () -> new ThreadState(
                 new ThreadId("thr_inactive"), new WorkspaceId("ws_inactive"), "title",
                 ThreadStatus.IDLE, 0, new TurnId("turn_inactive")));
-        assertThrows(IllegalArgumentException.class, () -> new ThreadState(
-                new ThreadId("thr_recovery"), new WorkspaceId("ws_recovery"), "title",
-                ThreadStatus.RECOVERY_REQUIRED, 0, new TurnId("turn_recovery")));
     }
 
     /** Verifies diagnostic strings never copy model payloads, paths, commands, or titles. */
@@ -569,10 +539,6 @@ class DomainStateTest {
                 () -> new CancellationToken(CancellationToken.MAX_LISTENERS + 1));
         assertThrows(IllegalArgumentException.class,
                 () -> new ThreadTurnCoordinator(ThreadTurnCoordinator.MAX_ACTIVE_THREADS + 1));
-        assertThrows(IllegalArgumentException.class,
-                () -> new WorkspaceLeaseManager(WorkspaceLeaseManager.MAX_WORKSPACE_CAPACITY + 1, 1));
-        assertThrows(IllegalArgumentException.class,
-                () -> new WorkspaceLeaseManager(1, WorkspaceLeaseManager.MAX_WORKSPACE_CAPACITY + 1));
         assertThrows(IllegalArgumentException.class,
                 () -> new InMemoryApprovalLedgerPort(new ServerInstanceId("srv_cap"),
                         InMemoryApprovalLedgerPort.MAX_APPROVALS + 1,

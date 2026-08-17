@@ -230,10 +230,9 @@ async function replayLateResponses(frames: RecordValue[]): Promise<void> {
         threadId: "thr_contract",
         turnId: "turn_contract",
         itemId: "item_contract",
-        action: { kind: "shell", fingerprint: "act_contract", command: "pnpm test", relativePaths: ["src"] },
+        action: { kind: "shell", command: "pnpm test", relativePaths: ["src"] },
         risk: "medium",
-        policySource: "contract",
-        scopeOptions: ["once"],
+        accessMode: "workspace",
         expiresAt: "2026-08-16T00:05:00Z",
       },
     });
@@ -352,9 +351,9 @@ it("consumes the frozen corpus and bounded property corpus through production pa
   const validFrames = corpusFiles(GOLDEN)
     .filter((path) => !path.split(/[\\/]/).includes("invalid") && !path.endsWith("major-incompatible.json"))
     .map(parseProductionDocuments);
-  expect(validFrames.reduce((count, file) => count + file.frames.length, 0)).toBe(46);
+  expect(validFrames.reduce((count, file) => count + file.frames.length, 0)).toBe(44);
   const methodResults = validFrames.reduce((count, file) => count + file.methodResults, 0);
-  expect(methodResults).toBe(12);
+  expect(methodResults).toBe(11);
   replayValidHandshake(documents(join(validRoot, "handshake.jsonl")));
   const invalidCases = documents(join(GOLDEN, "invalid", "handshake-challenge.jsonl"));
   expect(invalidCases).toHaveLength(23);
@@ -368,5 +367,5 @@ it("consumes the frozen corpus and bounded property corpus through production pa
   expect(property[1]).toBe(100);
   expect(property[2]).toBe(EXPECTED_PROPERTY_DIGEST);
   // This marker is intentionally the only success output consumed by run.py.
-  console.log(`TS_CONTRACT_OK digest=${EXPECTED_DIGEST} validFrames=46 methodResults=${methodResults} parseFrames=${parseFrames} propertyValid=${property[0]} propertyInvalid=${property[1]} propertyDigest=${property[2]}`);
+  console.log(`TS_CONTRACT_OK digest=${EXPECTED_DIGEST} validFrames=44 methodResults=${methodResults} parseFrames=${parseFrames} propertyValid=${property[0]} propertyInvalid=${property[1]} propertyDigest=${property[2]}`);
 });

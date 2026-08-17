@@ -27,7 +27,7 @@ minor 扩展放宽的可选语义。错误对象的递归 token redaction 同样
 - 增加新的可选 method/event，并在 `capabilities` 中声明；旧端不得调用未声明方法。
 - 增加新的非关键 capability、Item metadata 或 `error.data.details` 字段。
 - 增加新的稳定错误码；旧端将未知 `jaCode` 按不可重试错误展示，并保留 diagnosticId。
-- 提高实现内部能力，但不得降低协商后的 limits、sandbox enforcement 或错误安全语义。
+- 提高实现内部能力，但不得降低协商后的 limits 或错误安全语义。
 
 minor 变更仍须满足 `minimumCompatibleMinor`。如果对端无法理解新增能力，可在
 `capabilities/read` 中显示 unsupported，不能静默选择另一种行为。
@@ -41,7 +41,7 @@ minor 变更仍须满足 `minimumCompatibleMinor`。如果对端无法理解新�
 - 删除、重命名、改变必填字段类型或改变已发布 method/event 的状态语义。
 - 改变 seq 的作用域/单调性、terminal event exactly-once 或 snapshot/live 无缺口流程。
 - 将 Java→Rust Approval/Secret request 改成 notification、或允许 Rust 代理 Agent Tool。
-- 放宽 frame、queue、pending、Tool output、artifact 或 deadline 上限，导致旧端无界接收。
+- 放宽 frame、queue、pending、Tool output 或 deadline 上限，导致旧端无界接收。
 - 把 OAuth、Responses、ACP、插件、MCP Resources/Prompts 等未实现能力伪装成 v1 能力。
 
 ## 字段语义

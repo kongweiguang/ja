@@ -400,8 +400,8 @@ export function applySnapshot(state: TimelineState, snapshot: ThreadReadResult):
 
 function applyTurn(state: TimelineState, turn: Turn): TimelineState {
   const thread = state.threads[turn.threadId];
-  const active = ["queued", "waiting_workspace", "running", "waiting_approval", "interrupting"].includes(turn.status);
-  const terminal = ["completed", "interrupted", "failed", "aborted_by_runtime", "recovery_required"].includes(turn.status);
+  const active = ["queued", "running", "waiting_approval", "interrupting"].includes(turn.status);
+  const terminal = ["completed", "interrupted", "failed", "aborted_by_runtime"].includes(turn.status);
   return {
     ...state,
     turns: { ...state.turns, [turn.turnId]: turn },
@@ -413,10 +413,8 @@ function applyTurn(state: TimelineState, turn: Turn): TimelineState {
             status:
               turn.status === "waiting_approval"
                 ? "waiting_approval"
-                : turn.status === "recovery_required"
-                  ? "recovery_required"
-                  : terminal
-                    ? "idle"
+                : terminal
+                  ? "idle"
                   : active
                     ? "running"
                     : thread.status,

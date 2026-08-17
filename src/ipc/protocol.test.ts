@@ -4,7 +4,6 @@
 import { describe, expect, it } from "vitest";
 import { parseMethodParams, parseMethodResult, parseServerMethodParams } from "./methods";
 import {
-  ArtifactSchema,
   assertSafePayload,
   assertNoReadyTokenLeak,
   InitializeParamsSchema,
@@ -17,7 +16,7 @@ import {
 const capabilities = {
   methods: ["initialize"],
   events: ["runtime/statusChanged"],
-  permissionModes: ["plan"],
+  accessModes: ["read_only", "workspace", "full_access"],
   itemKinds: ["agent_message"],
   mcp: { protocolVersions: ["2025-06-18"], transports: ["stdio"], features: ["tools_list"] },
 };
@@ -30,7 +29,6 @@ const limits = {
   maxPendingRequests: 64,
   maxItemDeltaBytes: 65_536,
   maxInlineToolOutputBytes: 1_048_576,
-  maxArtifactBytes: 268_435_456,
   maxLogBytes: 1_048_576,
   defaultRequestDeadlineMs: 120_000,
   defaultApprovalDeadlineMs: 300_000,
@@ -54,9 +52,8 @@ describe("JA protocol boundary", () => {
     expect(() => parseRequest({ jsonrpc: "2.0", id: "c:../../secret", method: "health/read", params: {} })).toThrow();
     expect(() => parseMethodParams("turn/start", {
       threadId: "thr_valid",
-      input: [{ type: "attachment" }],
-      mode: "workspace",
-      permissionMode: "ask",
+      input: [{ type: "text", text: "hello" }],
+      accessMode: "invalid",
       profileRevision: "profile_valid",
     })).toThrow();
     expect(() => parseMethodParams("workspace/open", JSON.parse('{"workspaceId":"ws_valid","rootPath":"C:\\\\workspace","trust":"trusted","__proto__":{"polluted":true}}'))).toThrow();
@@ -176,8 +173,7 @@ describe("JA protocol boundary", () => {
           turnId: "turn_one",
           threadId: "thr_one",
           status: "running",
-          mode: "workspace",
-          permissionMode: "ask",
+          accessMode: "workspace",
         },
         extension: "kept-in-params",
         id: "params-id-extension",
@@ -238,39 +234,22 @@ describe("JA protocol boundary", () => {
     expect(() => parseMethodParams("thread/read", { threadId: "thr_valid", afterSeq: 1 })).not.toThrow();
     expect(() => parseMethodParams("mcp/reload", {})).toThrow();
     expect(() => parseMethodParams("mcp/reload", { mcpRevision: "mcp_valid" })).not.toThrow();
-    expect(() => parseMethodParams("attachment/import", {
-      sourceToken: "source_valid",
-      fileName: "file.txt",
-      mimeType: "text/plain",
-      sizeBytes: 1,
-      sha256: "a".repeat(64),
-    })).toThrow();
-    expect(() => parseMethodParams("attachment/import", {
-      sourceToken: "pick_valid",
-      fileName: "file.txt",
-      mimeType: "text/plain",
-      sizeBytes: 1,
-      sha256: "a".repeat(64),
-    })).not.toThrow();
     expect(() => parseMethodParams("turn/start", {
       threadId: "thr_valid",
       input: [{ type: "text", text: "hello" }],
-      mode: "workspace",
-      permissionMode: "ask",
+      accessMode: "invalid",
       profileRevision: "profile_valid",
-      attachmentIds: ["att_one", "att_one"],
     })).toThrow();
     expect(() => parseServerMethodParams("approval/request", {
       approvalId: "appr_valid",
       threadId: "thr_valid",
       turnId: "turn_valid",
       itemId: "item_valid",
-      action: { kind: "shell", fingerprint: "act_valid" },
+      action: { kind: "shell", command: "pnpm test" },
       risk: "low",
-      policySource: "workspace",
-      scopeOptions: ["once", "once"],
+      accessMode: "workspace",
       expiresAt: "2026-08-16T00:00:00Z",
-    })).toThrow();
+    })).not.toThrow();
     expect(() => parseMethodParams("skill/enable", {
       skillRevision: "skill_valid",
       enabled: true,
@@ -282,29 +261,23 @@ describe("JA protocol boundary", () => {
       profileRevision: "profile_valid",
       name: "Default",
       model: { provider: "openai", protocol: "openai_chat_completions", model: "gpt" },
-      mode: "workspace",
+      accessMode: "workspace",
       skillRevisions: ["skill_valid", "skill_valid"],
     })).toThrow();
     expect(() => ProfileSchema.parse({
       profileRevision: "profile_valid",
       name: "Default",
       model: { provider: "openai", protocol: "openai_chat_completions", model: "gpt" },
-      mode: "workspace",
+      accessMode: "workspace",
       mcpRevisions: ["mcp_valid", "mcp_valid"],
     })).toThrow();
   });
 
   it("keeps optional result entities typed instead of accepting arbitrary values", () => {
-    const artifact = ArtifactSchema.parse({
-      artifactId: "artifact_valid",
-      sizeBytes: 1,
-      sha256: "a".repeat(64),
-      mediaType: "text/plain",
-    });
     expect(parseMethodResult("health/read", { status: "healthy", checks: {}, serverInstanceId: "srv_valid" })).toMatchObject({
       serverInstanceId: "srv_valid",
     });
-    expect(parseMethodResult("diagnostics/read", { status: "available", artifact })).toMatchObject({ artifact });
+    expect(parseMethodResult("diagnostics/read", { status: "available", report: { summary: "ok" } })).toMatchObject({ report: { summary: "ok" } });
     expect(parseMethodResult("thread/archive", { accepted: true, threadId: "thr_valid", status: "archived" })).toMatchObject({
       status: "archived",
     });
@@ -330,8 +303,8 @@ describe("JA protocol boundary", () => {
     expect(parseMethodResult("externalTool/request", {
       accepted: true,
       status: "completed",
-      artifact,
-    })).toMatchObject({ artifact });
+      output: { summary: "ok" },
+    })).toMatchObject({ output: { summary: "ok" } });
   });
 
   it("rejects deep prototype poison and cyclic payloads instead of silently truncating", () => {

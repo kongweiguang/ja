@@ -61,8 +61,7 @@ public record ThreadState(ThreadId threadId, WorkspaceId workspaceId, String tit
 
     /** Returns an idle snapshot once its active turn reaches a terminal state. */
     public ThreadState clearActiveTurn(ThreadStatus nextStatus) {
-        if (nextStatus != ThreadStatus.IDLE && nextStatus != ThreadStatus.ARCHIVED
-                && nextStatus != ThreadStatus.RECOVERY_REQUIRED) {
+        if (nextStatus != ThreadStatus.IDLE && nextStatus != ThreadStatus.ARCHIVED) {
             throw new IllegalArgumentException("invalid active turn clear status");
         }
         return new ThreadState(threadId, workspaceId, title, nextStatus, lastSeq, null);

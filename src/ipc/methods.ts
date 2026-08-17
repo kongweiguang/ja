@@ -3,8 +3,6 @@
 
 import { z } from "zod";
 import {
-  AttachmentIdSchema,
-  AttachmentSchema,
   ActionSchema,
   assertSafePayload,
   CapabilitiesSchema,
@@ -17,7 +15,6 @@ import {
   ProfileSchema,
   ModelProfileSchema,
   ProfileRevisionSchema,
-  ArtifactSchema,
   ServerInstanceIdSchema,
   SkillSummarySchema,
   SkillRevisionSchema,
@@ -56,8 +53,6 @@ export const CLIENT_METHODS = [
   "thread/purge",
   "turn/start",
   "turn/cancel",
-  "turn/steer",
-  "turn/followUp",
   "profile/list",
   "profile/read",
   "profile/save",
@@ -76,9 +71,6 @@ export const CLIENT_METHODS = [
   "mcp/reload",
   "mcp/tools/read",
   "mcp/toolPolicy/set",
-  "attachment/import",
-  "attachment/read",
-  "attachment/delete",
 ] as const;
 
 export const SERVER_METHODS = [
@@ -119,14 +111,6 @@ const turnControlParams = z
     reason: z.string().max(512).optional(),
   })
   .passthrough();
-const inputParams = z
-  .object({
-    threadId: ThreadIdSchema,
-    turnId: TurnIdSchema.optional(),
-    input: z.array(InputPartSchema).min(1).max(128),
-  })
-  .passthrough();
-
 const ParamsSchemaByMethod = {
   initialize: InitializeParamsSchema,
   version: z.object({ includeBuild: z.boolean().optional() }).passthrough(),
@@ -148,10 +132,8 @@ const ParamsSchemaByMethod = {
   "thread/archive": threadIdParams,
   "thread/delete": threadIdParams,
   "thread/purge": threadIdParams,
-  "turn/start": z.object({ threadId: ThreadIdSchema, input: z.array(InputPartSchema).min(1).max(128), mode: z.enum(["plan", "workspace", "full_access"]), permissionMode: z.enum(["allow", "ask", "deny"]), profileRevision: ProfileRevisionSchema, attachmentIds: z.array(AttachmentIdSchema).max(64).refine((values) => new Set(values).size === values.length, { message: "attachmentIds must be unique" }).optional(), clientRequestKey: z.string().min(1).max(128).optional() }).passthrough(),
+  "turn/start": z.object({ threadId: ThreadIdSchema, input: z.array(InputPartSchema).min(1).max(128), accessMode: z.enum(["read_only", "workspace", "full_access"]), profileRevision: ProfileRevisionSchema, clientRequestKey: z.string().min(1).max(128).optional() }).passthrough(),
   "turn/cancel": turnControlParams,
-  "turn/steer": inputParams,
-  "turn/followUp": inputParams,
   "profile/list": emptyParams,
   "profile/read": idParams("profileRevision", ProfileRevisionSchema),
   "profile/save": z.object({ profile: ProfileSchema, expectedRevision: ProfileRevisionSchema.optional() }).passthrough(),
@@ -170,10 +152,7 @@ const ParamsSchemaByMethod = {
   "mcp/reload": z.object({ mcpRevision: McpRevisionSchema }).passthrough(),
   "mcp/tools/read": idParams("mcpRevision", McpRevisionSchema),
   "mcp/toolPolicy/set": z.object({ mcpRevision: McpRevisionSchema, toolName: z.string().min(1).max(256), policy: z.enum(["allow", "ask", "deny"]) }).passthrough(),
-  "attachment/import": z.object({ sourceToken: z.string().regex(/^pick_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(100), fileName: z.string().min(1).max(512), mimeType: z.string().min(1).max(128), sizeBytes: z.number().int().min(1).max(1_073_741_824), sha256: z.string().regex(/^[A-Fa-f0-9]{64}$/) }).passthrough(),
-  "attachment/read": idParams("attachmentId", AttachmentIdSchema),
-  "attachment/delete": idParams("attachmentId", AttachmentIdSchema),
-  "approval/request": z.object({ approvalId: z.string().regex(/^appr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(101), threadId: ThreadIdSchema, turnId: TurnIdSchema, itemId: z.string().regex(/^item_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(101), action: ActionSchema, risk: z.enum(["low", "medium", "high", "critical"]), policySource: z.string().min(1).max(256), scopeOptions: z.array(z.enum(["once", "thread", "workspace"])).max(3).refine((values) => new Set(values).size === values.length, { message: "scopeOptions must be unique" }).optional(), expiresAt: z.string().datetime({ offset: true }).max(64), reason: z.string().max(2048).optional() }).passthrough(),
+  "approval/request": z.object({ approvalId: z.string().regex(/^appr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(101), threadId: ThreadIdSchema, turnId: TurnIdSchema, itemId: z.string().regex(/^item_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(101), action: ActionSchema, risk: z.enum(["low", "medium", "high", "critical"]), accessMode: z.enum(["read_only", "workspace", "full_access"]), expiresAt: z.string().datetime({ offset: true }).max(64), reason: z.string().max(2048).optional() }).passthrough(),
   "secret/resolve": z.object({ credentialRef: z.string().regex(/^cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(100), purpose: z.enum(["model", "mcp"]), profileRevision: ProfileRevisionSchema, mcpRevision: McpRevisionSchema.optional() }).passthrough(),
   "externalTool/request": z.object({ externalRequestId: z.string().regex(/^ext_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(100), toolName: z.string().min(1).max(256), input: z.record(z.string(), z.unknown()), deadlineMs: z.number().int().min(1).max(3_600_000), threadId: ThreadIdSchema.optional(), turnId: TurnIdSchema.optional(), itemId: z.string().regex(/^item_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(101).optional() }).passthrough(),
 } satisfies Record<JaMethod, z.ZodType>;
@@ -206,7 +185,7 @@ const versionResultSchema = z.object({
 }).passthrough();
 const capabilitiesResultSchema = z.object({ capabilities: CapabilitiesSchema, unsupported: z.array(z.string().max(128)).max(256).optional() }).passthrough();
 const healthResultSchema = z.object({ status: z.enum(["healthy", "degraded", "unhealthy", "stopped"]), checks: z.record(z.string(), z.unknown()), serverInstanceId: ServerInstanceIdSchema.optional() }).passthrough();
-const diagnosticsResultSchema = z.object({ status: z.enum(["available", "degraded", "unavailable"]), report: z.record(z.string(), z.unknown()).optional(), artifact: ArtifactSchema.optional() }).passthrough();
+const diagnosticsResultSchema = z.object({ status: z.enum(["available", "degraded", "unavailable"]), report: z.record(z.string(), z.unknown()).optional() }).passthrough();
 const shutdownResultSchema = acceptedResultSchema.extend({ status: z.enum(["accepted", "shutting_down", "stopped"]), deadlineMs: z.number().int().min(1).max(300_000).optional() });
 const workspaceOpenResultSchema = z.object({ workspace: WorkspaceSchema }).passthrough();
 const workspaceListResultSchema = z.object({ workspaces: z.array(WorkspaceSchema).max(500), nextCursor: z.string().max(256).optional() }).passthrough();
@@ -220,7 +199,7 @@ const threadArchiveResultSchema = acceptedResultSchema.extend({ threadId: Thread
 const threadDeleteResultSchema = acceptedResultSchema.extend({ threadId: ThreadIdSchema, status: z.literal("deleted") });
 const threadPurgeResultSchema = acceptedResultSchema.extend({ threadId: ThreadIdSchema, status: z.literal("purged") });
 const turnStartResultSchema = z.object({ accepted: z.boolean(), turnId: TurnIdSchema, queued: z.boolean(), status: TurnSchema.shape.status.optional() }).passthrough();
-const turnCancelResultSchema = z.object({ accepted: z.boolean(), turnId: TurnIdSchema, status: z.enum(["interrupting", "interrupted", "recovery_required"]) }).passthrough();
+const turnCancelResultSchema = z.object({ accepted: z.boolean(), turnId: TurnIdSchema, status: z.enum(["interrupting", "interrupted"]) }).passthrough();
 const profileListResultSchema = z.object({ profiles: z.array(ProfileSchema).max(256), activeProfileRevision: ProfileRevisionSchema.optional() }).passthrough();
 const profileResultSchema = z.object({ profile: ProfileSchema }).passthrough();
 const profileActivateResultSchema = z.object({ accepted: z.boolean(), activeProfileRevision: ProfileRevisionSchema }).passthrough();
@@ -237,11 +216,9 @@ const mcpDeleteResultSchema = z.object({ accepted: z.boolean(), mcpRevision: Mcp
 const mcpTestResultSchema = z.object({ mcpRevision: McpRevisionSchema, status: z.enum(["healthy", "degraded", "unavailable"]), protocolVersion: z.string().max(32).optional(), toolCount: z.number().int().min(0).max(10_000).optional() }).passthrough();
 const mcpToolsReadResultSchema = z.object({ mcpRevision: McpRevisionSchema, tools: z.array(McpToolSchema).max(10_000) }).passthrough();
 const mcpToolPolicyResultSchema = z.object({ mcpRevision: McpRevisionSchema, toolName: z.string().min(1).max(256), policy: z.enum(["allow", "ask", "deny"]) }).passthrough();
-const attachmentResultSchema = z.object({ attachment: AttachmentSchema }).passthrough();
-const attachmentDeleteResultSchema = z.object({ accepted: z.boolean(), attachmentId: AttachmentIdSchema }).passthrough();
-const approvalResponseResultSchema = z.object({ decision: z.enum(["allow_once", "allow_scope", "deny", "expired", "disconnected"]), scope: z.enum(["once", "thread", "workspace"]).optional(), resolvedAt: z.string().datetime({ offset: true }).max(64) }).passthrough();
+const approvalResponseResultSchema = z.object({ decision: z.enum(["allow_once", "allow_session", "deny", "expired", "disconnected"]), resolvedAt: z.string().datetime({ offset: true }).max(64) }).passthrough();
 const secretResolveResultSchema = z.object({ secretValue: z.string().min(1).max(1_048_576), expiresAt: z.string().datetime({ offset: true }).max(64).optional() }).passthrough();
-const externalToolResponseResultSchema = z.object({ accepted: z.boolean(), status: z.enum(["accepted", "completed", "failed", "cancelled"]), output: z.record(z.string(), z.unknown()).optional(), artifact: ArtifactSchema.optional() }).passthrough();
+const externalToolResponseResultSchema = z.object({ accepted: z.boolean(), status: z.enum(["accepted", "completed", "failed", "cancelled"]), output: z.record(z.string(), z.unknown()).optional() }).passthrough();
 
 /**
  * Every negotiated method has an explicit result parser so a valid envelope
@@ -268,8 +245,6 @@ export const ResultSchemaByMethod = {
   "thread/purge": threadPurgeResultSchema,
   "turn/start": turnStartResultSchema,
   "turn/cancel": turnCancelResultSchema,
-  "turn/steer": turnStartResultSchema,
-  "turn/followUp": turnStartResultSchema,
   "profile/list": profileListResultSchema,
   "profile/read": profileResultSchema,
   "profile/save": profileResultSchema.extend({ created: z.boolean().optional() }),
@@ -288,9 +263,6 @@ export const ResultSchemaByMethod = {
   "mcp/reload": mcpTestResultSchema,
   "mcp/tools/read": mcpToolsReadResultSchema,
   "mcp/toolPolicy/set": mcpToolPolicyResultSchema,
-  "attachment/import": attachmentResultSchema,
-  "attachment/read": attachmentResultSchema,
-  "attachment/delete": attachmentDeleteResultSchema,
   "approval/request": approvalResponseResultSchema,
   "secret/resolve": secretResolveResultSchema,
   "externalTool/request": externalToolResponseResultSchema,

@@ -29,8 +29,7 @@ const turn = {
   turnId: "turn_one",
   threadId: "thr_one",
   status: "running" as const,
-  mode: "workspace" as const,
-  permissionMode: "ask" as const,
+  accessMode: "workspace" as const,
 };
 
 function readyState() {
@@ -212,7 +211,7 @@ describe("runtime-owned timeline reducer", () => {
 
   it("rejects zero-generation reducer promotions even for terminal-looking states", () => {
     const cold = createTimelineState();
-    for (const status of ["starting", "stopped", "recovery_required", "crashed"] as const) {
+    for (const status of ["starting", "stopped", "crashed"] as const) {
       const rejected = applyRuntimeStatus(cold, {
         status,
         generation: 0,

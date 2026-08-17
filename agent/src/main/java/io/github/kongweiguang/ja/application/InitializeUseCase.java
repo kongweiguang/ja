@@ -75,7 +75,6 @@ public final class InitializeUseCase {
                 Math.min(client.maxPendingRequests(), server.maxPendingRequests()),
                 Math.min(client.maxItemDeltaBytes(), server.maxItemDeltaBytes()),
                 Math.min(client.maxInlineToolOutputBytes(), server.maxInlineToolOutputBytes()),
-                Math.min(client.maxArtifactBytes(), server.maxArtifactBytes()),
                 Math.min(client.maxLogBytes(), server.maxLogBytes()),
                 Math.min(client.defaultRequestDeadlineMs(), server.defaultRequestDeadlineMs()),
                 Math.min(client.defaultApprovalDeadlineMs(), server.defaultApprovalDeadlineMs()));

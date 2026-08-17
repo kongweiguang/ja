@@ -162,8 +162,7 @@ function JaWorkspace(): ReactElement {
     await runAction("turn", async () => {
       const accepted = await startTurn({
         threadId: THREAD_ID,
-        mode: "workspace",
-        permissionMode: "ask",
+        accessMode: "workspace",
         profileRevision: "profile_ui_preview",
         input: [{ type: "text", text: input.trim() }],
       });

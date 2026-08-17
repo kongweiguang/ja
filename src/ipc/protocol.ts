@@ -41,8 +41,6 @@ export const ItemIdSchema = id("item_", 101);
 export const EventIdSchema = id("evt_", 100);
 export const WorkspaceIdSchema = id("ws_", 99);
 export const ApprovalIdSchema = id("appr_", 101);
-export const ArtifactIdSchema = id("artifact_", 105);
-export const AttachmentIdSchema = id("att_", 99);
 export const ProfileRevisionSchema = id("profile_", 104);
 export const SkillRevisionSchema = id("skill_", 104);
 export const McpRevisionSchema = id("mcp_", 102);
@@ -71,7 +69,6 @@ export const LimitsSchema = z
     maxPendingRequests: z.number().int().min(1).max(1024),
     maxItemDeltaBytes: z.number().int().min(256).max(1_048_576),
     maxInlineToolOutputBytes: z.number().int().min(1024).max(16_777_216),
-    maxArtifactBytes: z.number().int().min(1_048_576).max(1_073_741_824),
     maxLogBytes: z.number().int().min(4096).max(67_108_864),
     defaultRequestDeadlineMs: z.number().int().min(1000).max(3_600_000),
     defaultApprovalDeadlineMs: z.number().int().min(1000).max(3_600_000),
@@ -86,7 +83,6 @@ export const DEFAULT_LIMITS: Limits = {
   maxPendingRequests: 64,
   maxItemDeltaBytes: 65_536,
   maxInlineToolOutputBytes: 1_048_576,
-  maxArtifactBytes: 268_435_456,
   maxLogBytes: 1_048_576,
   defaultRequestDeadlineMs: 120_000,
   defaultApprovalDeadlineMs: 300_000,
@@ -96,8 +92,8 @@ export const CapabilitiesSchema = z
   .object({
     methods: z.array(boundedString(128)).max(256),
     events: z.array(boundedString(128)).max(256),
-    permissionModes: z
-      .array(z.enum(["plan", "workspace", "full_access"]))
+    accessModes: z
+      .array(z.enum(["read_only", "workspace", "full_access"]))
       .max(3),
     itemKinds: z.array(boundedString(64)).max(64),
     mcp: z
@@ -110,31 +106,15 @@ export const CapabilitiesSchema = z
   })
   .passthrough();
 
-export const WorkspacePolicySchema = z
-  .object({
-    mode: z.enum(["plan", "workspace", "full_access"]),
-    allowNetwork: z.boolean(),
-    allowShell: z.boolean(),
-    allowWrite: z.boolean(),
-  })
-  .passthrough();
-
 export const InputPartSchema = z
   .object({
-    type: z.enum(["text", "attachment"]),
+    type: z.literal("text"),
     text: z.string().max(1_048_576).optional(),
-    attachmentId: AttachmentIdSchema.optional(),
   })
   .passthrough()
   .superRefine((part, context) => {
     if (part.type === "text" && part.text === undefined) {
       context.addIssue({ code: "custom", message: "text input requires text" });
-    }
-    if (part.type === "attachment" && part.attachmentId === undefined) {
-      context.addIssue({
-        code: "custom",
-        message: "attachment input requires attachmentId",
-      });
     }
   });
 
@@ -147,22 +127,10 @@ export const ActionSchema = z
       "shell",
       "mcp_tool",
       "external_tool",
-      "network",
     ]),
-    fingerprint: z.string().regex(/^act_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(100),
     command: z.string().max(4096).optional(),
+    cwd: z.string().max(4096).optional(),
     relativePaths: z.array(z.string().max(4096)).max(128).optional(),
-    networkTargets: z.array(z.string().max(2048)).max(64).optional(),
-  })
-  .passthrough();
-
-export const ArtifactSchema = z
-  .object({
-    artifactId: ArtifactIdSchema,
-    sizeBytes: z.number().int().min(1).max(1_073_741_824),
-    sha256: z.string().regex(/^[A-Fa-f0-9]{64}$/),
-    mediaType: boundedString(128),
-    displayName: z.string().max(512).optional(),
   })
   .passthrough();
 
@@ -185,7 +153,6 @@ export const ThreadSchema = z
       "idle",
       "running",
       "waiting_approval",
-      "recovery_required",
       "archived",
     ]),
     lastSeq: snapshotSeqSchema,
@@ -199,7 +166,6 @@ export const TurnSchema = z
     threadId: ThreadIdSchema,
     status: z.enum([
       "queued",
-      "waiting_workspace",
       "running",
       "waiting_approval",
       "interrupting",
@@ -207,10 +173,8 @@ export const TurnSchema = z
       "interrupted",
       "failed",
       "aborted_by_runtime",
-      "recovery_required",
     ]),
-    mode: z.enum(["plan", "workspace", "full_access"]),
-    permissionMode: z.enum(["allow", "ask", "deny"]),
+    accessMode: z.enum(["read_only", "workspace", "full_access"]),
     startedAt: timestampSchema.optional(),
     completedAt: timestampSchema.optional(),
     error: z.record(z.string(), z.unknown()).optional(),
@@ -225,20 +189,14 @@ export const ItemSchema = z
       "user_message",
       "agent_message",
       "commentary",
-      "reasoning_summary",
-      "plan",
       "tool_call",
       "command",
       "file_change",
       "approval",
-      "subagent",
-      "context_compaction",
-      "runtime_notice",
     ]),
     status: z.enum(["started", "in_progress", "completed", "failed", "cancelled"]),
     title: z.string().max(512).optional(),
     text: z.string().max(1_048_576).optional(),
-    artifact: ArtifactSchema.optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .passthrough();
@@ -259,7 +217,7 @@ export const ProfileSchema = z
     profileRevision: ProfileRevisionSchema,
     name: boundedString(256),
     model: ModelProfileSchema,
-    mode: z.enum(["plan", "workspace", "full_access"]),
+    accessMode: z.enum(["read_only", "workspace", "full_access"]),
     skillRevisions: z.array(SkillRevisionSchema).max(128).refine((values) => new Set(values).size === values.length, { message: "skillRevisions must be unique" }).optional(),
     mcpRevisions: z.array(McpRevisionSchema).max(128).refine((values) => new Set(values).size === values.length, { message: "mcpRevisions must be unique" }).optional(),
   })
@@ -294,17 +252,6 @@ export const McpToolSchema = z
     description: z.string().max(4096).optional(),
     inputSchema: z.record(z.string(), z.unknown()),
     policy: z.enum(["allow", "ask", "deny"]),
-  })
-  .passthrough();
-
-export const AttachmentSchema = z
-  .object({
-    attachmentId: AttachmentIdSchema,
-    fileName: boundedString(512),
-    mimeType: boundedString(128),
-    sizeBytes: z.number().int().min(1).max(1_073_741_824),
-    sha256: z.string().regex(/^[A-Fa-f0-9]{64}$/),
-    artifact: ArtifactSchema,
   })
   .passthrough();
 
@@ -355,7 +302,6 @@ export const InitializeParamsSchema = z
     clientVersion: boundedString(128),
     capabilities: CapabilitiesSchema,
     limits: LimitsSchema,
-    workspacePolicy: WorkspacePolicySchema.optional(),
   })
   .passthrough();
 
@@ -530,7 +476,6 @@ export const TurnCompletedParamsSchema = z
       "interrupted",
       "failed",
       "aborted_by_runtime",
-      "recovery_required",
     ]),
   })
   .passthrough()
@@ -550,8 +495,7 @@ export const ApprovalEventParamsSchema = z.object({ approval: ApprovalSummarySch
 export const ApprovalResolvedParamsSchema = z
   .object({
     approvalId: ApprovalIdSchema,
-    decision: z.enum(["allow_once", "allow_scope", "deny", "expired", "disconnected"]),
-    scope: z.enum(["once", "thread", "workspace"]).optional(),
+    decision: z.enum(["allow_once", "allow_session", "deny", "expired", "disconnected"]),
     resolvedAt: timestampSchema,
   })
   .passthrough();
@@ -581,7 +525,7 @@ export const RuntimeNoticeParamsSchema = z
   .passthrough();
 export const RuntimeOverloadParamsSchema = z
   .object({
-    queue: z.enum(["inbound", "outbound", "pending", "artifact", "tool_output"]),
+    queue: z.enum(["inbound", "outbound", "pending", "tool_output"]),
     retryable: z.boolean(),
     retryAfterMs: z.number().int().min(1).max(3_600_000).optional(),
   })
@@ -609,9 +553,7 @@ export const ThreadReadResultSchema = z
 
 export type Limits = z.infer<typeof LimitsSchema>;
 export type Capabilities = z.infer<typeof CapabilitiesSchema>;
-export type WorkspacePolicy = z.infer<typeof WorkspacePolicySchema>;
 export type InputPart = z.infer<typeof InputPartSchema>;
-export type Artifact = z.infer<typeof ArtifactSchema>;
 export type Workspace = z.infer<typeof WorkspaceSchema>;
 export type Thread = z.infer<typeof ThreadSchema>;
 export type Turn = z.infer<typeof TurnSchema>;
@@ -621,7 +563,6 @@ export type SkillSummary = z.infer<typeof SkillSummarySchema>;
 export type ModelProfile = z.infer<typeof ModelProfileSchema>;
 export type McpServer = z.infer<typeof McpServerSchema>;
 export type McpTool = z.infer<typeof McpToolSchema>;
-export type Attachment = z.infer<typeof AttachmentSchema>;
 export type ApprovalSummary = z.infer<typeof ApprovalSummarySchema>;
 export type RpcError = z.infer<typeof RpcErrorSchema>;
 export type ReadyToken = z.infer<typeof ReadyTokenSchema>;

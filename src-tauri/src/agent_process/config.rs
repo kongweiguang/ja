@@ -29,8 +29,6 @@ pub struct SidecarConfig {
     pub executable: PathBuf,
     pub args: Vec<OsString>,
     pub run_dir: PathBuf,
-    /// 只有平台 sandbox spike 已证明 enforcement 后才能宣称 os_enforced。
-    pub workspace_enforcement_verified: bool,
     /// 可选 workspace 根；配置后 run_dir 必须位于其外部，避免 host 自身目录被 sidecar 复用。
     pub workspace_root: Option<PathBuf>,
     pub env: BTreeMap<OsString, OsString>,
@@ -56,7 +54,6 @@ impl SidecarConfig {
             executable: fs::canonicalize(&executable).unwrap_or_else(|_| executable.clone()),
             args: Vec::new(),
             run_dir: fs::canonicalize(&run_dir).unwrap_or_else(|_| run_dir.clone()),
-            workspace_enforcement_verified: false,
             workspace_root: None,
             env: BTreeMap::new(),
             initialize_params: default_initialize_params(&limits),
@@ -144,20 +141,8 @@ impl SidecarConfig {
         if !self.initialize_params.is_object() {
             return Err(AgentProcessError::InvalidConfig);
         }
-        validate_initialize_params(
-            &self.initialize_params,
-            &self.limits,
-            self.workspace_enforcement_verified,
-        )
-        .map_err(|_| AgentProcessError::InvalidConfig)?;
-        let mode = self
-            .initialize_params
-            .pointer("/workspacePolicy/mode")
-            .and_then(Value::as_str)
-            .ok_or(AgentProcessError::InvalidConfig)?;
-        if mode != "plan" && self.workspace_root.is_none() {
-            return Err(AgentProcessError::InvalidConfig);
-        }
+        validate_initialize_params(&self.initialize_params, &self.limits)
+            .map_err(|_| AgentProcessError::InvalidConfig)?;
         if self
             .args
             .iter()

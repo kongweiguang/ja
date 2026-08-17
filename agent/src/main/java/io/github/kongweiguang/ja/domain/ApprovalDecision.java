@@ -6,7 +6,7 @@ package io.github.kongweiguang.ja.domain;
 /** Exactly-once approval outcomes. */
 public enum ApprovalDecision {
     ALLOW_ONCE,
-    ALLOW_SCOPE,
+    ALLOW_SESSION,
     DENY,
     EXPIRED,
     DISCONNECTED

@@ -33,8 +33,7 @@ function timelineFrame(seq: number): Record<string, unknown> {
         turnId: "turn_store",
         threadId: "thr_store",
         status: "running",
-        mode: "workspace",
-        permissionMode: "ask",
+        accessMode: "workspace",
       },
     },
   };

@@ -33,8 +33,8 @@ MAX_ARTIFACT_SNAPSHOT_ENTRIES = 100_000
 MAX_DESCENDANT_PIDS = 1_024
 PROPERTY_SEED = 20260816
 EXPECTED = {
-    "validFrames": 46,
-    "methodResults": 12,
+    "validFrames": 44,
+    "methodResults": 11,
     "handshakeValidFrames": 6,
     "handshakeInvalidCases": 23,
     "parseFrames": 31,
@@ -42,8 +42,8 @@ EXPECTED = {
 
 
 def expected_rust_contract_tests() -> int:
-    """Account for Windows-only process-tree tests while keeping the shared gate strict on both CI targets."""
-    return 57 if os.name == "nt" else 53
+    """Keep the shared marker aligned after adding one cross-platform Rust regression while retaining four Windows-only skips on Unix."""
+    return 58 if os.name == "nt" else 54
 
 
 def rust_test_artifact_exists(target_root: Path | None = None) -> bool:
@@ -913,7 +913,7 @@ def run_java(property_path: Path, digest: str, classification_digest: str, temp:
         [tool("mvn"), "-B", "-ntp", "-f", str(pom_file), "clean", "verify"],
         ROOT,
     )
-    require_marker("java-build", build_result.stdout + build_result.stderr, r"Tests run:\s*75, Failures:\s*0, Errors:\s*0")
+    require_marker("java-build", build_result.stdout + build_result.stderr, r"Tests run:\s*174, Failures:\s*0, Errors:\s*0")
     classpath_file = temp / "java-classpath.txt"
     run_command(
         "java-classpath",
@@ -1084,7 +1084,7 @@ def handshake_result(minor):
         "capabilities": {
             "methods": [],
             "events": [],
-            "permissionModes": ["plan", "workspace", "full_access"],
+            "accessModes": ["read_only", "workspace", "full_access"],
             "itemKinds": [],
             "mcp": {"protocolVersions": [], "transports": [], "features": []},
         },
@@ -1096,7 +1096,6 @@ def handshake_result(minor):
             "maxPendingRequests": 64,
             "maxItemDeltaBytes": 65536,
             "maxInlineToolOutputBytes": 1048576,
-            "maxArtifactBytes": 268435456,
             "maxLogBytes": 1048576,
             "defaultRequestDeadlineMs": 120000,
             "defaultApprovalDeadlineMs": 300000,
@@ -1195,7 +1194,7 @@ while True:
 
 
 def run_rust(property_path: Path, digest: str, classification_digest: str, temp: Path) -> None:
-    """Run locked Rust evidence, then compile a temp adapter over production codec/session/supervisor modules."""
+    """Run locked Rust evidence and compile an explicitly declared temp adapter so Cargo lockfile generation does not rely on auto-discovery."""
     supervisor_replay_only = os.environ.get("JA_RUST_SUPERVISOR_REPLAY_ONLY") == "1"
     cargo_target = temp / "cargo-target"
     cargo_env = os.environ.copy()
@@ -1289,7 +1288,7 @@ def run_rust(property_path: Path, digest: str, classification_digest: str, temp:
         "pub use supervisor::{SidecarConfig, SidecarSupervisor};\n"
         "use serde_json::Value;\n"
         "pub fn validate_initialize_params(value: &Value) -> Result<(), error::AgentProcessError> {\n"
-        "    handshake::validate_initialize_params(value, &codec::Limits::default(), false)\n"
+        "    handshake::validate_initialize_params(value, &codec::Limits::default())\n"
         "}\n"
         "pub fn is_ready_notification(frame: &codec::RpcFrame, expected: Option<&str>) -> bool {\n"
         "    handshake::is_ready_notification(frame, expected)\n"
@@ -1328,13 +1327,13 @@ def run_rust(property_path: Path, digest: str, classification_digest: str, temp:
             shutil.copytree(path, target)
     manifest = temp / "Cargo.toml"
     manifest.write_text(
-        """[package]\nname = \"ja-contract-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nserde = { version = \"=1.0.229\", features = [\"derive\"] }\nserde_json = \"=1.0.151\"\nsha2 = \"=0.11.0\"\n""",
+        """[package]\nname = \"ja-contract-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[[bin]]\nname = \"ja-contract-consumer\"\npath = \"src/main.rs\"\n\n[dependencies]\nserde = { version = \"=1.0.229\", features = [\"derive\"] }\nserde_json = \"=1.0.151\"\nsha2 = \"=0.11.0\"\ntracing = \"=0.1.44\"\n""",
         encoding="utf-8",
         newline="\n",
     )
     run_command(
         "rust-adapter-lock",
-        [tool("cargo"), "generate-lockfile", "--manifest-path", str(manifest)],
+        [tool("cargo"), "generate-lockfile", "--offline", "--manifest-path", str(manifest)],
         ROOT,
         env=cargo_env,
     )
@@ -1351,7 +1350,7 @@ def run_rust(property_path: Path, digest: str, classification_digest: str, temp:
         env["JA_RUST_SUPERVISOR_REPLAY_ONLY"] = "1"
     result = run_command(
         "rust-adapter",
-        [tool("cargo"), "run", "--manifest-path", str(manifest), "--locked", "--quiet"],
+        [tool("cargo"), "run", "--offline", "--manifest-path", str(manifest), "--locked", "--quiet"],
         ROOT,
         env=env,
     )
@@ -1415,8 +1414,8 @@ def run_typescript(property_path: Path, digest: str, classification_digest: str,
         ROOT,
         env=suite_env,
     )
-    require_marker("typescript-suite", suite.stdout + suite.stderr, r"Tests\s+85 passed\s+\(85\)")
-    print("TS_SUITE_OK tests=85")
+    require_marker("typescript-suite", suite.stdout + suite.stderr, r"Tests\s+97 passed\s+\(97\)")
+    print("TS_SUITE_OK tests=97")
     ts_filters = (
         ("nested-pending", "tracks server request pending IDs and rejects duplicate, unknown, and late responses"),
         ("cancel-race", "linearizes slow disconnect and reconnect so stale listeners cannot win"),
@@ -1444,7 +1443,7 @@ def run_typescript(property_path: Path, digest: str, classification_digest: str,
         require_marker(
             f"typescript-filter-{filter_id}",
             filtered.stdout + filtered.stderr,
-            r"Tests\s+1 passed(?:\s+\|\s+[0-9]+\s+skipped)?\s+\(85\)",
+            r"Tests\s+1 passed(?:\s+\|\s+[0-9]+\s+skipped)?\s+\(97\)",
         )
         print(f"TS_FILTER_OK id={filter_id}")
     contract_env = env.copy()

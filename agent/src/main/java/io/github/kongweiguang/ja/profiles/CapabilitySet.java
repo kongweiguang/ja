@@ -58,9 +58,9 @@ public record CapabilitySet(Set<ModelCapability> supported) {
         return new CapabilitySet(result);
     }
 
-    /** Checks a feature gate before an attachment or generation option is sent. */
+    /** Checks a feature gate before a provider input or generation option is sent. */
     public boolean supports(ModelCapability capability) {
-        // A single gate keeps attachments and generation options from claiming unverified features.
+        // A single gate keeps provider inputs and generation options from claiming unverified features.
         return supported.contains(capability);
     }
 }

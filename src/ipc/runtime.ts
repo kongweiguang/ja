@@ -42,12 +42,21 @@ const RuntimeStatusKindSchema = z.enum([
   "faulted",
 ]);
 
+/**
+ * Accepts the host-only recovery projection because Rust intentionally returns
+ * no live generation while a persisted recovery marker blocks startup.
+ */
+function isRuntimeCommandGenerationValid(status: string, generation: number): boolean {
+  return isRuntimeGenerationValid(status, generation)
+    || (status === "recovery_required" && generation === 0);
+}
+
 const RuntimeStatusSchema = z.object({
   status: RuntimeStatusKindSchema,
   generation: RuntimeGenerationSchema,
   serverInstanceId: ServerInstanceIdSchema.nullable().optional(),
 }).strict().refine(
-  (value) => isRuntimeGenerationValid(value.status, value.generation),
+  (value) => isRuntimeCommandGenerationValid(value.status, value.generation),
   { message: "runtime generation zero is only valid for recovery_required or stopped host" },
 );
 
@@ -68,8 +77,7 @@ const ManualRecoveryConfirmationSchema = z.object({
 
 const TurnStartInputSchema = z.object({
   threadId: z.string().regex(/^thr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(128),
-  mode: z.enum(["plan", "workspace", "full_access"]),
-  permissionMode: z.string().min(1).max(64),
+  accessMode: z.enum(["read_only", "workspace", "full_access"]),
   profileRevision: ProfileRevisionSchema,
   input: z.array(InputPartSchema).min(1).max(128),
 }).strict();

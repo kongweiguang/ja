@@ -51,8 +51,8 @@ public final class JavaCorpusProbe {
             int parseFrames = consumeParseCorpus(golden);
             PropertyResult property = consumePropertyCorpus(Path.of(Objects.requireNonNull(
                     System.getenv(PROPERTY_PATH_ENV), "property path")));
-            assertCondition(valid[0] == 46, "valid frame count mismatch");
-            assertCondition(valid[1] == 12, "method result count mismatch");
+            assertCondition(valid[0] == 44, "valid frame count mismatch");
+            assertCondition(valid[1] == 11, "method result count mismatch");
             assertCondition(parseFrames == 31, "parse frame count mismatch");
             assertCondition(property.valid() == 100 && property.invalid() == 100, "property count mismatch");
             assertCondition(property.digest().equals(System.getenv(PROPERTY_DIGEST_ENV)), "property digest mismatch");
@@ -183,15 +183,6 @@ public final class JavaCorpusProbe {
                 requiredBoolean(object, "accepted");
                 requiredEnum(object, "status", "accepted", "shutting_down", "stopped");
             }
-            case "attachment/import" -> {
-                ObjectNode attachment = requiredObject(object, "attachment");
-                requiredPattern(attachment, "attachmentId", "^att_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$");
-                requiredText(attachment, "fileName");
-                requiredText(attachment, "mimeType");
-                requiredInteger(attachment, "sizeBytes");
-                requiredPattern(attachment, "sha256", "^[A-Fa-f0-9]{64}$");
-                requiredObject(attachment, "artifact");
-            }
             case "skill/import" -> {
                 requiredPattern(object, "skillRevision", "^skill_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$");
                 requiredEnum(object, "status", "healthy", "degraded", "invalid");
@@ -228,8 +219,7 @@ public final class JavaCorpusProbe {
                 optionalText(object, "expiresAt");
             }
             case "approval/request" -> {
-                requiredEnum(object, "decision", "allow_once", "allow_scope", "deny", "expired", "disconnected");
-                optionalEnum(object, "scope", "once", "thread", "workspace");
+                requiredEnum(object, "decision", "allow_once", "allow_session", "deny", "expired", "disconnected");
                 requiredText(object, "resolvedAt");
             }
             case "thread/read" -> {

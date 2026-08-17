@@ -48,8 +48,8 @@ public record ApprovalState(ApprovalId approvalId, ThreadId threadId, TurnId tur
         if (decision == null && scope != null) {
             throw new IllegalArgumentException("pending approval cannot have a scope");
         }
-        if (decision != ApprovalDecision.ALLOW_SCOPE && scope != null) {
-            throw new IllegalArgumentException("scope is only valid for allow_scope");
+        if (decision != ApprovalDecision.ALLOW_SESSION && scope != null) {
+            throw new IllegalArgumentException("scope is only valid for allow_session");
         }
     }
 
@@ -77,7 +77,7 @@ public record ApprovalState(ApprovalId approvalId, ThreadId threadId, TurnId tur
         if (nextDecision == ApprovalDecision.EXPIRED && at.isBefore(expiresAt)) {
             throw new ProtocolException(JaErrorCode.INVALID_STATE);
         }
-        if (nextDecision == ApprovalDecision.ALLOW_SCOPE) {
+        if (nextDecision == ApprovalDecision.ALLOW_SESSION) {
             if (nextScope == null || !scopeOptions.contains(nextScope)) {
                 throw new ProtocolException(JaErrorCode.INVALID_STATE);
             }
@@ -90,7 +90,7 @@ public record ApprovalState(ApprovalId approvalId, ThreadId threadId, TurnId tur
         }
         return new ApprovalState(approvalId, threadId, turnId, itemId, action, risk, policySource,
                 scopeOptions, expiresAt, reason, nextDecision,
-                nextDecision == ApprovalDecision.ALLOW_SCOPE ? nextScope : null, at);
+                nextDecision == ApprovalDecision.ALLOW_SESSION ? nextScope : null, at);
     }
 
     /** Returns whether no terminal decision has yet been persisted for this approval. */

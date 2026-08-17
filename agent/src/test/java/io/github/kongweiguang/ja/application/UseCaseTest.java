@@ -86,15 +86,15 @@ class UseCaseTest {
     @Test
     void initializationUsesFieldWiseMinimumForNonSymmetricLimits() {
         ProtocolLimits server = new ProtocolLimits(8192, 200, 100, 20, 10,
-                1024, 4096, 3_000_000, 6000, 3000, 2000);
+                1024, 4096, 6000, 3000, 2000);
         ProtocolLimits client = new ProtocolLimits(4096, 100, 200, 10, 20,
-                512, 2048, 2_000_000, 5000, 2000, 3000);
+                512, 2048, 5000, 2000, 3000);
         InitializeUseCase useCase = new InitializeUseCase(new ProtocolVersion(1, 2, 1), "ja-test",
                 new ServerInstanceId("srv_limits"), server);
         ProtocolLimits negotiated = useCase.execute(new InitializeParams(
                 new ProtocolVersion(1, 2, 0), "ui", Capabilities.minimal(), client)).limits();
         assertEquals(new ProtocolLimits(4096, 100, 100, 10, 10, 512, 2048,
-                2_000_000, 5000, 2000, 2000), negotiated);
+                5000, 2000, 2000), negotiated);
     }
 
     /** Verifies ambiguous publish failure keeps one token until the stable lease is retried. */
@@ -127,7 +127,7 @@ class UseCaseTest {
     void cancellationRejectsTerminalTurnBeforeTokenRegistration() {
         Instant start = Instant.parse("2026-08-16T00:00:00Z");
         TurnState terminal = TurnState.queued(new TurnId("turn_terminal"), new ThreadId("thr_terminal"),
-                        TurnMode.PLAN, PermissionMode.ASK, start)
+                        TurnMode.READ_ONLY, PermissionMode.ASK, start)
                 .transition(io.github.kongweiguang.ja.domain.TurnStatus.RUNNING, start.plusSeconds(1))
                 .transition(io.github.kongweiguang.ja.domain.TurnStatus.COMPLETED, start.plusSeconds(2));
         InMemoryTurnStatePort port = new InMemoryTurnStatePort();
@@ -313,17 +313,17 @@ class UseCaseTest {
     @Test
     void initializationIntersectsSchemaFriendlyCapabilities() {
         Capabilities server = new Capabilities(List.of("initialize", "turn/start"),
-                List.of("turn/started"), List.of("plan", "workspace"), List.of("agent_message"),
+                List.of("turn/started"), List.of("read_only", "workspace"), List.of("agent_message"),
                 new McpCapabilities(List.of("2025-06-18"), List.of("stdio"), List.of("tools_list")));
         Capabilities client = new Capabilities(List.of("initialize"), List.of("turn/started"),
-                List.of("plan"), List.of("agent_message"),
+                List.of("read_only"), List.of("agent_message"),
                 new McpCapabilities(List.of("2025-06-18"), List.of("stdio"), List.of("tools_list")));
         InitializeUseCase useCase = new InitializeUseCase(new ProtocolVersion(1, 2, 1), "ja-test",
                 new ServerInstanceId("srv_caps"), server, ProtocolLimits.defaults());
         NegotiatedInitialization result = useCase.execute(new InitializeParams(
                 new ProtocolVersion(1, 2, 0), "ui", client, ProtocolLimits.defaults()));
         assertEquals(List.of("initialize"), result.capabilities().methods());
-        assertEquals(List.of("plan"), result.capabilities().permissionModes());
+        assertEquals(List.of("read_only"), result.capabilities().accessModes());
         assertEquals(List.of("tools_list"), result.capabilities().mcp().features());
         assertThrows(IllegalArgumentException.class, () -> new Capabilities(
                 List.of("initialize", "initialize"), List.of(), List.of(), List.of(),

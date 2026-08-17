@@ -13,7 +13,7 @@ use crate::agent_process::handshake::{
     MAX_READY_TIMEOUT, MAX_SHUTDOWN_TIMEOUT, bounded_string, checked_deadline,
     error_is_incompatible, generate_ready_token, is_ready_notification,
     is_runtime_ready_notification, valid_schema_id, valid_version, validate_capabilities,
-    validate_remote_limits, validate_workspace_policy,
+    validate_remote_limits,
 };
 use crate::agent_process::lifecycle::{LifecycleMachine, LifecycleState};
 use crate::agent_process::session::{EventPump, Session, SessionEvent, TerminalReason};
@@ -602,12 +602,6 @@ impl SidecarSupervisor {
         }
         validate_capabilities(object.get("capabilities"))?;
         validate_remote_limits(object.get("limits"), &self.config.limits)?;
-        if object.contains_key("workspacePolicy") {
-            validate_workspace_policy(
-                object.get("workspacePolicy"),
-                self.config.workspace_enforcement_verified,
-            )?;
-        }
         self.expected_server_instance = Some(instance.to_owned());
         Ok(())
     }

@@ -866,8 +866,7 @@ impl RuntimeStatusKind {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TurnStartInput {
     pub thread_id: String,
-    pub mode: String,
-    pub permission_mode: String,
+    pub access_mode: String,
     pub profile_revision: String,
     pub input: Vec<TurnInputPart>,
 }
@@ -880,7 +879,6 @@ pub struct TurnInputPart {
     #[serde(rename = "type")]
     pub kind: String,
     pub text: Option<String>,
-    pub attachment_id: Option<String>,
 }
 
 impl TurnStartInput {
@@ -888,9 +886,10 @@ impl TurnStartInput {
     /// size constraints before any process request is admitted.
     pub(super) fn into_params(self) -> Result<Value, RuntimeCommandError> {
         if !valid_text_id(&self.thread_id, 128)
-            || !matches!(self.mode.as_str(), "plan" | "workspace" | "full_access")
-            || self.permission_mode.is_empty()
-            || self.permission_mode.len() > 64
+            || !matches!(
+                self.access_mode.as_str(),
+                "read_only" | "workspace" | "full_access"
+            )
             || !self.profile_revision.starts_with("profile_")
             || self.profile_revision.len() > 128
             || self.input.is_empty()
@@ -906,22 +905,13 @@ impl TurnStartInput {
                     return Err(RuntimeCommandError::invalid_params());
                 }
                 parts.push(json!({ "type": "text", "text": text }));
-            } else if part.kind == "attachment" {
-                let attachment_id = part
-                    .attachment_id
-                    .ok_or_else(RuntimeCommandError::invalid_params)?;
-                if !valid_text_id(&attachment_id, 128) {
-                    return Err(RuntimeCommandError::invalid_params());
-                }
-                parts.push(json!({ "type": "attachment", "attachmentId": attachment_id }));
             } else {
                 return Err(RuntimeCommandError::invalid_params());
             }
         }
         Ok(json!({
             "threadId": self.thread_id,
-            "mode": self.mode,
-            "permissionMode": self.permission_mode,
+            "accessMode": self.access_mode,
             "profileRevision": self.profile_revision,
             "input": parts,
         }))

@@ -669,10 +669,6 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                     String type = required((ObjectNode) part, "type");
                     if ("text".equals(type)) {
                         text.append(required((ObjectNode) part, "text"));
-                    } else if ("attachment".equals(type)) {
-                        text.append("[attachment:")
-                                .append(required((ObjectNode) part, "attachmentId"))
-                                .append("]");
                     } else {
                         throw new IllegalArgumentException("input part type");
                     }

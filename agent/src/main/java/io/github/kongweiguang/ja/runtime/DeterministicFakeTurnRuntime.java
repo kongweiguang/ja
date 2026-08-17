@@ -174,8 +174,8 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
     /** Emits one complete, ordered fixture timeline and releases the thread admission. */
     private void runTurn(TurnInput input, TurnId turnId, Consumer<TurnEvent> eventPublisher) {
         Instant startedAt = clock.instant();
-        TurnState queued = TurnState.queued(turnId, input.threadId(), input.mode(),
-                input.permissionMode(), startedAt);
+        TurnState queued = TurnState.queued(turnId, input.threadId(), input.accessMode(),
+                PermissionMode.ASK, startedAt);
         ItemIdParts item = new ItemIdParts("item_fake_" + itemSequence.incrementAndGet(), input.threadId());
         boolean terminalPublished = false;
         TurnState latest = queued;
@@ -233,8 +233,7 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
         turn.put("turnId", state.turnId().value());
         turn.put("threadId", state.threadId().value());
         turn.put("status", WireEnums.encode(state.status()));
-        turn.put("mode", WireEnums.encode(state.mode()));
-        turn.put("permissionMode", WireEnums.encode(state.permissionMode()));
+        turn.put("accessMode", WireEnums.encode(state.accessMode()));
         turn.put("startedAt", state.startedAt().toString());
         if (state.completedAt() != null) {
             turn.put("completedAt", state.completedAt().toString());
@@ -312,14 +311,12 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
     }
 
     /** Validates turn/start params and maps all input parts into visible fixture text. */
-    private record TurnInput(ThreadId threadId, TurnMode mode, PermissionMode permissionMode,
+    private record TurnInput(ThreadId threadId, TurnMode accessMode,
                              String inputText, String outputText) {
         private static TurnInput from(ObjectNode params) {
             try {
                 ThreadId threadId = new ThreadId(requiredText(params, "threadId"));
-                TurnMode mode = WireEnums.decode(requiredText(params, "mode"), TurnMode.class);
-                PermissionMode permission = WireEnums.decode(requiredText(params, "permissionMode"),
-                        PermissionMode.class);
+                TurnMode accessMode = WireEnums.decode(requiredText(params, "accessMode"), TurnMode.class);
                 String profile = requiredText(params, "profileRevision");
                 if (!profile.startsWith("profile_")) {
                     throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
@@ -340,10 +337,6 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
                     String type = requiredText((ObjectNode) part, "type");
                     if ("text".equals(type)) {
                         input.append(requiredText((ObjectNode) part, "text"));
-                    } else if ("attachment".equals(type)) {
-                        input.append("[attachment:")
-                                .append(requiredText((ObjectNode) part, "attachmentId"))
-                                .append(']');
                     } else {
                         throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
                     }
@@ -353,7 +346,7 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
                     throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
                 }
                 String output = "Fake response: " + inputText;
-                return new TurnInput(threadId, mode, permission, inputText, output);
+                return new TurnInput(threadId, accessMode, inputText, output);
             } catch (ProtocolException exception) {
                 throw exception;
             } catch (RuntimeException exception) {

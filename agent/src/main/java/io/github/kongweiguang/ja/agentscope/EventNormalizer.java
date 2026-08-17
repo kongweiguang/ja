@@ -11,7 +11,6 @@ import io.agentscope.core.event.AgentEventType;
 import io.agentscope.core.event.AgentResultEvent;
 import io.agentscope.core.event.AgentStartEvent;
 import io.agentscope.core.event.AllToolsDeniedEvent;
-import io.agentscope.core.event.CustomEvent;
 import io.agentscope.core.event.DataBlockDeltaEvent;
 import io.agentscope.core.event.DataBlockEndEvent;
 import io.agentscope.core.event.DataBlockStartEvent;
@@ -23,7 +22,6 @@ import io.agentscope.core.event.ModelCallStartEvent;
 import io.agentscope.core.event.RequestStopEvent;
 import io.agentscope.core.event.RequireExternalExecutionEvent;
 import io.agentscope.core.event.RequireUserConfirmEvent;
-import io.agentscope.core.event.SubagentExposedEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.event.TextBlockEndEvent;
 import io.agentscope.core.event.TextBlockStartEvent;
@@ -44,15 +42,12 @@ import io.github.kongweiguang.ja.domain.ThreadId;
 import io.github.kongweiguang.ja.domain.TurnId;
 import io.github.kongweiguang.ja.protocol.JsonNodes;
 import io.github.kongweiguang.ja.runtime.TurnEvent;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -68,13 +63,6 @@ public final class EventNormalizer {
      * event budget; construction rejects anything below this protocol floor before a stream starts.
      */
     static final int MIN_TERMINAL_EVENT_BYTES = 1_024;
-    private static final int MAX_METADATA_TEXT = 512;
-    private static final Set<String> SAFE_METADATA_KEYS = Set.of(
-            "toolCallId", "toolName", "toolKind", "operationId", "status", "toolCount",
-            "requiresUserAction", "hintSource", "inputBytes", "outputBytes", "customEvent",
-            "valueKeyCount", "phase", "replyId", "usageInputTokens", "usageOutputTokens");
-    private static final String SENSITIVE_NAME_PATTERN =
-            "(?i).*(command|path|api[_-]?key|password|token|secret|cause|stack|trace).*";
     private final ServerInstanceId serverInstanceId;
     private final Clock clock;
     private final Limits limits;
@@ -189,9 +177,7 @@ public final class EventNormalizer {
                 case EXCEED_MAX_ITERS -> terminal(context, "failed", "max_iterations");
                 case ALL_TOOLS_DENIED -> terminal(context, "failed", "all_tools_denied");
                 case REQUEST_STOP -> terminal(context, "interrupted", "request_stop");
-                case SUBAGENT_EXPOSED -> normalizeSubagent((SubagentExposedEvent) event, context);
                 case HINT_BLOCK -> normalizeHint((HintBlockEvent) event, context);
-                case CUSTOM -> normalizeCustom((CustomEvent) event, context);
                 default -> unsupportedEvent(context, type.getValue());
                 };
             } catch (BudgetExceededException exception) {
@@ -448,7 +434,6 @@ public final class EventNormalizer {
     private ItemAccumulator findBlock(Context context, String rawKey, boolean hidden) {
         List<String> categories = hidden
                 ? List.of(ItemKind.RUNTIME_NOTICE.name(), ItemKind.REASONING_SUMMARY.name(),
-                ItemKind.SUBAGENT.name(), ItemKind.PLAN.name(), ItemKind.CONTEXT_COMPACTION.name(),
                 ItemKind.COMMAND.name(), ItemKind.APPROVAL.name())
                 : List.of(ItemKind.AGENT_MESSAGE.name(), ItemKind.TOOL_CALL.name(),
                 ItemKind.COMMAND.name(), ItemKind.RUNTIME_NOTICE.name());
@@ -575,12 +560,6 @@ public final class EventNormalizer {
         return result;
     }
 
-    /** Downgrades exposed-subagent signals because this product build has no subagent admission. */
-    private List<TurnEvent> normalizeSubagent(SubagentExposedEvent event, Context context) {
-        return runtimeNotice(context, "SUBAGENT_EXPOSED", "disabled",
-                operationId(event.getSubagentId()));
-    }
-
     /** Converts harness hints to a closed runtime row so background context is inspectable. */
     private List<TurnEvent> normalizeHint(HintBlockEvent event, Context context) {
         String key = "hint:" + event.getBlockId();
@@ -598,26 +577,9 @@ public final class EventNormalizer {
         return result;
     }
 
-    /** Downgrades untrusted custom signals to ordinary hints; prefixes never gain authority. */
-    private List<TurnEvent> normalizeCustom(CustomEvent event, Context context) {
-        String name = safeIdentifier(event.getName());
-        String key = "custom:" + name + ":" + event.getId();
-        List<TurnEvent> result = new ArrayList<>(startBlock(context, key,
-                ItemKind.RUNTIME_NOTICE, "Agent hint", true));
-        ItemAccumulator item = context.items.get(key(key, ItemKind.RUNTIME_NOTICE.name()));
-        if (item != null) {
-            putMetadata(context, item, "customEvent", name);
-            putMetadata(context, item, "valueKeyCount", safeKeys(event.getValue()).size());
-            putMetadata(context, item, "status", "hint");
-            rewriteStartedItem(result, context, item);
-        }
-        result.addAll(endBlock(context, key));
-        return result;
-    }
-
     /**
      * Rebuilds the start snapshot after metadata is known so clients can
-     * render tool/plan/approval context before the corresponding completion.
+     * render tool/approval context before the corresponding completion.
      */
     private void rewriteStartedItem(List<TurnEvent> result, Context context,
                                     ItemAccumulator item) {
@@ -753,104 +715,30 @@ public final class EventNormalizer {
         return node;
     }
 
-    /** Hashes provider block IDs so untrusted IDs cannot become oversized map keys. */
+    /** Delegates stable item identity and UTF-8-safe hashing to the value policy. */
     private static String key(String raw, String category) {
-        return category + ":" + digest(raw == null ? "unknown" : raw);
+        return EventNormalizerPolicy.key(raw, category);
     }
 
-    /** Uses a deterministic short digest to make item IDs stable without exposing raw IDs. */
+    /** Delegates opaque identity generation so all provider identifiers share one policy. */
     private static String digest(String value) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            updateDigestUtf8(digest, value);
-            byte[] bytes = digest.digest();
-            StringBuilder result = new StringBuilder(16);
-            for (int i = 0; i < 8; i++) {
-                result.append(String.format("%02x", bytes[i]));
-            }
-            return result.toString();
-        } catch (NoSuchAlgorithmException exception) {
-            throw new IllegalStateException("SHA-256 is required by the JDK", exception);
-        }
+        return EventNormalizerPolicy.digest(value);
     }
 
-    /**
-     * Feeds a provider string to the digest one UTF-8 code point at a time, avoiding a full-size
-     * temporary byte array whose size is controlled by the provider.
-     */
-    private static void updateDigestUtf8(MessageDigest digest, String value) {
-        Objects.requireNonNull(value, "value");
-        for (int index = 0; index < value.length(); index++) {
-            char character = value.charAt(index);
-            if (Character.isHighSurrogate(character)) {
-                if (index + 1 >= value.length()
-                        || !Character.isLowSurrogate(value.charAt(index + 1))) {
-                    throw new IllegalArgumentException("AgentScope value contains malformed UTF-16");
-                }
-                int codePoint = Character.toCodePoint(character, value.charAt(++index));
-                digest.update((byte) (0xF0 | (codePoint >> 18)));
-                digest.update((byte) (0x80 | ((codePoint >> 12) & 0x3F)));
-                digest.update((byte) (0x80 | ((codePoint >> 6) & 0x3F)));
-                digest.update((byte) (0x80 | (codePoint & 0x3F)));
-            } else if (Character.isLowSurrogate(character)) {
-                throw new IllegalArgumentException("AgentScope value contains malformed UTF-16");
-            } else if (character <= 0x7F) {
-                digest.update((byte) character);
-            } else if (character <= 0x7FF) {
-                digest.update((byte) (0xC0 | (character >> 6)));
-                digest.update((byte) (0x80 | (character & 0x3F)));
-            } else {
-                digest.update((byte) (0xE0 | (character >> 12)));
-                digest.update((byte) (0x80 | ((character >> 6) & 0x3F)));
-                digest.update((byte) (0x80 | (character & 0x3F)));
-            }
-        }
-    }
-
-    /** Bounds metadata and keeps surrogate pairs valid before they enter JSON. */
+    /** Delegates bounded string retention so event mapping never owns a second Unicode policy. */
     private static String bounded(String value) {
-        if (value == null) {
-            return "";
-        }
-        if (value.length() <= MAX_METADATA_TEXT) {
-            // Validate the full retained value because it will be serialized as JSON later.
-            utf8BytesAtMost(value, Integer.MAX_VALUE);
-            return value;
-        }
-        int end = MAX_METADATA_TEXT;
-        // Avoid returning an unpaired high surrogate when a provider puts a
-        // supplementary character exactly at the metadata boundary.
-        if (Character.isHighSurrogate(value.charAt(end - 1))) {
-            end--;
-        }
-        String bounded = value.substring(0, end);
-        // Only the retained prefix crosses the wire; validating it avoids scanning an unbounded
-        // provider suffix while still rejecting malformed UTF-16 in the emitted value.
-        utf8BytesAtMost(bounded, Integer.MAX_VALUE);
-        return bounded;
-    }
-
-    /** Whitelists only metadata key names so custom event values cannot cross the wire. */
-    private static List<String> safeKeys(Map<String, Object> value) {
-        if (value == null || value.isEmpty()) {
-            return List.of();
-        }
-        return value.keySet().stream().filter(Objects::nonNull)
-                .map(EventNormalizer::bounded)
-                .filter(key -> !isSensitiveName(key))
-                .filter(key -> key.matches("[A-Za-z0-9_.-]{1,64}"))
-                .limit(32).toList();
+        return EventNormalizerPolicy.bounded(value);
     }
 
     /** Adds only typed allowlisted metadata and accounts its UTF-8 footprint. */
     private void putMetadata(Context context, ItemAccumulator item, String key, Object value) {
-        if (!SAFE_METADATA_KEYS.contains(key)) {
+        if (!EventNormalizerPolicy.isSafeMetadataKey(key)) {
             return;
         }
-        Object safeValue = safeMetadataValue(key, value);
+        Object safeValue = EventNormalizerPolicy.safeMetadataValue(key, value);
         Object oldValue = item.metadata.get(key);
-        int oldBytes = oldValue == null ? 0 : metadataCost(key, oldValue);
-        int newBytes = metadataCost(key, safeValue);
+        int oldBytes = oldValue == null ? 0 : EventNormalizerPolicy.metadataCost(key, oldValue);
+        int newBytes = EventNormalizerPolicy.metadataCost(key, safeValue);
         long projected = (long) context.metadataBytes - oldBytes + newBytes;
         if (projected > limits.maxMetadataBytes()) {
             context.overflow = true;
@@ -860,79 +748,39 @@ public final class EventNormalizer {
         item.metadata.put(key, safeValue);
     }
 
-    /** Overestimates JSON metadata overhead so the retained map stays under its hard budget. */
-    private static int metadataCost(String key, Object value) {
-        return safeByteCount(key) + safeByteCount(String.valueOf(value)) + 16;
-    }
-
-    /** Reduces metadata values to strings/counters that cannot carry provider payloads. */
-    private static Object safeMetadataValue(String key, Object value) {
-        if (value instanceof Number number) {
-            return Math.max(0L, Math.min(Integer.MAX_VALUE, number.longValue()));
-        }
-        if (value instanceof Boolean bool) {
-            return bool;
-        }
-        if ("toolName".equals(key) || "toolKind".equals(key) || "hintSource".equals(key)
-                || "customEvent".equals(key) || "phase".equals(key) || "status".equals(key)) {
-            return safeIdentifier(String.valueOf(value));
-        }
-        return safeIdentifier(String.valueOf(value));
-    }
-
     /** Converts provider identifiers to bounded opaque labels instead of exposing raw values. */
     private static String safeIdentifier(String value) {
-        if (value == null || value.isBlank()) {
-            return "unknown";
-        }
-        if (isSensitiveName(value)) {
-            return "redacted";
-        }
-        String normalized = bounded(value);
-        return normalized.matches("[A-Za-z0-9_.:/-]{1,128}") ? normalized : "opaque_" + digest(normalized);
+        return EventNormalizerPolicy.safeIdentifier(value);
     }
 
     /** Keeps tool names useful for the UI while rejecting command/path/credential-like labels. */
     private static String safeToolName(String value) {
-        String normalized = safeIdentifier(value);
-        return isSensitiveName(normalized) ? "redacted" : normalized;
+        return EventNormalizerPolicy.safeToolName(value);
     }
 
     /** Provides a stable tool kind without forwarding argument-shaped names. */
     private static String toolKind(String value) {
-        return safeToolName(value).equals("redacted") ? "tool" : safeToolName(value);
+        return EventNormalizerPolicy.toolKind(value);
     }
 
     /** Uses an opaque operation identity so raw provider IDs cannot become UI data. */
     private static String operationId(String value) {
-        return "op_" + digest(value == null ? "unknown" : value);
+        return EventNormalizerPolicy.operationId(value);
     }
 
     /** Allows only product-owned terminal diagnostics so provider causes never reach the UI. */
     private static String terminalReason(String value) {
-        if (value == null || value.isBlank()) {
-            return "";
-        }
-        return switch (value) {
-            case "cancelled", "cancelled_before_start", "cancelled_before_execution",
-                    "deadline_exceeded", "provider_error", "event_budget_exceeded",
-                    "max_iterations", "all_tools_denied", "request_stop", "scheduler_rejected" -> value;
-            default -> "provider_error";
-        };
+        return EventNormalizerPolicy.terminalReason(value);
     }
 
     /** Restricts terminal status to the product's finite lifecycle vocabulary. */
     private static String terminalStatus(String value) {
-        return switch (value) {
-            case "failed" -> "failed";
-            case "interrupted" -> "interrupted";
-            default -> "completed";
-        };
+        return EventNormalizerPolicy.terminalStatus(value);
     }
 
     /** Counts bytes after strict Unicode validation; null payloads are intentionally zero. */
     private static int safeByteCount(String value) {
-        return value == null ? 0 : utf8BytesAtMost(value, Integer.MAX_VALUE);
+        return EventNormalizerPolicy.safeByteCount(value);
     }
 
     /**
@@ -940,36 +788,7 @@ public final class EventNormalizer {
      * provider delta cannot force a second byte-array allocation merely to discover overflow.
      */
     private static int utf8BytesAtMost(String value, int cap) {
-        Objects.requireNonNull(value, "value");
-        if (cap < 0) {
-            throw new IllegalArgumentException("UTF-8 cap is negative");
-        }
-        int bytes = 0;
-        for (int index = 0; index < value.length(); index++) {
-            char character = value.charAt(index);
-            int increment;
-            if (Character.isHighSurrogate(character)) {
-                if (index + 1 >= value.length()
-                        || !Character.isLowSurrogate(value.charAt(index + 1))) {
-                    throw new IllegalArgumentException("AgentScope value contains malformed UTF-16");
-                }
-                increment = 4;
-                index++;
-            } else if (Character.isLowSurrogate(character)) {
-                throw new IllegalArgumentException("AgentScope value contains malformed UTF-16");
-            } else if (character <= 0x7F) {
-                increment = 1;
-            } else if (character <= 0x7FF) {
-                increment = 2;
-            } else {
-                increment = 3;
-            }
-            if ((long) bytes + increment > cap) {
-                return cap == Integer.MAX_VALUE ? Integer.MAX_VALUE : cap + 1;
-            }
-            bytes += increment;
-        }
-        return bytes;
+        return EventNormalizerPolicy.utf8BytesAtMost(value, cap);
     }
 
     /** Exposes the same bounded counter to package tests without reintroducing full-byte encoding. */
@@ -979,12 +798,7 @@ public final class EventNormalizer {
 
     /** Prevents negative provider counters from crossing the protocol boundary. */
     private static int nonNegative(int value) {
-        return Math.max(0, value);
-    }
-
-    /** Identifies names that are unsafe to forward even when supplied as metadata keys. */
-    private static boolean isSensitiveName(String value) {
-        return value != null && value.matches(SENSITIVE_NAME_PATTERN);
+        return EventNormalizerPolicy.nonNegative(value);
     }
 
     /** Mutable per-turn normalization state, never shared across sessions. */

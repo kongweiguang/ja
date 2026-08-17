@@ -56,8 +56,8 @@ fn run() -> Result<(), ()> {
         return Err(());
     }
     check_framing_boundaries()?;
-    if valid_frames != 46
-        || method_results != 12
+    if valid_frames != 44
+        || method_results != 11
         || parse_frames != 31
         || property_valid != 100
         || property_invalid != 100
@@ -473,20 +473,8 @@ fn replay_minor_compatibility_through_supervisor(document: &Value) -> Result<(),
     {
         return Err(());
     }
-    let mut initialize = params.clone();
-    initialize
-        .as_object_mut()
-        .ok_or(())?
-        .insert(
-            "workspacePolicy".to_owned(),
-            serde_json::json!({
-                "mode": "plan",
-                "network": "disabled",
-                "enforcement": "unavailable",
-                "protectedRoots": []
-            }),
-        );
-    let mut supervisor = production_supervisor("minor.json", Some(initialize))?;
+    let supervisor_params = params.clone();
+    let mut supervisor = production_supervisor("minor.json", Some(supervisor_params))?;
     supervisor.start().map_err(|_| ())?;
     if supervisor.state() != LifecycleState::Ready {
         return Err(());

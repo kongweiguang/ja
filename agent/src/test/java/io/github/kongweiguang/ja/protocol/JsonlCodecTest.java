@@ -111,10 +111,10 @@ class JsonlCodecTest {
                 JsonNodeFactory.instance.objectNode().put("message", large), RpcDirection.SERVER_TO_CLIENT);
         assertThrows(ProtocolException.class, () -> encode(notification));
         ProtocolLimits tooSmall = new ProtocolLimits(1024, 1, 1, 1, 1, 256, 1024,
-                1_048_576, 4096, 1000, 1000);
+                4096, 1000, 1000);
         assertThrows(ProtocolException.class, () -> new HandshakeJsonlCodec(readyState()).encode(notification, tooSmall));
         assertThrows(IllegalArgumentException.class, () -> new ProtocolLimits(1024, 1, 1, 1, 1,
-                ProtocolLimits.MAX_ITEM_DELTA_BYTES + 1, 1024, 1_048_576, 4096, 1000, 1000));
+                ProtocolLimits.MAX_ITEM_DELTA_BYTES + 1, 1024, 4096, 1000, 1000));
     }
 
     /** Verifies wire errors use redacted bounded fields and fixed schema ranges. */

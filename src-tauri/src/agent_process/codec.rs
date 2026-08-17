@@ -86,7 +86,6 @@ impl Limits {
             "maxPendingRequests": self.max_pending_requests,
             "maxItemDeltaBytes": 65_536,
             "maxInlineToolOutputBytes": 1_048_576,
-            "maxArtifactBytes": 268_435_456,
             "maxLogBytes": self.max_log_bytes,
             "defaultRequestDeadlineMs": self.request_deadline_ms,
             "defaultApprovalDeadlineMs": self.approval_deadline_ms,

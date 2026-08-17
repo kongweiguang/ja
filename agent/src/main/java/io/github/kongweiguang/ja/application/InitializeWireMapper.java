@@ -62,7 +62,7 @@ public final class InitializeWireMapper {
             throw invalidParams();
         }
         return new Capabilities(textArray(node, "methods"), textArray(node, "events"),
-                textArray(node, "permissionModes"), textArray(node, "itemKinds"),
+                textArray(node, "accessModes"), textArray(node, "itemKinds"),
                 readMcp(node.get("mcp")));
     }
 
@@ -84,7 +84,7 @@ public final class InitializeWireMapper {
                 requiredInt(node, "maxInboundQueueFrames"), requiredInt(node, "maxOutboundQueueFrames"),
                 requiredInt(node, "maxInFlightRequests"), requiredInt(node, "maxPendingRequests"),
                 requiredInt(node, "maxItemDeltaBytes"), requiredInt(node, "maxInlineToolOutputBytes"),
-                requiredInt(node, "maxArtifactBytes"), requiredInt(node, "maxLogBytes"),
+                requiredInt(node, "maxLogBytes"),
                 requiredInt(node, "defaultRequestDeadlineMs"), requiredInt(node, "defaultApprovalDeadlineMs"));
     }
 
@@ -93,7 +93,7 @@ public final class InitializeWireMapper {
         ObjectNode node = io.github.kongweiguang.ja.protocol.JsonNodes.object();
         node.set("methods", textArray(capabilities.methods()));
         node.set("events", textArray(capabilities.events()));
-        node.set("permissionModes", textArray(capabilities.permissionModes()));
+        node.set("accessModes", textArray(capabilities.accessModes()));
         node.set("itemKinds", textArray(capabilities.itemKinds()));
         ObjectNode mcp = io.github.kongweiguang.ja.protocol.JsonNodes.object();
         mcp.set("protocolVersions", textArray(capabilities.mcp().protocolVersions()));
@@ -113,7 +113,6 @@ public final class InitializeWireMapper {
         node.put("maxPendingRequests", limits.maxPendingRequests());
         node.put("maxItemDeltaBytes", limits.maxItemDeltaBytes());
         node.put("maxInlineToolOutputBytes", limits.maxInlineToolOutputBytes());
-        node.put("maxArtifactBytes", limits.maxArtifactBytes());
         node.put("maxLogBytes", limits.maxLogBytes());
         node.put("defaultRequestDeadlineMs", limits.defaultRequestDeadlineMs());
         node.put("defaultApprovalDeadlineMs", limits.defaultApprovalDeadlineMs());

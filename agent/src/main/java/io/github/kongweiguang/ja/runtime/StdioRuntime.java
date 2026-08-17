@@ -482,7 +482,8 @@ public final class StdioRuntime implements AutoCloseable {
         return new Capabilities(methods,
                 List.of("runtime/statusChanged", "turn/started", "item/started", "item/delta",
                         "item/completed", "turn/completed"),
-                List.of("plan", "workspace", "full_access"), List.of("agent_message"),
+                List.of("read_only", "workspace", "full_access"),
+                List.of("user_message", "agent_message", "commentary", "tool_call", "command", "file_change", "approval"),
                 McpCapabilities.empty());
     }
 
@@ -491,7 +492,7 @@ public final class StdioRuntime implements AutoCloseable {
         ObjectNode node = JsonNodes.object();
         node.set("methods", textArray(capabilities.methods()));
         node.set("events", textArray(capabilities.events()));
-        node.set("permissionModes", textArray(capabilities.permissionModes()));
+        node.set("accessModes", textArray(capabilities.accessModes()));
         node.set("itemKinds", textArray(capabilities.itemKinds()));
         ObjectNode mcp = JsonNodes.object();
         mcp.set("protocolVersions", textArray(capabilities.mcp().protocolVersions()));

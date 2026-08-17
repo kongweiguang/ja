@@ -12,12 +12,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.agentscope.core.event.AgentEndEvent;
 import io.agentscope.core.event.AgentStartEvent;
-import io.agentscope.core.event.CustomEvent;
 import io.agentscope.core.event.ExceedMaxItersEvent;
 import io.agentscope.core.event.ExternalExecutionResultEvent;
 import io.agentscope.core.event.ModelCallEndEvent;
 import io.agentscope.core.event.ModelCallStartEvent;
-import io.agentscope.core.event.SubagentExposedEvent;
 import io.agentscope.core.event.UserConfirmResultEvent;
 import io.agentscope.core.event.ConfirmResult;
 import io.agentscope.core.message.ToolResultBlock;
@@ -89,29 +87,6 @@ final class EventNormalizerTest {
         assertEquals("reasoning_summary", end.params().path("item").path("kind").textValue());
     }
 
-    /** Ensures untrusted plan/compaction prefixes remain ordinary non-authoritative hints. */
-    @Test
-    void downgradesCustomEventsWithoutRawPayloads() {
-        EventNormalizer normalizer = normalizer();
-        EventNormalizer.Context context = normalizer.open(
-                new ThreadId("thr_plan"), new TurnId("turn_plan"));
-        List<TurnEvent> events = normalizer.normalize(new CustomEvent(
-                "plan_update", Map.of("secret", "do-not-forward", "phase", "draft")), context);
-        assertEquals("item/started", events.getFirst().method());
-        assertEquals("runtime_notice", events.getFirst().params().path("item").path("kind").textValue());
-        assertEquals("plan_update", events.getFirst().params().path("item").path("metadata")
-                .path("customEvent").textValue());
-        assertFalse(events.getFirst().params().toString().contains("secret"));
-        assertEquals("item/completed", events.get(1).method());
-        assertFalse(events.get(1).params().toString().contains("do-not-forward"));
-
-        List<TurnEvent> compaction = normalizer.normalize(new CustomEvent(
-                "compaction_started", Map.of("summary", "private")),
-                normalizer.open(new ThreadId("thr_compact"), new TurnId("turn_compact")));
-        assertEquals("runtime_notice", compaction.getFirst().params().path("item")
-                .path("kind").textValue());
-    }
-
     /** Classifies all v2 model/approval result events without promoting provider state. */
     @Test
     void normalizesKnownLifecycleResults() {
@@ -148,19 +123,6 @@ final class EventNormalizerTest {
         assertTrue(delta.toString().contains("redacted"));
     }
 
-    /** Subagent events remain diagnostics because no subagent admission budget is exposed. */
-    @Test
-    void downgradesSubagentExposureWhenCapabilityIsDisabled() {
-        EventNormalizer normalizer = normalizer();
-        EventNormalizer.Context context = normalizer.open(
-                new ThreadId("thr_subagent"), new TurnId("turn_subagent"));
-        TurnEvent event = normalizer.normalize(new SubagentExposedEvent(
-                "sub_1", "agent_1", "session_1", "private label"), context).getFirst();
-        assertEquals("runtime/notice", event.method());
-        assertEquals("disabled", event.params().path("phase").textValue());
-        assertFalse(event.params().toString().contains("private label"));
-    }
-
     /** Unknown-event diagnostics cannot create item or authoritative turn state. */
     @Test
     void unknownEventIsUnsupportedDiagnostic() {
@@ -192,7 +154,8 @@ final class EventNormalizerTest {
                 .path("terminalStatus").textValue());
         assertEquals("max_iterations", events.getFirst().params().path("turn")
                 .path("reason").textValue());
-        assertTrue(normalizer.normalize(new CustomEvent("late", Map.of()), context).isEmpty());
+        assertTrue(normalizer.normalize(new TextBlockDeltaEvent("reply", "late", "late"),
+                context).isEmpty());
     }
 
     /** Enforces the UTF-8 budget before a provider can retain oversized output. */

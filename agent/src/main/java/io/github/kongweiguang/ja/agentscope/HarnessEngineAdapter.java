@@ -6,9 +6,10 @@ package io.github.kongweiguang.ja.agentscope;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEvent;
 import io.agentscope.core.message.UserMessage;
-import io.agentscope.core.state.InMemoryAgentStateStore;
 import io.agentscope.harness.agent.HarnessAgent;
-import java.util.Locale;
+import io.agentscope.harness.agent.filesystem.sandbox.AbstractSandboxFilesystem;
+import io.agentscope.harness.agent.filesystem.local.LocalFilesystemWithShell;
+import io.agentscope.harness.agent.filesystem.sandbox.SandboxBackedFilesystem;
 import java.util.Objects;
 import reactor.core.publisher.Flux;
 
@@ -25,28 +26,21 @@ public final class HarnessEngineAdapter implements AgentScopeEngine {
         verifyDelegate(delegate);
     }
 
-    /** Rejects a Harness built outside the product composition boundary. */
+    /** Rejects a Harness that can escape the bounded JA filesystem boundary. */
     private static void verifyDelegate(HarnessAgent candidate) {
-        boolean safeMiddlewares = candidate.getDelegate().getMiddlewares().stream()
-                .map(middleware -> middleware.getClass().getName().toLowerCase(Locale.ROOT))
-                .noneMatch(name -> name.contains("subagent") || name.contains("plan")
-                        || name.contains("compaction") || name.contains("workspacecontext")
-                        || name.contains("atpathexpansion") || name.contains("memory"));
         if (!(candidate.getWorkspaceManager() != null
-                && candidate.getWorkspaceManager().getFilesystem() instanceof InMemoryFilesystem)
-                || !(candidate.getStateStore() instanceof InMemoryAgentStateStore)
-                || !candidate.getToolkit().getToolNames().isEmpty()
-                || !candidate.getSkillRepositories().isEmpty()
-                || candidate.getSubagentAgentManager() != null
-                || candidate.getCompactionHook() != null
-                || !safeMiddlewares) {
-            throw new IllegalArgumentException("HarnessAgent is not a verified JA construction");
+                && candidate.getWorkspaceManager().getFilesystem() instanceof AbstractSandboxFilesystem
+                && (candidate.getWorkspaceManager().getFilesystem() instanceof LocalFilesystemWithShell
+                || candidate.getWorkspaceManager().getFilesystem() instanceof SandboxBackedFilesystem))
+                || candidate.getStateStore() == null) {
+            throw new IllegalArgumentException("HarnessAgent is outside the JA filesystem boundary");
         }
     }
 
     /**
      * Uses HarnessAgent's v2 event stream because it preserves fine-grained
-     * tool, plan and subagent signals needed by JA's timeline.
+     * tool and lifecycle signals; unsupported extension events are classified
+     * by the JA normalizer without becoming authoritative state.
      */
     @Override
     public Flux<AgentEvent> stream(String input, RuntimeContext context) {

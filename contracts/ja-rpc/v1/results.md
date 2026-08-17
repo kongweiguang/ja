@@ -21,7 +21,7 @@ JSON-RPC response 没有 `method` 字段，因此根 Schema 的 response envelop
 | `version` | `versionResult` | `protocolMajor`、`protocolMinor`、`serverVersion`、`serverInstanceId`、`runtime` |
 | `capabilities/read` | `capabilitiesResult` | `capabilities`；可选 `unsupported[]` |
 | `health/read` | `healthResult` | `status`、`checks` |
-| `diagnostics/read` | `diagnosticsResult` | `status`；可选脱敏 `report`/`artifact` |
+| `diagnostics/read` | `diagnosticsResult` | `status`；可选脱敏 `report` |
 | `shutdown` | `shutdownResult` | `accepted`、`status`；可选 `deadlineMs` |
 | `workspace/open` | `workspaceOpenResult` | `workspace` |
 | `workspace/list` | `workspaceListResult` | `workspaces[]`；可选 `nextCursor` |
@@ -45,13 +45,11 @@ JSON-RPC response 没有 `method` 字段，因此根 Schema 的 response envelop
 | `thread/delete` | `threadMutationResult` | `accepted`、`threadId`、`status=deleted` |
 | `thread/purge` | `threadMutationResult` | `accepted`、`threadId`、`status=purged` |
 | `turn/start` | `turnStartResult` | `accepted`、`turnId`、`queued`；可选 status |
-| `turn/cancel` | `turnCancelResult` | `accepted`、`turnId`、`status=interrupting/interrupted/recovery_required` |
-| `turn/steer` | `turnSteerResult` | `accepted`、`turnId`、`queued` |
-| `turn/followUp` | `turnFollowUpResult` | `accepted`、`turnId`、`queued` |
+| `turn/cancel` | `turnCancelResult` | `accepted`、`turnId`、`status=interrupting/interrupted` |
 
 `thread/read` 的 `snapshotSeq` 是同一只读事务里的截止序号；它与
-`thread/subscribe.fromSeq` 一起形成 snapshot→live 无缺口流程。`turn/start`、
-`turn/cancel`、steer 和 follow-up 的 response 都只是 ACK/排队结果；Turn terminal
+`thread/subscribe.fromSeq` 一起形成 snapshot→live 无缺口流程。`turn/start` 与
+`turn/cancel` 的 response 都只是 ACK/排队结果；Turn terminal
 事实只能由 `turn/completed` notification 表达。
 
 ## Profile 与 Model
@@ -96,16 +94,13 @@ Skill result 只描述不可变 revision 和健康状态；导入/enable/reload 
 MCP result 只覆盖 Tools registry。Resources、Prompts、Sampling、OAuth 等未实现能力
 不能通过扩展 result object 被隐式启用；MCP server 自报 read-only 也不能跳过 Tool policy。
 
-## Attachment 与 Java→Rust request
+## Java→Rust request
 
 | request method | result `$defs` | 必填核心字段 |
 | --- | --- | --- |
-| `attachment/import` | `attachmentImportResult` | `attachment`，含 opaque id、artifact、size/hash/media |
-| `attachment/read` | `attachmentReadResult` | `attachment` |
-| `attachment/delete` | `attachmentDeleteResult` | `accepted`、`attachmentId` |
-| `approval/request` | `approvalResponseResult` | `decision`、`resolvedAt`；可选 scope |
+| `approval/request` | `approvalResponseResult` | `decision`、`resolvedAt` |
 | `secret/resolve` | `secretResolveResult` | `secretValue`；可选 expiresAt（敏感字段） |
-| `externalTool/request` | `externalToolResponseResult` | `accepted`、`status`；可选 output/artifact |
+| `externalTool/request` | `externalToolResponseResult` | `accepted`、`status`；可选 output |
 
 `approval/request`、`secret/resolve` 和 `externalTool/request` 的 pending id 必须是
 `s:`。Approval response 只确认用户决定，Secret response 只在 Java 内存中短暂使用，

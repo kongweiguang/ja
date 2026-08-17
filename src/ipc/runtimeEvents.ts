@@ -22,21 +22,11 @@ export const EventIdSchema = id("evt_", 100);
 export const WorkspaceIdSchema = id("ws_", 99);
 export const ApprovalIdSchema = id("appr_", 101);
 export const ProfileRevisionSchema = id("profile_", 104);
-export const AttachmentIdSchema = id("att_", 99);
 export const ServerInstanceIdSchema = id("srv_", 101);
 
 export const InputPartSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("text"), text: z.string().min(1).max(1_048_576) }).strip(),
-  z.object({ type: z.literal("attachment"), attachmentId: AttachmentIdSchema }).strip(),
 ]);
-
-const artifactSchema = z.object({
-  artifactId: id("artifact_", 105),
-  sizeBytes: z.number().int().min(1).max(1_073_741_824),
-  sha256: z.string().regex(/^[A-Fa-f0-9]{64}$/),
-  mediaType: z.string().min(1).max(128),
-  displayName: z.string().max(512).optional(),
-}).strip();
 
 /** Only a stable code/retry flag may describe a failed turn in the UI. */
 const safeTurnErrorSchema = z.object({
@@ -48,7 +38,7 @@ export const ThreadSchema = z.object({
   threadId: ThreadIdSchema,
   workspaceId: WorkspaceIdSchema,
   title: z.string().max(512),
-  status: z.enum(["idle", "running", "waiting_approval", "recovery_required", "archived"]),
+  status: z.enum(["idle", "running", "waiting_approval", "archived"]),
   lastSeq: snapshotSequenceSchema,
   activeTurnId: TurnIdSchema.optional(),
 }).strip();
@@ -58,7 +48,6 @@ export const TurnSchema = z.object({
   threadId: ThreadIdSchema,
   status: z.enum([
     "queued",
-    "waiting_workspace",
     "running",
     "waiting_approval",
     "interrupting",
@@ -66,10 +55,8 @@ export const TurnSchema = z.object({
     "interrupted",
     "failed",
     "aborted_by_runtime",
-    "recovery_required",
   ]),
-  mode: z.enum(["plan", "workspace", "full_access"]),
-  permissionMode: z.enum(["allow", "ask", "deny"]),
+  accessMode: z.enum(["read_only", "workspace", "full_access"]),
   startedAt: timestampSchema.optional(),
   completedAt: timestampSchema.optional(),
   error: safeTurnErrorSchema.optional(),
@@ -82,25 +69,21 @@ export const ItemSchema = z.object({
     "user_message",
     "agent_message",
     "commentary",
-    "reasoning_summary",
-    "plan",
     "tool_call",
     "command",
     "file_change",
     "approval",
-    "subagent",
-    "context_compaction",
-    "runtime_notice",
   ]),
   status: z.enum(["started", "in_progress", "completed", "failed", "cancelled"]),
   title: z.string().max(512).optional(),
   text: z.string().max(1_048_576).optional(),
-  artifact: artifactSchema.optional(),
 }).strip();
 
 const safeActionSchema = z.object({
-  kind: z.enum(["file_read", "file_write", "file_delete", "shell", "mcp_tool", "external_tool", "network"]),
-  fingerprint: id("act_", 100),
+  kind: z.enum(["file_read", "file_write", "file_delete", "shell", "mcp_tool", "external_tool"]),
+  command: z.string().max(4096).optional(),
+  cwd: z.string().max(4096).optional(),
+  relativePaths: z.array(z.string().max(4096)).max(128).optional(),
 }).strip();
 
 export const ApprovalSummarySchema = z.object({
@@ -110,13 +93,14 @@ export const ApprovalSummarySchema = z.object({
   itemId: ItemIdSchema,
   action: safeActionSchema,
   risk: z.enum(["low", "medium", "high", "critical"]),
+  accessMode: z.enum(["read_only", "workspace", "full_access"]),
   expiresAt: timestampSchema,
 }).strip();
 
 export const TurnEventParamsSchema = z.object({ turn: TurnSchema }).strip();
 export const TurnCompletedParamsSchema = z.object({
   turn: TurnSchema,
-  terminalStatus: z.enum(["completed", "interrupted", "failed", "aborted_by_runtime", "recovery_required"]),
+  terminalStatus: z.enum(["completed", "interrupted", "failed", "aborted_by_runtime"]),
 }).strip().superRefine((params, context) => {
   if (params.turn.status !== params.terminalStatus) {
     context.addIssue({ code: "custom", message: "terminalStatus must match turn.status" });
@@ -131,8 +115,7 @@ export const ThreadChangedParamsSchema = z.object({
 export const ApprovalEventParamsSchema = z.object({ approval: ApprovalSummarySchema }).strip();
 export const ApprovalResolvedParamsSchema = z.object({
   approvalId: ApprovalIdSchema,
-  decision: z.enum(["allow_once", "allow_scope", "deny", "expired", "disconnected"]),
-  scope: z.enum(["once", "thread", "workspace"]).optional(),
+  decision: z.enum(["allow_once", "allow_session", "deny", "expired", "disconnected"]),
   resolvedAt: timestampSchema,
 }).strip();
 export const ExternalToolEventParamsSchema = z.object({
@@ -146,14 +129,9 @@ export const ExternalToolEventParamsSchema = z.object({
 export const RuntimeStatusWireKindSchema = z.enum([
   "starting",
   "ready",
-  "busy",
-  "stopping",
   "shutting_down",
   "stopped",
-  "recovery_required",
   "crashed",
-  "incompatible",
-  "faulted",
 ]);
 
 export type RuntimeStatusWireKind = z.infer<typeof RuntimeStatusWireKindSchema>;
@@ -161,13 +139,12 @@ export const RuntimeGenerationSchema = z.number().int().min(0).max(Number.MAX_SA
 
 /**
  * Keeps command state and lifecycle event validation distinct because Rust
- * reports recovery without a generation only through the state command,
- * while a zero-generation event is reserved for startup and stopped frames.
+ * requires a positive generation for live lifecycle events, while a
+ * zero-generation event is reserved for startup and stopped frames.
  */
 export function isRuntimeGenerationValid(status: string, generation: number, allowStarting = false): boolean {
   return generation > 0
     || status === "stopped"
-    || (!allowStarting && status === "recovery_required")
     || (allowStarting && status === "starting");
 }
 
@@ -175,7 +152,7 @@ const runtimeNoticeParamsSchema = z.object({
   code: z.string().regex(/^[A-Z][A-Z0-9_]{2,63}$/),
 }).strip();
 const runtimeOverloadParamsSchema = z.object({
-  queue: z.enum(["inbound", "outbound", "pending", "artifact", "tool_output"]),
+  queue: z.enum(["inbound", "outbound", "pending", "tool_output"]),
   retryable: z.boolean(),
   retryAfterMs: z.number().int().min(1).max(3_600_000).optional(),
 }).strip();

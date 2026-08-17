@@ -11,15 +11,15 @@ import io.github.kongweiguang.ja.protocol.UnicodeChecks;
 
 /** Bounded mandatory capability object matching the frozen initialize schema. */
 public record Capabilities(List<String> methods, List<String> events,
-                           List<String> permissionModes, List<String> itemKinds,
+                           List<String> accessModes, List<String> itemKinds,
                            McpCapabilities mcp) {
-    private static final Set<String> PERMISSION_MODES = Set.of("plan", "workspace", "full_access");
+    private static final Set<String> ACCESS_MODES = Set.of("read_only", "workspace", "full_access");
 
     /** Copies all capability arrays and validates the limits before handshake publication. */
     public Capabilities {
         methods = bounded(methods, 256, 128, null, "methods");
         events = bounded(events, 256, 128, null, "events");
-        permissionModes = bounded(permissionModes, 3, 32, PERMISSION_MODES, "permissionModes");
+        accessModes = bounded(accessModes, 3, 32, ACCESS_MODES, "accessModes");
         itemKinds = bounded(itemKinds, 64, 64, null, "itemKinds");
         mcp = Objects.requireNonNull(mcp, "mcp");
     }
@@ -33,7 +33,7 @@ public record Capabilities(List<String> methods, List<String> events,
     public Capabilities intersect(Capabilities peer) {
         Objects.requireNonNull(peer, "peer");
         return new Capabilities(intersection(methods, peer.methods),
-                intersection(events, peer.events), intersection(permissionModes, peer.permissionModes),
+                intersection(events, peer.events), intersection(accessModes, peer.accessModes),
                 intersection(itemKinds, peer.itemKinds), mcp.intersect(peer.mcp));
     }
 

@@ -4,32 +4,83 @@
 package io.github.kongweiguang.ja.agentscope;
 
 import io.agentscope.core.model.Model;
-import io.agentscope.core.tool.Toolkit;
-import io.agentscope.core.tool.ToolkitConfig;
 import io.agentscope.core.state.InMemoryAgentStateStore;
+import io.agentscope.core.tool.Toolkit;
 import io.agentscope.harness.agent.HarnessAgent;
-import java.util.List;
-import java.util.Locale;
+import io.agentscope.harness.agent.filesystem.sandbox.AbstractSandboxFilesystem;
+import io.github.kongweiguang.ja.skills.JaSkillSources;
+import io.github.kongweiguang.ja.tools.JaApplyPatchTool;
+import io.github.kongweiguang.ja.tools.JaSandboxFilesystem;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Objects;
 
 /**
- * Product-owned composition boundary for AgentScope Harness. The first JA
- * build is intentionally fail-closed: all host-backed tools, plan mutation,
- * persistence and subagent orchestration are disabled until their product
- * owners provide typed ports. There is deliberately no SubagentBudget facade
- * while no admission owner exists, so unsupported capability cannot be exposed.
+ * Product-owned composition boundary for AgentScope Harness. JA owns only the
+ * explicit filesystem, temporary workspace and state store here; AgentScope
+ * remains the source of truth for tools, skills, MCP registration, permissions,
+ * HITL and middleware composition.
  */
 public final class HarnessFactory {
     private final Config config;
+    private final AbstractSandboxFilesystem filesystem;
+    private final Path workspace;
+    private final JaSkillSources skillSources;
 
-    /** Creates a factory with the host-isolated coding defaults. */
+    /** Creates a factory with JA's credential-stripping workspace boundary. */
     public HarnessFactory() {
-        this(Config.defaults());
+        this(Config.defaults(), defaultWorkspace());
     }
 
-    /** Injects only bounded, non-I/O composition values for one agent lifetime. */
+    /** Injects bounded composition values while retaining AgentScope capabilities. */
     public HarnessFactory(Config config) {
+        this(config, defaultWorkspace());
+    }
+
+    /**
+     * Allows the product sandbox owner to inject a typed AgentScope sandbox filesystem without
+     * adding a JA tool/manager facade or silently falling back to a repository path.
+     */
+    public HarnessFactory(Config config, AbstractSandboxFilesystem filesystem, Path workspace) {
+        this(config, filesystem, workspace, null);
+    }
+
+    /**
+     * Exposes the future INT-JAVA composition seam: the caller owns the workspace, sandbox and
+     * optional AgentScope-backed skill repositories, while this factory only wires them together.
+     */
+    public HarnessFactory(Config config, AbstractSandboxFilesystem filesystem, Path workspace,
+                          JaSkillSources skillSources) {
         this.config = Objects.requireNonNull(config, "config");
+        this.filesystem = Objects.requireNonNull(filesystem, "filesystem");
+        this.workspace = requireWorkspace(workspace);
+        this.skillSources = skillSources;
+    }
+
+    /** Uses the JA shell/filesystem adapter so child processes cannot inherit provider secrets. */
+    private HarnessFactory(Config config, Path workspace) {
+        this(config, new JaSandboxFilesystem(workspace), workspace, null);
+    }
+
+    /** Creates a process-scoped temporary workspace so smoke runs never point at the repository. */
+    private static Path defaultWorkspace() {
+        try {
+            Path root = Path.of(System.getProperty("java.io.tmpdir"), "ja-harness",
+                    "process-" + ProcessHandle.current().pid());
+            return Files.createDirectories(root).toAbsolutePath().normalize();
+        } catch (IOException | RuntimeException exception) {
+            throw new IllegalStateException("Cannot create JA harness workspace", exception);
+        }
+    }
+
+    /** Rejects blank or relative injection paths before AgentScope resolves workspace files. */
+    private static Path requireWorkspace(Path workspace) {
+        Path value = Objects.requireNonNull(workspace, "workspace").toAbsolutePath().normalize();
+        if (value.toString().isBlank()) {
+            throw new IllegalArgumentException("workspace is blank");
+        }
+        return value;
     }
 
     /** Returns the safe default configuration used by the first JA engine. */
@@ -38,87 +89,84 @@ public final class HarnessFactory {
     }
 
     /**
-     * Builds the real AgentScope Harness with an explicit in-memory filesystem
-     * so library defaults cannot resolve the host project or local state.
+     * Builds the real AgentScope Harness with the upstream capability graph and only the JA
+     * adapters that have a typed product owner: sandboxed filesystem, apply_patch and skills.
      */
     HarnessAgent create(Model model) {
         Objects.requireNonNull(model, "model");
-        HarnessAgent agent = HarnessAgent.builder()
+        HarnessAgent.Builder builder = HarnessAgent.builder()
                 .name(config.agentName())
                 .agentId(config.agentId())
                 .model(model)
-                .toolkit(new Toolkit(ToolkitConfig.builder().allowToolDeletion(true).build()))
                 .sysPrompt(config.systemPrompt())
                 .maxIters(config.maxIters())
                 .maxContextTokens(config.maxContextTokens())
                 .stateStore(new InMemoryAgentStateStore())
-                .workspace(InMemoryWorkspacePath.path())
-                .abstractFilesystem(new InMemoryFilesystem())
-                .messageBus(new DisabledMessageBus())
-                .asyncToolRegistry(new DisabledAsyncToolRegistry())
-                .disableSessionPersistence()
-                .disableFilesystemTools()
-                .disableShellTool()
-                .disableWorkspaceContext()
-                .disableAtPathExpansion()
-                .disableDefaultWorkspaceSkills()
-                .disableDynamicSkills()
-                .disableToolsConfig()
-                .disableMemoryTools()
-                .disableMemoryHooks()
+                .workspace(workspace)
+                .abstractFilesystem(filesystem)
+                .toolkit(toolkit())
+                // Subagent orchestration is deliberately deferred from JA's first protocol; the
+                // upstream builder remains the owner of every other tool and middleware path.
                 .disableSubagents()
-                .disableDynamicSubagents()
-                .enablePlanMode(false)
-                .disableCompaction()
-                .disableToolResultEviction()
-                .enableAgentTracingLog(false)
-                .build();
-        // The Harness creates a workspace message bus when any filesystem is
-        // present; remove its task-result helper because JA has no subagent or
-        // background-task product port in this release.
-        Toolkit safeToolkit = agent.getToolkit();
-        for (String forbiddenTool : List.of("wait_async_results", "task_output",
-                "agent_spawn", "agent_send", "plan_enter", "plan_write", "plan_exit")) {
-            safeToolkit.removeTool(forbiddenTool);
+                .disableDynamicSubagents();
+        if (skillSources != null) {
+            skillSources.configure(builder);
         }
-        verifySafeConstruction(agent);
+        HarnessAgent agent = builder.build();
+        verifyConstruction(agent, workspace);
         return agent;
     }
 
+    /** Registers only the JA-owned patch delta while Harness supplies all standard tools. */
+    private Toolkit toolkit() {
+        Toolkit toolkit = new Toolkit();
+        if (filesystem instanceof JaSandboxFilesystem sandbox) {
+            toolkit.registerTool(new JaApplyPatchTool(sandbox));
+        }
+        return toolkit;
+    }
+
     /**
-     * Verifies the capabilities that AgentScope creates implicitly so a future library change
-     * cannot silently re-enable host files, task orchestration, or unbounded tools.
+     * Verifies that the upstream capability composition actually ran and that its filesystem is
+     * still the JA bounded implementation; this catches accidental reintroduction of opt-out
+     * builder flags or a future default that falls back to local disk.
      */
-    private static void verifySafeConstruction(HarnessAgent agent) {
+    private void verifyConstruction(HarnessAgent agent, Path expectedWorkspace) {
         boolean safeFilesystem = agent.getWorkspaceManager() != null
-                && agent.getWorkspaceManager().getFilesystem() instanceof InMemoryFilesystem;
-        boolean noTools = agent.getToolkit().getToolNames().isEmpty();
-        boolean noSkills = agent.getSkillRepositories().isEmpty();
-        boolean noSubagents = agent.getSubagentAgentManager() == null;
-        boolean noCompaction = agent.getCompactionHook() == null;
-        boolean safeMiddlewares = agent.getDelegate().getMiddlewares().stream()
-                .map(middleware -> middleware.getClass().getName().toLowerCase(Locale.ROOT))
-                .noneMatch(name -> name.contains("subagent") || name.contains("plan")
-                        || name.contains("compaction") || name.contains("workspacecontext")
-                        || name.contains("atpathexpansion") || name.contains("memory"));
-        if (!safeFilesystem || !noTools || !noSkills || !noSubagents || !noCompaction
-                || !safeMiddlewares) {
+                && agent.getWorkspaceManager().getFilesystem() instanceof AbstractSandboxFilesystem
+                && agent.getWorkspaceManager().getWorkspace().equals(expectedWorkspace);
+        var toolNames = agent.getToolkit().getToolNames();
+        boolean upstreamTools = !toolNames.isEmpty();
+        boolean upstreamSkills = !agent.getSkillRepositories().isEmpty();
+        boolean upstreamPermissions = agent.getDelegate().getPermissionContext() != null;
+        boolean upstreamWorkspaceContext = agent.getDelegate().getMiddlewares().stream()
+                .map(middleware -> middleware.getClass().getSimpleName())
+                .anyMatch("WorkspaceContextMiddleware"::equals);
+        boolean upstreamShell = agent.getToolkit().getToolNames().contains("execute");
+        boolean applyPatch = filesystem instanceof JaSandboxFilesystem
+                ? toolNames.contains("apply_patch") : !toolNames.contains("apply_patch");
+        boolean subagentsDisabled = !toolNames.contains("agent_spawn")
+                && !toolNames.contains("agent_send")
+                && agent.getSubagentAgentManager() == null;
+        if (!safeFilesystem || !upstreamTools || !upstreamSkills || !upstreamPermissions
+                || !upstreamWorkspaceContext || !upstreamShell || !applyPatch || !subagentsDisabled) {
             try {
                 agent.close();
             } catch (RuntimeException closeFailure) {
-                throw new IllegalStateException("AgentScope Harness safety invariant failed",
+                throw new IllegalStateException("AgentScope Harness capability invariant failed",
                         closeFailure);
             }
-            throw new IllegalStateException("AgentScope Harness safety invariant failed");
+            throw new IllegalStateException("AgentScope Harness capability invariant failed");
         }
     }
+
 
     /** Creates a narrow runtime engine around a newly built HarnessAgent. */
     public AgentScopeEngine createEngine(Model model) {
         return new HarnessEngineAdapter(create(model));
     }
 
-    /** Immutable composition values; capabilities requiring I/O are not configurable here. */
+    /** Immutable composition values for the AgentScope Harness build. */
     public record Config(String agentName, String agentId, String systemPrompt,
                          int maxIters, int maxContextTokens) {
         /** Validates values before they reach a mutable AgentScope builder. */
@@ -135,7 +183,7 @@ public final class HarnessFactory {
             }
         }
 
-        /** Returns the composition baseline with every unowned capability disabled. */
+        /** Returns the coding baseline while leaving AgentScope capabilities enabled. */
         public static Config defaults() {
             return new Config(
                     "ja-coding-agent",
