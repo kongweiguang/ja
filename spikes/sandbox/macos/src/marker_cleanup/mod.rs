@@ -230,6 +230,27 @@ fn marker_remove_diagnostic_code(code: &str) -> Option<&'static str> {
         "last-copy" => Some("last-copy"),
         "close-evidence" => Some("close-evidence"),
         "close-transaction" => Some("close-transaction"),
+        "prepare-deadline" => Some("prepare-deadline"),
+        "prepare-root" => Some("prepare-root"),
+        "prepare-backup-stat" => Some("prepare-backup-stat"),
+        "prepare-backup-conflict" => Some("prepare-backup-conflict"),
+        "prepare-backup-open" => Some("prepare-backup-open"),
+        "prepare-backup-identity" => Some("prepare-backup-identity"),
+        "prepare-backup-read" => Some("prepare-backup-read"),
+        "prepare-backup-content" => Some("prepare-backup-content"),
+        "prepare-pending-stat" => Some("prepare-pending-stat"),
+        "prepare-pending-open" => Some("prepare-pending-open"),
+        "prepare-pending-create" => Some("prepare-pending-create"),
+        "prepare-pending-identity" => Some("prepare-pending-identity"),
+        "prepare-pending-read" => Some("prepare-pending-read"),
+        "prepare-pending-content" => Some("prepare-pending-content"),
+        "prepare-pending-write" => Some("prepare-pending-write"),
+        "prepare-pending-sync" => Some("prepare-pending-sync"),
+        "prepare-pending-root" => Some("prepare-pending-root"),
+        "prepare-pending-dir-sync" => Some("prepare-pending-dir-sync"),
+        "prepare-pending-rename" => Some("prepare-pending-rename"),
+        "prepare-backup-dir-sync" => Some("prepare-backup-dir-sync"),
+        "prepare-backup-reopen" => Some("prepare-backup-reopen"),
         "deadline" => Some("deadline"),
         _ => None,
     }
@@ -1823,13 +1844,16 @@ fn unlink_cleaned_evidence_with_diagnostics(
         }
     };
     let backup_identity = match prepare_recovery_backup(
-        root,
-        root_directory,
-        root_identity,
-        &backup,
-        &pending,
-        &contents,
-        deadline,
+        RecoveryBackupRequest {
+            root,
+            root_directory,
+            root_identity,
+            backup: &backup,
+            pending: &pending,
+            contents: &contents,
+            deadline,
+        },
+        diagnostic,
     ) {
         Ok(identity) => identity,
         Err(()) => {
@@ -1995,82 +2019,186 @@ fn recovery_backup_names(name: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
     Ok((backup, pending))
 }
 
-/// Publish a complete backup image before the final recovery unlink.  Existing
-/// matching evidence may be resumed, but a conflicting inode/content fails
-/// closed instead of being overwritten.
-fn prepare_recovery_backup(
-    root: &Path,
-    root_directory: &File,
+/// Keep all namespace and image inputs together so the diagnostic sink remains
+/// a separate mutable borrow and cannot reorder any safety check.
+struct RecoveryBackupRequest<'a> {
+    root: &'a Path,
+    root_directory: &'a File,
     root_identity: RootDirectoryIdentity,
-    backup: &[u8],
-    pending: &[u8],
-    contents: &[u8],
+    backup: &'a [u8],
+    pending: &'a [u8],
+    contents: &'a [u8],
     deadline: Instant,
+}
+
+/// Publish a complete backup image before the final recovery unlink while
+/// exposing only a fixed, path-free phase code to the native fixture hook.
+/// This is diagnostic plumbing rather than a recovery fallback: every failure
+/// still returns the original error and therefore remains fail-closed.
+fn prepare_recovery_backup(
+    request: RecoveryBackupRequest<'_>,
+    diagnostic: &mut Option<&mut CleanupDiagnosticHook<'_>>,
 ) -> Result<marker::MarkerFileIdentity, ()> {
+    let RecoveryBackupRequest {
+        root,
+        root_directory,
+        root_identity,
+        backup,
+        pending,
+        contents,
+        deadline,
+    } = request;
     let root_fd = root_directory.as_raw_fd();
     if Instant::now() >= deadline || !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
+        emit_marker_remove_stage(diagnostic, "prepare-deadline");
         return Err(());
     }
-    verify_root_path_until(root, root_directory, root_identity, deadline)?;
+    if verify_root_path_until(root, root_directory, root_identity, deadline).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-root");
+        return Err(());
+    }
     if fd::fstatat_no_follow(root_fd, backup).is_ok() {
         if fd::fstatat_no_follow(root_fd, pending).is_ok() {
             // A second staging entry means the previous publication did not
             // reach a single settled state; keep both images for the next
             // bounded pass instead of claiming this transaction complete.
+            emit_marker_remove_stage(diagnostic, "prepare-backup-conflict");
             return Err(());
         }
         if fd::last_errno() != fd::ENOENT {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-stat");
             return Err(());
         }
-        let mut file = fd::open_at_file(root_fd, backup).map_err(|_| ())?;
-        let identity = validate_recovery_image(&file)?;
-        let existing = read_marker_image(&mut file, deadline)?;
+        let mut file = match fd::open_at_file(root_fd, backup) {
+            Ok(file) => file,
+            Err(_) => {
+                emit_marker_remove_stage(diagnostic, "prepare-backup-open");
+                return Err(());
+            }
+        };
+        let identity = match validate_recovery_image(&file) {
+            Ok(identity) => identity,
+            Err(()) => {
+                emit_marker_remove_stage(diagnostic, "prepare-backup-identity");
+                return Err(());
+            }
+        };
+        let existing = match read_marker_image(&mut file, deadline) {
+            Ok(existing) => existing,
+            Err(()) => {
+                emit_marker_remove_stage(diagnostic, "prepare-backup-read");
+                return Err(());
+            }
+        };
         if existing != contents || identity.uid != process::current_uid() {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-content");
             return Err(());
         }
         return Ok(identity);
     }
     if fd::last_errno() != fd::ENOENT {
+        emit_marker_remove_stage(diagnostic, "prepare-backup-stat");
         return Err(());
     }
 
     let mut pending_file = match fd::open_at_file(root_fd, pending) {
         Ok(file) => file,
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
-            fd::create_at_file(root_fd, pending, MARKER_MODE).map_err(|_| ())?
+            match fd::create_at_file(root_fd, pending, MARKER_MODE) {
+                Ok(file) => file,
+                Err(_) => {
+                    emit_marker_remove_stage(diagnostic, "prepare-pending-create");
+                    return Err(());
+                }
+            }
         }
-        Err(_) => return Err(()),
+        Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-open");
+            return Err(());
+        }
     };
-    let pending_identity = validate_recovery_image(&pending_file)?;
-    let existing = read_marker_image(&mut pending_file, deadline)?;
+    let pending_identity = match validate_recovery_image(&pending_file) {
+        Ok(identity) => identity,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-identity");
+            return Err(());
+        }
+    };
+    let existing = match read_marker_image(&mut pending_file, deadline) {
+        Ok(existing) => existing,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-pending-read");
+            return Err(());
+        }
+    };
     if !existing.is_empty() && existing != contents {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-content");
         return Err(());
     }
-    if existing.is_empty() {
-        pending_file.write_all(contents).map_err(|_| ())?;
+    if existing.is_empty() && pending_file.write_all(contents).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-write");
+        return Err(());
     }
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
+        emit_marker_remove_stage(diagnostic, "prepare-deadline");
         return Err(());
     }
-    pending_file.sync_all().map_err(|_| ())?;
+    if pending_file.sync_all().is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-sync");
+        return Err(());
+    }
     drop(pending_file);
-    verify_root_path_until(root, root_directory, root_identity, deadline)?;
-    fd::sync_directory(root_directory).map_err(|_| ())?;
-    if Instant::now() >= deadline {
+    if verify_root_path_until(root, root_directory, root_identity, deadline).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-root");
         return Err(());
     }
-    fd::rename_at(root_fd, pending, backup).map_err(|_| ())?;
+    if fd::sync_directory(root_directory).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-dir-sync");
+        return Err(());
+    }
+    if Instant::now() >= deadline {
+        emit_marker_remove_stage(diagnostic, "prepare-deadline");
+        return Err(());
+    }
+    if fd::rename_at(root_fd, pending, backup).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-pending-rename");
+        return Err(());
+    }
     if !has_cleanup_budget(deadline, CLEANUP_SYSCALL_RESERVE) {
+        emit_marker_remove_stage(diagnostic, "prepare-deadline");
         return Err(());
     }
-    fd::sync_directory(root_directory).map_err(|_| ())?;
+    if fd::sync_directory(root_directory).is_err() {
+        emit_marker_remove_stage(diagnostic, "prepare-backup-dir-sync");
+        return Err(());
+    }
     if Instant::now() >= deadline {
+        emit_marker_remove_stage(diagnostic, "prepare-deadline");
         return Err(());
     }
-    let mut backup_file = fd::open_at_file(root_fd, backup).map_err(|_| ())?;
-    let actual = validate_recovery_image(&backup_file)?;
-    let image = read_marker_image(&mut backup_file, deadline)?;
+    let mut backup_file = match fd::open_at_file(root_fd, backup) {
+        Ok(file) => file,
+        Err(_) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-reopen");
+            return Err(());
+        }
+    };
+    let actual = match validate_recovery_image(&backup_file) {
+        Ok(identity) => identity,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-identity");
+            return Err(());
+        }
+    };
+    let image = match read_marker_image(&mut backup_file, deadline) {
+        Ok(image) => image,
+        Err(()) => {
+            emit_marker_remove_stage(diagnostic, "prepare-backup-read");
+            return Err(());
+        }
+    };
     if actual != pending_identity || image != contents {
+        emit_marker_remove_stage(diagnostic, "prepare-backup-content");
         return Err(());
     }
     Ok(actual)
@@ -2927,6 +3055,27 @@ mod unit_tests {
             "last-copy",
             "close-evidence",
             "close-transaction",
+            "prepare-deadline",
+            "prepare-root",
+            "prepare-backup-stat",
+            "prepare-backup-conflict",
+            "prepare-backup-open",
+            "prepare-backup-identity",
+            "prepare-backup-read",
+            "prepare-backup-content",
+            "prepare-pending-stat",
+            "prepare-pending-open",
+            "prepare-pending-create",
+            "prepare-pending-identity",
+            "prepare-pending-read",
+            "prepare-pending-content",
+            "prepare-pending-write",
+            "prepare-pending-sync",
+            "prepare-pending-root",
+            "prepare-pending-dir-sync",
+            "prepare-pending-rename",
+            "prepare-backup-dir-sync",
+            "prepare-backup-reopen",
             "deadline",
         ] {
             assert_eq!(marker_remove_diagnostic_code(code), Some(code));
@@ -4029,14 +4178,18 @@ mod unit_tests {
         target.write_all(contents).expect("target image");
         target.sync_all().expect("target sync");
         drop(target);
+        let mut diagnostic: Option<&mut CleanupDiagnosticHook<'_>> = None;
         prepare_recovery_backup(
-            &root,
-            &root_directory,
-            root_identity,
-            alternate,
-            pending,
-            contents,
-            Instant::now() + CLEANUP_DEADLINE,
+            RecoveryBackupRequest {
+                root: &root,
+                root_directory: &root_directory,
+                root_identity,
+                backup: alternate,
+                pending,
+                contents,
+                deadline: Instant::now() + CLEANUP_DEADLINE,
+            },
+            &mut diagnostic,
         )
         .expect("retained backup");
         fd::unlink_at(root_fd, original).expect("simulate target unlink");
