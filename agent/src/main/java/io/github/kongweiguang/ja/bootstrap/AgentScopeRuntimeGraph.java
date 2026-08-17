@@ -301,6 +301,19 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
         return turns.start(effectiveRequest, modeAwarePublisher);
     }
 
+    /** Delegates exact thread-aware cancellation to the existing AgentScope runtime. */
+    @Override
+    public TurnRuntime.CancelResult cancel(String threadId, io.github.kongweiguang.ja.domain.TurnId turnId,
+                                           String reason) {
+        return turns.cancel(threadId, turnId, reason);
+    }
+
+    /** Advertises the delegated provider interruption boundary to the stdio capability offer. */
+    @Override
+    public boolean supportsCancellation() {
+        return turns.supportsCancellation();
+    }
+
     /** Forwards the single stdio approval sink to the existing AgentScope FIFO runtime. */
     @Override
     public void setApprovalSink(TurnRuntime.ApprovalSink sink) {

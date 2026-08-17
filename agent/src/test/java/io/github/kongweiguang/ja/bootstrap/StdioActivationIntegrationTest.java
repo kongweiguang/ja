@@ -117,9 +117,15 @@ final class StdioActivationIntegrationTest {
              BufferedReader output = new BufferedReader(new InputStreamReader(
                      clientOutput, StandardCharsets.UTF_8))) {
             send(input, initializeFrame());
-            assertEquals("c:init", read(output).path("id").textValue());
+            JsonNode initialize = read(output);
+            assertEquals("c:init", initialize.path("id").textValue());
+            assertTrue(initialize.path("result").path("capabilities").path("methods")
+                    .toString().contains("turn/cancel"));
             send(input, initializedFrame());
             assertEquals("ready", read(output).path("params").path("status").textValue());
+
+            send(input, capabilitiesReadFrame("c:caps-before"));
+            JsonNode capabilitiesBefore = readUntil(output, "c:caps-before", null);
 
             send(input, turnStartFrame());
             JsonNode unavailable = readUntil(output, "c:turn", null);
@@ -143,6 +149,12 @@ final class StdioActivationIntegrationTest {
             assertFalse(activation.has("error"), activation.toString());
             assertEquals("profile_activation", activation.path("result")
                     .path("activeProfileRevision").textValue());
+
+            send(input, capabilitiesReadFrame("c:caps-after"));
+            JsonNode capabilitiesAfter = readUntil(output, "c:caps-after", null);
+            assertEquals(capabilitiesBefore.path("result").path("capabilities"),
+                    capabilitiesAfter.path("result").path("capabilities"),
+                    "activation must not mutate the negotiated method set");
 
             // After the original response has been queued, replaying the same id is a completed
             // request and may receive the stable duplicate error without starting activation.
@@ -290,7 +302,7 @@ final class StdioActivationIntegrationTest {
         params.put("protocolMinor", 0);
         params.put("minimumCompatibleMinor", 0);
         params.put("clientVersion", "activation-test");
-        params.set("capabilities", JSON.readTree("{\"methods\":[\"initialize\",\"workspace/open\",\"profile/save\",\"profile/activate\",\"turn/start\",\"shutdown\"],\"events\":[\"runtime/statusChanged\",\"turn/started\",\"item/started\",\"item/delta\",\"item/completed\",\"turn/completed\"],\"accessModes\":[\"read_only\",\"workspace\",\"full_access\"],\"itemKinds\":[\"agent_message\"],\"mcp\":{\"protocolVersions\":[],\"transports\":[],\"features\":[]}}"));
+        params.set("capabilities", JSON.readTree("{\"methods\":[\"initialize\",\"workspace/open\",\"profile/save\",\"profile/activate\",\"turn/start\",\"turn/cancel\",\"shutdown\"],\"events\":[\"runtime/statusChanged\",\"turn/started\",\"item/started\",\"item/delta\",\"item/completed\",\"turn/completed\"],\"accessModes\":[\"read_only\",\"workspace\",\"full_access\"],\"itemKinds\":[\"agent_message\"],\"mcp\":{\"protocolVersions\":[],\"transports\":[],\"features\":[]}}"));
         params.set("limits", JSON.readTree("{\"maxFrameBytes\":4194304,\"maxInboundQueueFrames\":256,\"maxOutboundQueueFrames\":1024,\"maxInFlightRequests\":64,\"maxPendingRequests\":64,\"maxItemDeltaBytes\":65536,\"maxInlineToolOutputBytes\":1048576,\"maxLogBytes\":1048576,\"defaultRequestDeadlineMs\":120000,\"defaultApprovalDeadlineMs\":300000}"));
         return JSON.writeValueAsString(Map.of("jsonrpc", "2.0", "id", "c:init",
                 "method", "initialize", "params", params));
@@ -300,6 +312,12 @@ final class StdioActivationIntegrationTest {
     private static String initializedFrame() {
         return "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{\"readyToken\":\""
                 + READY_TOKEN + "\"}}";
+    }
+
+    /** Reads the stable capability projection without changing activation state. */
+    private static String capabilitiesReadFrame(String id) throws Exception {
+        return JSON.writeValueAsString(Map.of("jsonrpc", "2.0", "id", id,
+                "method", "capabilities/read", "params", Map.of()));
     }
 
     /** Builds one workspace binding request without creating the directory in Java. */

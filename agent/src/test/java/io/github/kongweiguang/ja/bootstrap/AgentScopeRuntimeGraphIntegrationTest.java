@@ -76,6 +76,8 @@ final class AgentScopeRuntimeGraphIntegrationTest {
         AgentScopeRuntimeGraph graph = AgentScopeRuntimeGraph.open(workspace, data, new ToolModel());
         assertSame(graph.toolkit(), graph.mcpRuntime().toolkit(),
                 "Harness and MCP must share AgentScope's Toolkit instance");
+        assertTrue(graph.supportsCancellation(),
+                "the production graph must expose the existing AgentScope cancel port");
         StdioRuntime runtime = new StdioRuntime(serverInput, serverOutput,
                 new SidecarConfiguration(SidecarConfiguration.RuntimeMode.PRODUCTION),
                 Clock.systemUTC(), graph);

@@ -165,9 +165,6 @@ public final class StdioRuntime implements AutoCloseable {
                         .toString().replace("-", ""));
         this.stateMachine = new HandshakeStateMachine(serverInstanceId);
         this.codec = new HandshakeJsonlCodec(stateMachine);
-        Capabilities capabilities = capabilities();
-        this.initializeUseCase = new InitializeUseCase(new ProtocolVersion(1, 0, 0),
-                "ja-preview", serverInstanceId, capabilities, limits);
         this.writer = new StdioWriter(Objects.requireNonNull(output, "output"), codec, limits,
                 exception -> failClosed("stdio writer failed", exception));
         this.pendingRequests = new PendingRequestRegistry(limits.maxPendingRequests());
@@ -178,7 +175,12 @@ public final class StdioRuntime implements AutoCloseable {
                 : TurnRuntime.unavailable();
         this.activeTurnRuntime = fakeRuntime || injectedTurnRuntime != null
                 ? new AtomicReference<>(initialTurnRuntime) : new AtomicReference<>();
-        this.initialTurnRuntime.setApprovalSink(this::requestApproval);
+        this.initialTurnRuntime.setApprovalSink(approvalSink());
+        // Build the handshake offer after the runtime reference exists so a
+        // capability cannot be advertised before its handler is actually wired.
+        Capabilities capabilities = capabilities();
+        this.initializeUseCase = new InitializeUseCase(new ProtocolVersion(1, 0, 0),
+                "ja-preview", serverInstanceId, capabilities, limits);
         this.activationLane = Executors.newSingleThreadExecutor(
                 Thread.ofVirtual().name("ja-activation", 0).factory());
         this.controlLane = new ThreadPoolExecutor(
@@ -383,6 +385,10 @@ public final class StdioRuntime implements AutoCloseable {
         }
         if ("turn/start".equals(request.method())) {
             handleTurnStart(request);
+            return;
+        }
+        if ("turn/cancel".equals(request.method())) {
+            handleTurnCancel(request);
             return;
         }
         if ("workspace/open".equals(request.method())) {
@@ -1141,7 +1147,7 @@ public final class StdioRuntime implements AutoCloseable {
                     serverInstanceId, attempt.profile().wireRevision(), attempt.workspace().trust(),
                     attempt.profile().accessMode(), handle.model(), attempt.profile().skillRevisions(),
                     mcpActivations);
-            graph.setApprovalSink(this::requestApproval);
+            graph.setApprovalSink(approvalSink());
             if (stopping.get() || !activeTurnRuntime.compareAndSet(null, graph)) {
                 graph.close();
                 graph = null;
@@ -1379,6 +1385,57 @@ public final class StdioRuntime implements AutoCloseable {
         }
     }
 
+    /**
+     * Validates the exact thread/turn identity and returns an immediate cancel
+     * acknowledgement; the runtime owns the asynchronous terminal event.
+     */
+    private void handleTurnCancel(RpcRequest request) {
+        try {
+            ObjectNode params = request.params();
+            String threadId = requiredIdentity(params, "threadId", "thr_");
+            String turnIdValue = requiredIdentity(params, "turnId", "turn_");
+            String reason = optionalReason(params.get("reason"));
+            TurnRuntime runtime = activeTurnRuntime.get();
+            if (runtime == null || !runtime.supportsCancellation()) {
+                // The production graph is activated later, but the control method is already
+                // wired. Keep the handshake stable and report only that the model is not ready.
+                sendFailure(request, new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE));
+                return;
+            }
+            TurnRuntime.CancelResult cancellation = runtime.cancel(threadId,
+                    new io.github.kongweiguang.ja.domain.TurnId(turnIdValue), reason);
+            ObjectNode result = JsonNodes.object();
+            result.put("accepted", cancellation.accepted());
+            result.put("turnId", cancellation.turnId().value());
+            result.put("status", cancellation.status());
+            sendResponse(RpcResponse.success(request, result));
+        } catch (RuntimeException exception) {
+            sendFailure(request, exception instanceof ProtocolException value
+                    ? value : new ProtocolException(JaErrorCode.INVALID_PARAMS));
+        }
+    }
+
+    /** Validates a bounded protocol identity without exposing parser details. */
+    private static String requiredIdentity(ObjectNode params, String name, String prefix) {
+        JsonNode value = params.get(name);
+        if (value == null || !value.isTextual() || value.textValue().isBlank()
+                || value.textValue().length() > 101 || !value.textValue().startsWith(prefix)) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        return value.textValue();
+    }
+
+    /** Bounds the optional user reason while keeping it out of logs and provider calls. */
+    private static String optionalReason(JsonNode value) {
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.isTextual() || value.textValue().length() > 512) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        return value.textValue();
+    }
+
     /** Acknowledges shutdown first, then performs the two-phase bounded drain. */
     private void handleShutdown(RpcRequest request) {
         beginShutdown(request);
@@ -1397,6 +1454,35 @@ public final class StdioRuntime implements AutoCloseable {
      */
     private void requestApproval(TurnRuntime.ApprovalPrompt prompt,
                                  Consumer<TurnRuntime.ApprovalDecision> resolver) {
+        requestApprovalWithHandle(prompt, resolver);
+    }
+
+    /**
+     * Builds the one transport-owned approval sink. The ordinary callback remains source
+     * compatible, while AgentScope can use the optional handle to retire this exact pending
+     * request when its turn is cancelled or reaches a terminal state.
+     */
+    private TurnRuntime.ApprovalSink approvalSink() {
+        return new TurnRuntime.ApprovalSink() {
+            @Override
+            public void request(TurnRuntime.ApprovalPrompt prompt,
+                                Consumer<TurnRuntime.ApprovalDecision> resolver) {
+                requestApproval(prompt, resolver);
+            }
+
+            @Override
+            public TurnRuntime.ApprovalHandle requestWithHandle(
+                    TurnRuntime.ApprovalPrompt prompt,
+                    Consumer<TurnRuntime.ApprovalDecision> resolver) {
+                return requestApprovalWithHandle(prompt, resolver);
+            }
+        };
+    }
+
+    /** Registers the server request before writing it and returns its existing registry hook. */
+    private TurnRuntime.ApprovalHandle requestApprovalWithHandle(
+            TurnRuntime.ApprovalPrompt prompt,
+            Consumer<TurnRuntime.ApprovalDecision> resolver) {
         Objects.requireNonNull(prompt, "prompt");
         Objects.requireNonNull(resolver, "resolver");
         String requestId = "s:approval_" + approvalRequestSequence.incrementAndGet();
@@ -1408,6 +1494,7 @@ public final class StdioRuntime implements AutoCloseable {
                 resolver.accept(decision);
             });
             sendResponse(request);
+            return () -> pendingRequests.cancel(requestId);
         } catch (RuntimeException exception) {
             pendingRequests.cancel(request.id());
             throw exception;
@@ -1609,10 +1696,12 @@ public final class StdioRuntime implements AutoCloseable {
     }
 
     /** Builds one stable capability advertisement for initialize and read. */
-    private static Capabilities capabilities() {
-        List<String> methods = List.of("initialize", "version", "capabilities/read", "health/read", "shutdown",
+    private Capabilities capabilities() {
+        List<String> methods = new java.util.ArrayList<>(List.of("initialize", "version",
+                "capabilities/read", "health/read", "shutdown",
                 "workspace/open", "profile/save", "profile/activate", "skill/list", "mcp/list",
-                "mcp/save", "mcp/delete", "mcp/test", "mcp/tools/read", "turn/start");
+                "mcp/save", "mcp/delete", "mcp/test", "mcp/tools/read", "turn/start",
+                "turn/cancel"));
         return new Capabilities(methods,
                 List.of("runtime/statusChanged", "turn/started", "item/started", "item/delta",
                         "item/completed", "turn/completed"),

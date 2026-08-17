@@ -38,6 +38,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
@@ -188,12 +189,59 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         return cancelInternal(turnId, "cancelled");
     }
 
+    /**
+     * Cancels only the turn owned by the supplied thread.  The explicit thread
+     * check prevents a stale UI request from stopping a same-id turn that was
+     * admitted under a different conversation context.
+     */
+    @Override
+    public TurnRuntime.CancelResult cancel(String threadId, TurnId turnId, String reason) {
+        Objects.requireNonNull(threadId, "threadId");
+        Objects.requireNonNull(turnId, "turnId");
+        Run run = runs.get(turnId);
+        if (run == null || !run.input.threadId.value().equals(threadId)) {
+            throw new ProtocolException(JaErrorCode.TURN_NOT_FOUND);
+        }
+        synchronized (run) {
+            if (run.finished.get() && !run.cancelled.get()) {
+                throw new ProtocolException(JaErrorCode.TURN_NOT_ACTIVE);
+            }
+            if (!run.cancelled.compareAndSet(false, true)) {
+                // A second cancel that races the first one is an idempotent
+                // acknowledgement; no provider interrupt or terminal is repeated.
+                return new TurnRuntime.CancelResult(true, turnId, "interrupted");
+            }
+        }
+        cancelMarkedRun(run, "cancelled");
+        return new TurnRuntime.CancelResult(true, turnId, "interrupting");
+    }
+
+    /** Confirms that this adapter owns the provider interruption boundary. */
+    @Override
+    public boolean supportsCancellation() {
+        return true;
+    }
+
     /** Applies one cancellation path to queued and running turns, preserving the reason. */
     private boolean cancelInternal(TurnId turnId, String reason) {
         Run run = runs.get(Objects.requireNonNull(turnId, "turnId"));
-        if (run == null || !run.cancelled.compareAndSet(false, true)) {
+        if (run == null) {
             return false;
         }
+        synchronized (run) {
+            if (run.finished.get() || !run.cancelled.compareAndSet(false, true)) {
+                return false;
+            }
+        }
+        cancelMarkedRun(run, reason);
+        return true;
+    }
+
+    /**
+     * Performs the one provider interruption and terminal transition after the
+     * atomic cancellation claim; callers must already own that claim.
+     */
+    private void cancelMarkedRun(Run run, String reason) {
         SessionLane lane = lanes.get(run.sessionKey);
         boolean queued = false;
         if (lane != null) {
@@ -203,9 +251,10 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                 }
             }
         }
+        cancelPendingApproval(clearPendingApproval(run));
         if (queued) {
-            finish(run, "interrupted", reason);
-            return true;
+            scheduleCancellationFinish(run, reason);
+            return;
         }
         Disposable subscription = run.subscription;
         if (subscription != null) {
@@ -219,8 +268,42 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                 // The run's own terminal event is still published below.
             }
         }
-        finish(run, "interrupted", reason);
-        return true;
+        scheduleCancellationFinish(run, reason);
+    }
+
+    /**
+     * Moves terminal publication off the stdio control lane so cancellation
+     * never waits on a provider or a slow event consumer.
+     */
+    private void scheduleCancellationFinish(Run run, String reason) {
+        try {
+            workers.submit(() -> finish(run, "interrupted", reason));
+        } catch (RejectedExecutionException rejected) {
+            // Shutdown may already have closed the bounded executor; the
+            // terminal gate still must be closed exactly once.
+            finish(run, "interrupted", reason);
+        }
+    }
+
+    /** Clears the AgentScope HITL resume path before a late approval can race cancellation. */
+    private PendingApproval clearPendingApproval(Run run) {
+        synchronized (run) {
+            PendingApproval pending = run.pendingApproval;
+            if (pending == null) {
+                return null;
+            }
+            approvals.remove(pending.prompt.approvalId(), run);
+            run.pendingApproval = null;
+            run.waitingApproval.set(false);
+            return pending;
+        }
+    }
+
+    /** Retires the transport request without introducing another approval correlation map. */
+    private static void cancelPendingApproval(PendingApproval pending) {
+        if (pending != null && pending.cancelHandle != null) {
+            pending.cancelHandle.cancel();
+        }
     }
 
     /** Cancels a turn when its absolute deadline expires, including queued turns. */
@@ -456,16 +539,27 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                 action.kind(), action.command(), action.cwd(), action.relativePaths(), action.risk(),
                 run.input.accessMode, Instant.now().plus(config.turnTimeout()), action.reason());
         PendingApproval pending = new PendingApproval(prompt, confirmation.getToolCalls());
-        run.pendingApproval = pending;
-        run.waitingApproval.set(true);
-        approvals.put(approvalId, run);
-        try {
-            approvalSink.request(prompt, decision -> resolveApproval(approvalId, decision));
-        } catch (RuntimeException exception) {
-            approvals.remove(approvalId, run);
-            run.pendingApproval = null;
-            run.waitingApproval.set(false);
-            throw exception;
+        synchronized (run) {
+            if (run.finished.get() || run.cancelled.get() || run.waitingApproval.get()) {
+                return;
+            }
+            run.pendingApproval = pending;
+            run.waitingApproval.set(true);
+            approvals.put(approvalId, run);
+            try {
+                pending.cancelHandle = approvalSink.requestWithHandle(
+                        prompt, decision -> resolveApproval(approvalId, decision));
+                // A sink may complete or cancel synchronously. Keep a handle that was returned
+                // after such a callback aligned with the already terminal run.
+                if (run.finished.get() || run.cancelled.get()) {
+                    cancelPendingApproval(pending);
+                }
+            } catch (RuntimeException exception) {
+                approvals.remove(approvalId, run);
+                run.pendingApproval = null;
+                run.waitingApproval.set(false);
+                throw exception;
+            }
         }
     }
 
@@ -482,18 +576,22 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
     private void resolveApproval(String approvalId, TurnRuntime.ApprovalDecision decision) {
         Objects.requireNonNull(decision, "decision");
         Run run = approvals.get(approvalId);
-        if (run == null || run.finished.get() || !run.waitingApproval.get()) {
+        if (run == null) {
             return;
         }
-        PendingApproval pending = run.pendingApproval;
-        if (pending == null || !pending.prompt.approvalId().equals(approvalId)
-                || pending.resolved.get()) {
-            return;
-        }
-        // The response may race AgentScope's asking-stream completion. Store the decision only
-        // after winning the one-shot gate; the resume is submitted by tryScheduleApprovalResume
-        // once both the decision and the upstream state-save boundary are complete.
-        synchronized (pending) {
+        PendingApproval pending;
+        synchronized (run) {
+            if (run.finished.get() || run.cancelled.get() || !run.waitingApproval.get()) {
+                return;
+            }
+            pending = run.pendingApproval;
+            if (pending == null || !pending.prompt.approvalId().equals(approvalId)
+                    || pending.resolved.get()) {
+                return;
+            }
+            // The response may race AgentScope's asking-stream completion. Store the decision only
+            // after winning the one-shot gate; the resume is submitted by tryScheduleApprovalResume
+            // once both the decision and the upstream state-save boundary are complete.
             if (!pending.resolved.compareAndSet(false, true)) {
                 return;
             }
@@ -510,7 +608,11 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
      */
     private void tryScheduleApprovalResume(Run run, PendingApproval pending) {
         TurnRuntime.ApprovalDecision decision;
-        synchronized (pending) {
+        synchronized (run) {
+            if (run.finished.get() || run.cancelled.get() || run.pendingApproval != pending
+                    || !run.waitingApproval.get()) {
+                return;
+            }
             if (!pending.resolved.get() || !pending.askingCompleted.get()
                     || pending.decision == null
                     || !pending.resumeScheduled.compareAndSet(false, true)) {
@@ -528,33 +630,39 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
     /** Applies the decision and resubscribes the same AgentScope session without waiting in stdio. */
     private void resumeAfterApproval(Run run, PendingApproval pending,
                                      TurnRuntime.ApprovalDecision decision) {
-        if (run.finished.get() || run.cancelled.get() || !run.waitingApproval.get()) {
-            return;
-        }
         try {
-            boolean allowed = "allow_once".equals(decision.decision())
-                    || "allow_session".equals(decision.decision());
-            if ("allow_session".equals(decision.decision())) {
-                engine.allowSession(run.input.userId, run.input.sessionId, pending.toolCalls);
+            synchronized (run) {
+                // Cancellation and approval resume share this gate. If cancellation wins the
+                // gate, no session rule, AgentScope resume, or tool execution may be admitted.
+                if (run.finished.get() || run.cancelled.get() || run.pendingApproval != pending
+                        || !run.waitingApproval.get()) {
+                    return;
+                }
+                boolean allowed = "allow_once".equals(decision.decision())
+                        || "allow_session".equals(decision.decision());
+                if ("allow_session".equals(decision.decision())) {
+                    engine.allowSession(run.input.userId, run.input.sessionId, pending.toolCalls);
+                }
+                List<ConfirmResult> confirmations = pending.toolCalls.stream()
+                        .map(tool -> new ConfirmResult(allowed, tool))
+                        .toList();
+                Map<String, Object> metadata = new HashMap<>();
+                metadata.put(Msg.METADATA_CONFIRM_RESULTS, confirmations);
+                Msg resume = Msg.builder()
+                        .name("user")
+                        .role(MsgRole.USER)
+                        .textContent(allowed ? "approved" : "denied")
+                        .metadata(metadata)
+                        .build();
+                // Reserve the replacement generation before changing waitingApproval. A late
+                // callback from the asking Flux can then never observe a resumable run as a fresh
+                // terminal. Holding run's gate also makes cancellation wait for this winner.
+                long resumeEpoch = run.subscriptionEpoch.incrementAndGet();
+                approvals.remove(pending.prompt.approvalId(), run);
+                run.pendingApproval = null;
+                run.waitingApproval.set(false);
+                subscribeStream(run, engine.resume(resume, run.context), resumeEpoch);
             }
-            List<ConfirmResult> confirmations = pending.toolCalls.stream()
-                    .map(tool -> new ConfirmResult(allowed, tool))
-                    .toList();
-            Map<String, Object> metadata = new HashMap<>();
-            metadata.put(Msg.METADATA_CONFIRM_RESULTS, confirmations);
-            Msg resume = Msg.builder()
-                    .name("user")
-                    .role(MsgRole.USER)
-                    .textContent(allowed ? "approved" : "denied")
-                    .metadata(metadata)
-                    .build();
-            // Reserve the replacement generation before changing waitingApproval. A late callback
-            // from the asking Flux can then never observe a resumable run as a fresh terminal.
-            long resumeEpoch = run.subscriptionEpoch.incrementAndGet();
-            approvals.remove(pending.prompt.approvalId(), run);
-            run.pendingApproval = null;
-            run.waitingApproval.set(false);
-            subscribeStream(run, engine.resume(resume, run.context), resumeEpoch);
         } catch (RuntimeException exception) {
             streamFailed(run, exception);
         }
@@ -614,9 +722,14 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
             // AgentScope intentionally completes the asking Flux with PERMISSION_ASKING. Marking
             // that boundary lets a response which arrived first resume only after state persistence
             // has drained; the session lane remains occupied until that resume becomes terminal.
-            PendingApproval pending = run.pendingApproval;
+            PendingApproval pending;
+            synchronized (run) {
+                pending = run.waitingApproval.get() ? run.pendingApproval : null;
+                if (pending != null) {
+                    pending.askingCompleted.set(true);
+                }
+            }
             if (pending != null) {
-                pending.askingCompleted.set(true);
                 tryScheduleApprovalResume(run, pending);
             }
             return;
@@ -714,15 +827,23 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
      * waiters; all three operations are guarded against duplicate callbacks.
      */
     private void finish(Run run, String status, String reason) {
-        if (!run.finished.compareAndSet(false, true)) {
-            return;
+        PendingApproval pending;
+        synchronized (run) {
+            if (!run.finished.compareAndSet(false, true)) {
+                return;
+            }
+            if (run.cancelled.get() && !"interrupted".equals(status)) {
+                status = "interrupted";
+                reason = reason == null ? "cancelled" : reason;
+            }
+            pending = run.pendingApproval;
+            if (pending != null) {
+                approvals.remove(pending.prompt.approvalId(), run);
+                run.pendingApproval = null;
+                run.waitingApproval.set(false);
+            }
         }
-        PendingApproval pending = run.pendingApproval;
-        if (pending != null) {
-            approvals.remove(pending.prompt.approvalId(), run);
-            run.pendingApproval = null;
-            run.waitingApproval.set(false);
-        }
+        cancelPendingApproval(pending);
         ScheduledFuture<?> deadlineTask = run.deadlineTask;
         if (deadlineTask != null) {
             deadlineTask.cancel(false);
@@ -912,6 +1033,7 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         private final AtomicBoolean resolved = new AtomicBoolean();
         private final AtomicBoolean askingCompleted = new AtomicBoolean();
         private final AtomicBoolean resumeScheduled = new AtomicBoolean();
+        private volatile TurnRuntime.ApprovalHandle cancelHandle;
         private volatile TurnRuntime.ApprovalDecision decision;
 
         private PendingApproval(TurnRuntime.ApprovalPrompt prompt, List<ToolUseBlock> toolCalls) {

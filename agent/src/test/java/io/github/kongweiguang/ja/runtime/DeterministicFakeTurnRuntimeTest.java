@@ -65,7 +65,7 @@ class DeterministicFakeTurnRuntimeTest {
         DeterministicFakeTurnRuntime runtime = new DeterministicFakeTurnRuntime(
                 new ServerInstanceId("srv_test_busy"), CLOCK, gate);
         CountDownLatch firstFinished = new CountDownLatch(1);
-        runtime.start(request("thr_busy", "first"), event -> {
+        TurnHandle first = runtime.start(request("thr_busy", "first"), event -> {
             if ("turn/completed".equals(event.method())) {
                 firstFinished.countDown();
             }
@@ -74,6 +74,8 @@ class DeterministicFakeTurnRuntimeTest {
                 () -> runtime.start(request("thr_busy", "second"), ignored -> { }));
         TurnHandle other = runtime.start(request("thr_other", "parallel"), ignored -> { });
         assertEquals("turn_fake_2", other.turnId().value());
+        TurnRuntime.CancelResult cancellation = runtime.cancel("thr_busy", first.turnId());
+        assertEquals("interrupting", cancellation.status());
         // Release both workers only after admission assertions, avoiding timing-based tests.
         gate.countDown();
         assertTrue(firstFinished.await(2, TimeUnit.SECONDS));

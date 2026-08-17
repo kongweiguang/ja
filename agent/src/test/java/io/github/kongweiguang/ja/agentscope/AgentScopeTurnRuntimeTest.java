@@ -96,7 +96,12 @@ final class AgentScopeTurnRuntimeTest {
         TurnId turn = runtime.start(request("thr_cancel", "session_cancel", "cancel"), events::add)
                 .turnId();
         assertTrue(started.await(2, TimeUnit.SECONDS));
-        assertTrue(runtime.cancel(turn));
+        ProtocolException wrongThread = assertThrows(ProtocolException.class,
+                () -> runtime.cancel("thr_other", turn));
+        assertEquals(JaErrorCode.TURN_NOT_FOUND, wrongThread.code());
+        TurnRuntime.CancelResult cancellation = runtime.cancel("thr_cancel", turn);
+        assertTrue(cancellation.accepted());
+        assertEquals("interrupting", cancellation.status());
         release.countDown();
         assertTrue(runtime.awaitQuiescence(java.time.Duration.ofSeconds(2)));
         assertEquals(1, events.stream().filter(e -> e.method().equals("turn/completed")).count());
@@ -253,6 +258,72 @@ final class AgentScopeTurnRuntimeTest {
         }
     }
 
+    /** Cancellation wins before the asking barrier opens and cannot persist or resume approval. */
+    @Test
+    void cancellationWinsApprovalResumeAdmission() throws Exception {
+        ApprovalRaceEngine engine = new ApprovalRaceEngine(false);
+        AgentScopeTurnRuntime runtime = runtime(engine, AgentScopeTurnRuntime.Config.defaults());
+        List<TurnEvent> events = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AtomicReference<java.util.function.Consumer<TurnRuntime.ApprovalDecision>> resolver =
+                new AtomicReference<>();
+        runtime.setApprovalSink((prompt, callback) -> resolver.set(callback));
+        try {
+            TurnId turn = runtime.start(request("thr_cancel_approval", "session_cancel_approval",
+                    "cancel-approval"), events::add).turnId();
+            assertTrue(engine.approvalObserved.await(2, TimeUnit.SECONDS));
+            resolver.get().accept(new TurnRuntime.ApprovalDecision("allow_session", Instant.now()));
+
+            TurnRuntime.CancelResult cancellation = runtime.cancel("thr_cancel_approval", turn);
+            assertEquals("interrupting", cancellation.status());
+            engine.completeAsking();
+            assertTrue(runtime.awaitQuiescence(java.time.Duration.ofSeconds(2)));
+
+            assertEquals(0, engine.allowSessionCalls.get(),
+                    "cancel winner must not write a session allow rule");
+            assertEquals(0, engine.resumeCalls.get(),
+                    "the cancelled approval must not enter AgentScope resume");
+            assertEquals(1, events.stream().filter(event -> "turn/completed".equals(event.method()))
+                    .count());
+            assertEquals("interrupted", events.getLast().params().path("turn")
+                    .path("terminalStatus").textValue());
+        } finally {
+            runtime.close();
+        }
+    }
+
+    /** Approval wins the shared gate first; a later cancel only interrupts the replacement turn. */
+    @Test
+    void approvalWinnerThenCancelOnlyInterruptsCurrentRun() throws Exception {
+        ApprovalRaceEngine engine = new ApprovalRaceEngine(false, false);
+        AgentScopeTurnRuntime runtime = runtime(engine, AgentScopeTurnRuntime.Config.defaults());
+        List<TurnEvent> events = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AtomicReference<java.util.function.Consumer<TurnRuntime.ApprovalDecision>> resolver =
+                new AtomicReference<>();
+        runtime.setApprovalSink((prompt, callback) -> resolver.set(callback));
+        try {
+            TurnId turn = runtime.start(request("thr_approval_winner", "session_approval_winner",
+                    "approval-winner"), events::add).turnId();
+            assertTrue(engine.approvalObserved.await(2, TimeUnit.SECONDS));
+            resolver.get().accept(new TurnRuntime.ApprovalDecision("allow_session", Instant.now()));
+            engine.completeAsking();
+            assertTrue(engine.resumeStarted.await(2, TimeUnit.SECONDS));
+
+            TurnRuntime.CancelResult cancellation = runtime.cancel("thr_approval_winner", turn);
+            assertEquals("interrupting", cancellation.status());
+            engine.releaseResume.countDown();
+            assertTrue(runtime.awaitQuiescence(java.time.Duration.ofSeconds(2)));
+
+            assertEquals(1, engine.allowSessionCalls.get());
+            assertEquals(1, engine.resumeCalls.get());
+            assertEquals(1, events.stream().filter(event -> "turn/completed".equals(event.method()))
+                    .count());
+            assertEquals("interrupted", events.getLast().params().path("turn")
+                    .path("terminalStatus").textValue());
+        } finally {
+            runtime.close();
+        }
+    }
+
     /** A current asking-stream error still fails the turn instead of leaving approval pending. */
     @Test
     void currentAskingStreamErrorFailsApprovalTurn() throws Exception {
@@ -387,9 +458,18 @@ final class AgentScopeTurnRuntimeTest {
         private final CountDownLatch resumeStarted = new CountDownLatch(1);
         private final CountDownLatch releaseResume = new CountDownLatch(1);
         private final AtomicReference<FluxSink<AgentEvent>> askingSink = new AtomicReference<>();
+        private final AtomicInteger allowSessionCalls = new AtomicInteger();
+        private final AtomicInteger resumeCalls = new AtomicInteger();
+        private final boolean holdResume;
 
         private ApprovalRaceEngine(boolean failAsking) {
+            this(failAsking, true);
+        }
+
+        /** Allows the approval-winner test to keep a replacement stream live without blocking. */
+        private ApprovalRaceEngine(boolean failAsking, boolean holdResume) {
             this.failAsking = failAsking;
+            this.holdResume = holdResume;
         }
 
         /** Emits one approval and optionally fails the still-current asking stream. */
@@ -413,8 +493,12 @@ final class AgentScopeTurnRuntimeTest {
         @Override
         public Flux<AgentEvent> resume(io.agentscope.core.message.Msg confirmation,
                                       RuntimeContext context) {
+            resumeCalls.incrementAndGet();
             return Flux.create(sink -> {
                 resumeStarted.countDown();
+                if (!holdResume) {
+                    return;
+                }
                 try {
                     if (!releaseResume.await(2, TimeUnit.SECONDS)) {
                         sink.error(new IllegalStateException("resume barrier timed out"));
@@ -427,6 +511,12 @@ final class AgentScopeTurnRuntimeTest {
                     sink.error(exception);
                 }
             });
+        }
+
+        /** Counts session-level permission writes so cancellation admission can be asserted. */
+        @Override
+        public void allowSession(String userId, String sessionId, List<ToolUseBlock> toolCalls) {
+            allowSessionCalls.incrementAndGet();
         }
 
         /** Completes only the old asking Flux after the replacement epoch is active. */

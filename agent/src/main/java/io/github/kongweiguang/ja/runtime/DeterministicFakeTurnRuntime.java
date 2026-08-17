@@ -55,6 +55,8 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
     private final AtomicLong itemSequence = new AtomicLong();
     private final AtomicLong eventSequence = new AtomicLong();
     private final ConcurrentHashMap<ThreadId, TurnId> activeTurns = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<TurnId, AtomicBoolean> cancellationFlags = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<TurnId, Thread> workerThreads = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<ThreadId, AtomicLong> threadSequences = new ConcurrentHashMap<>();
     private final AtomicBoolean accepting = new AtomicBoolean(true);
     private final AtomicBoolean closed = new AtomicBoolean(false);
@@ -112,16 +114,56 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
         if (previous != null) {
             throw new ProtocolException(JaErrorCode.THREAD_BUSY);
         }
+        cancellationFlags.put(turnId, new AtomicBoolean());
         try {
             workers.submit(() -> runTurn(input, turnId, eventPublisher));
         } catch (RejectedExecutionException exception) {
             activeTurns.remove(input.threadId(), turnId);
+            cancellationFlags.remove(turnId);
             synchronized (activeMonitor) {
                 activeMonitor.notifyAll();
             }
             throw new ProtocolException(JaErrorCode.QUEUE_FULL, null, exception);
         }
         return new TurnHandle(turnId);
+    }
+
+    /**
+     * Claims cancellation for one exact thread/turn pair and interrupts only
+     * that fixture worker, matching the production runtime's identity boundary.
+     */
+    @Override
+    public CancelResult cancel(String threadId, TurnId turnId, String reason) {
+        final ThreadId expectedThread;
+        try {
+            expectedThread = new ThreadId(Objects.requireNonNull(threadId, "threadId"));
+        } catch (RuntimeException exception) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS, null, exception);
+        }
+        TurnId active = activeTurns.get(expectedThread);
+        if (active == null || !active.equals(turnId)) {
+            throw new ProtocolException(JaErrorCode.TURN_NOT_FOUND);
+        }
+        AtomicBoolean cancelled = cancellationFlags.get(turnId);
+        if (cancelled == null) {
+            throw new ProtocolException(JaErrorCode.TURN_NOT_ACTIVE);
+        }
+        if (!cancelled.compareAndSet(false, true)) {
+            return new CancelResult(true, turnId, "interrupted");
+        }
+        Thread worker = workerThreads.get(turnId);
+        if (worker != null) {
+            worker.interrupt();
+        }
+        // The worker owns the terminal event; returning interrupting keeps the
+        // ACK independent from its event-publisher scheduling.
+        return new CancelResult(true, turnId, "interrupting");
+    }
+
+    /** Confirms that the fixture worker can be interrupted for stdio cancellation tests. */
+    @Override
+    public boolean supportsCancellation() {
+        return true;
     }
 
     /** Stops admission so accepted turns can drain without being discarded. */
@@ -173,6 +215,7 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
 
     /** Emits one complete, ordered fixture timeline and releases the thread admission. */
     private void runTurn(TurnInput input, TurnId turnId, Consumer<TurnEvent> eventPublisher) {
+        workerThreads.put(turnId, Thread.currentThread());
         Instant startedAt = clock.instant();
         TurnState queued = TurnState.queued(turnId, input.threadId(), input.accessMode(),
                 PermissionMode.ASK, startedAt);
@@ -180,13 +223,34 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
         boolean terminalPublished = false;
         TurnState latest = queued;
         try {
+            AtomicBoolean cancelled = cancellationFlags.get(turnId);
+            if (cancelled != null && cancelled.get()) {
+                publishInterrupted(latest, eventPublisher);
+                terminalPublished = true;
+                return;
+            }
             executionGate.await();
+            if (cancelled != null && cancelled.get()) {
+                publishInterrupted(latest, eventPublisher);
+                terminalPublished = true;
+                return;
+            }
             latest = queued.transition(TurnStatus.RUNNING, clock.instant());
             eventPublisher.accept(new TurnEvent("turn/started", turnParams(latest)));
             eventPublisher.accept(new TurnEvent("item/started", itemParams(item, turnId,
                     ItemStatus.STARTED, input.outputText(), input.inputText())));
             for (String delta : utf8Chunks(input.outputText(), limits.maxItemDeltaBytes())) {
+                if (cancelled != null && cancelled.get()) {
+                    publishInterrupted(latest, eventPublisher);
+                    terminalPublished = true;
+                    return;
+                }
                 eventPublisher.accept(new TurnEvent("item/delta", deltaParams(item, delta)));
+            }
+            if (cancelled != null && cancelled.get()) {
+                publishInterrupted(latest, eventPublisher);
+                terminalPublished = true;
+                return;
             }
             TurnState completed = latest.transition(TurnStatus.COMPLETED, clock.instant());
             eventPublisher.accept(new TurnEvent("item/completed", itemParams(item, turnId,
@@ -197,13 +261,20 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
             terminalPublished = true;
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            publishAborted(latest, eventPublisher);
+            AtomicBoolean cancelled = cancellationFlags.get(turnId);
+            if (cancelled != null && cancelled.get()) {
+                publishInterrupted(latest, eventPublisher);
+            } else {
+                publishAborted(latest, eventPublisher);
+            }
             terminalPublished = true;
         } catch (RuntimeException exception) {
             if (!terminalPublished) {
                 publishAborted(latest, eventPublisher);
             }
         } finally {
+            workerThreads.remove(turnId, Thread.currentThread());
+            cancellationFlags.remove(turnId);
             activeTurns.remove(input.threadId(), turnId);
             synchronized (activeMonitor) {
                 activeMonitor.notifyAll();
@@ -220,6 +291,23 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
             TurnState aborted = latest.transition(TurnStatus.ABORTED_BY_RUNTIME, clock.instant());
             ObjectNode params = turnParams(aborted);
             params.put("terminalStatus", "aborted_by_runtime");
+            eventPublisher.accept(new TurnEvent("turn/completed", params));
+        } catch (RuntimeException ignored) {
+            // A broken writer owns the primary failure; no second diagnostic may reach stdout.
+        }
+    }
+
+    /** Publishes the frozen interrupted terminal through the normal state transitions. */
+    private void publishInterrupted(TurnState latest, Consumer<TurnEvent> eventPublisher) {
+        if (latest.status().terminal()) {
+            return;
+        }
+        try {
+            TurnState interrupting = latest.status() == TurnStatus.INTERRUPTING
+                    ? latest : latest.transition(TurnStatus.INTERRUPTING, clock.instant());
+            TurnState interrupted = interrupting.transition(TurnStatus.INTERRUPTED, clock.instant());
+            ObjectNode params = turnParams(interrupted);
+            params.put("terminalStatus", "interrupted");
             eventPublisher.accept(new TurnEvent("turn/completed", params));
         } catch (RuntimeException ignored) {
             // A broken writer owns the primary failure; no second diagnostic may reach stdout.
