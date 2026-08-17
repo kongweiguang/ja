@@ -97,3 +97,23 @@ export const selectThread = (threadId: string) => (state: TimelineStore) => stat
 export const selectThreads = (state: TimelineStore) => Object.values(state.threads);
 export const selectItemsForThread = (threadId: string) => (state: TimelineStore) =>
   (state.itemIdsByThread[threadId] ?? []).map((itemId) => state.items[itemId]).filter((item) => item !== undefined);
+
+/**
+ * Hides resolution tombstones from cards while retaining them in the state so
+ * a late request with the same approvalId cannot resurrect user-facing work.
+ */
+export const selectApprovals = (state: TimelineStore) =>
+  Object.values(state.approvalsById)
+    .map((projection) => projection.approval)
+    .filter((approval): approval is NonNullable<typeof approval> => approval !== undefined);
+
+/**
+ * Produces the existing card adapter's decision map without making approval
+ * events a second source of truth or exposing unresolved entries as decisions.
+ */
+export const selectApprovalDecisions = (state: TimelineStore) =>
+  Object.fromEntries(
+    Object.entries(state.approvalsById)
+      .filter(([, projection]) => projection.decision !== undefined)
+      .map(([approvalId, projection]) => [approvalId, projection.decision]),
+  );

@@ -12,11 +12,13 @@ import {
   TurnCompletedParamsSchema,
   TurnEventParamsSchema,
   type JaEvent,
+  type ApprovalSummary,
   type Item,
   type Thread,
   type ThreadReadResult,
   type Turn,
 } from "@/ipc/runtimeEvents";
+import { z } from "zod";
 
 export const EVENT_DEDUP_WINDOW = 1024;
 const MAX_ITEM_TEXT_BYTES = 1_048_576;
@@ -64,6 +66,22 @@ export interface HostProjection {
   generation: number;
 }
 
+export type ApprovalDecision = z.infer<typeof ApprovalResolvedParamsSchema>["decision"];
+
+/**
+ * Keeps one approval identity in the timeline while allowing a resolved event
+ * to arrive before its request. An optional approval is therefore a small
+ * terminal tombstone, not a second approval registry or a new protocol state.
+ */
+export interface TimelineApprovalState {
+  /** The event envelope owner is required because resolution params omit it. */
+  threadId: string;
+  approval?: ApprovalSummary;
+  /** Undefined means runtime-pending; card submission remains component-local. */
+  decision?: ApprovalDecision;
+  resolvedAt?: string;
+}
+
 export interface TimelineState {
   handshake: HostProjection;
   serverInstanceId: string | undefined;
@@ -73,6 +91,7 @@ export interface TimelineState {
   itemThreadById: Record<string, string>;
   itemUtf8BytesById: Record<string, number>;
   itemIdsByThread: Record<string, string[]>;
+  approvalsById: Record<string, TimelineApprovalState>;
   lastSeqByThread: Record<string, number>;
   seenEventIds: Record<string, true>;
   seenEventOrderByScope: Record<string, string[]>;
@@ -95,6 +114,7 @@ export function createTimelineState(): TimelineState {
     itemThreadById: {},
     itemUtf8BytesById: {},
     itemIdsByThread: {},
+    approvalsById: {},
     lastSeqByThread: {},
     seenEventIds: {},
     seenEventOrderByScope: {},
@@ -118,6 +138,7 @@ function clearBusinessProjection(state: TimelineState): TimelineState {
     itemThreadById: {},
     itemUtf8BytesById: {},
     itemIdsByThread: {},
+    approvalsById: {},
     lastSeqByThread: {},
     seenEventIds: {},
     seenEventOrderByScope: {},
@@ -247,8 +268,8 @@ function rememberEvent(state: TimelineState, scope: string, fingerprint: string)
 }
 
 /**
- * Removing a thread also removes derived item byte counters so a replacement
- * snapshot cannot reuse accounting from an older projection.
+ * Removing a thread also removes derived item byte counters and its approval
+ * cards so a replacement snapshot cannot reuse an older thread projection.
  */
 function removeThreadEntities(state: TimelineState, threadId: string): TimelineState {
   const cleaned = clearSeenScope(state, threadId);
@@ -256,6 +277,7 @@ function removeThreadEntities(state: TimelineState, threadId: string): TimelineS
   const items = { ...cleaned.items };
   const itemThreadById = { ...cleaned.itemThreadById };
   const itemUtf8BytesById = { ...cleaned.itemUtf8BytesById };
+  const approvalsById = { ...cleaned.approvalsById };
   for (const [turnId, turn] of Object.entries(turns)) {
     if (turn.threadId === threadId) {
       delete turns[turnId];
@@ -269,12 +291,18 @@ function removeThreadEntities(state: TimelineState, threadId: string): TimelineS
       delete itemUtf8BytesById[itemId];
     }
   }
+  for (const [approvalId, projection] of Object.entries(approvalsById)) {
+    if (projection.threadId === threadId) {
+      delete approvalsById[approvalId];
+    }
+  }
   return {
     ...cleaned,
     turns,
     items,
     itemThreadById,
     itemUtf8BytesById,
+    approvalsById,
     itemIdsByThread: { ...cleaned.itemIdsByThread, [threadId]: [] },
   };
 }
@@ -444,6 +472,69 @@ function applyItem(state: TimelineState, item: Item, threadId: string): Timeline
 }
 
 /**
+ * Upserts a request by approvalId so replayed requests cannot render a second
+ * card; an existing terminal decision is deliberately retained as authority.
+ */
+function applyApprovalRequested(state: TimelineState, approval: ApprovalSummary): TimelineState {
+  const existing = state.approvalsById[approval.approvalId];
+  return {
+    ...state,
+    approvalsById: {
+      ...state.approvalsById,
+      [approval.approvalId]: { ...existing, threadId: existing?.threadId ?? approval.threadId, approval },
+    },
+  };
+}
+
+/**
+ * Compares the complete frozen wire summary instead of only its identity
+ * fields; otherwise a resolved card could display a different command while
+ * retaining the original decision.
+ */
+function sameApprovalSummary(left: ApprovalSummary, right: ApprovalSummary): boolean {
+  const leftPaths = left.action.relativePaths;
+  const rightPaths = right.action.relativePaths;
+  const samePaths = leftPaths?.length === rightPaths?.length
+    && (leftPaths === undefined || leftPaths.every((path, index) => path === rightPaths?.[index]));
+  return left.approvalId === right.approvalId
+    && left.threadId === right.threadId
+    && left.turnId === right.turnId
+    && left.itemId === right.itemId
+    && left.action.kind === right.action.kind
+    && left.action.command === right.action.command
+    && left.action.cwd === right.action.cwd
+    && samePaths
+    && left.risk === right.risk
+    && left.accessMode === right.accessMode
+    && left.expiresAt === right.expiresAt;
+}
+
+/**
+ * Records the first terminal decision and keeps a tombstone when the request
+ * was not observed, preventing a later request with the same business id from
+ * reviving an approval that the runtime has already resolved.
+ */
+function applyApprovalResolved(
+  state: TimelineState,
+  approvalId: string,
+  decision: ApprovalDecision,
+  resolvedAt: string,
+  threadId: string,
+): TimelineState {
+  const existing = state.approvalsById[approvalId];
+  if (existing?.decision !== undefined) {
+    return state;
+  }
+  return {
+    ...state,
+    approvalsById: {
+      ...state.approvalsById,
+      [approvalId]: { ...existing, threadId: existing?.threadId ?? threadId, decision, resolvedAt },
+    },
+  };
+}
+
+/**
  * Source checks run before projection updates so a valid sequence cannot make
  * an item, approval, or tool request appear in the wrong thread.
  */
@@ -546,11 +637,29 @@ function applyThreadEvent(state: TimelineState, event: Extract<JaEvent, { thread
         if (parsed.approval.threadId !== event.threadId) {
           return resync(state, key, "invalid_event");
         }
+        const existingProjection = next.approvalsById[parsed.approval.approvalId];
+        const existing = existingProjection?.approval;
+        if (existingProjection !== undefined && existingProjection.threadId !== event.threadId) {
+          return resync(state, key, "invalid_event");
+        }
+        if (
+          existing !== undefined &&
+          !sameApprovalSummary(existing, parsed.approval)
+        ) {
+          return resync(state, key, "invalid_event");
+        }
+        next = applyApprovalRequested(next, parsed.approval);
         break;
       }
-      case "approval/resolved":
-        ApprovalResolvedParamsSchema.parse(event.params);
+      case "approval/resolved": {
+        const parsed = ApprovalResolvedParamsSchema.parse(event.params);
+        const existing = next.approvalsById[parsed.approvalId];
+        if (existing !== undefined && existing.threadId !== event.threadId) {
+          return resync(state, key, "invalid_event");
+        }
+        next = applyApprovalResolved(next, parsed.approvalId, parsed.decision, parsed.resolvedAt, event.threadId);
         break;
+      }
       case "externalTool/requested": {
         const parsed = ExternalToolEventParamsSchema.parse(event.params);
         if (parsed.threadId !== undefined && parsed.threadId !== event.threadId) {

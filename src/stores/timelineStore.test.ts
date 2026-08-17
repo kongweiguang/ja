@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import { parseRuntimeHostEvent } from "@/ipc/runtime";
-import { useTimelineStore } from "./timelineStore";
+import { selectApprovalDecisions, selectApprovals, useTimelineStore } from "./timelineStore";
 
 function statusFrame(generation: number, status: string): Record<string, unknown> {
   return {
@@ -35,6 +35,40 @@ function timelineFrame(seq: number): Record<string, unknown> {
         status: "running",
         accessMode: "workspace",
       },
+    },
+  };
+}
+
+/** Uses the frozen event envelope so store tests exercise the real parser path. */
+function approvalFrame(
+  seq: number,
+  eventId: string,
+  method: "approval/requested" | "approval/resolved",
+  approvalId = "appr_store",
+  decision?: "allow_once" | "allow_session" | "deny" | "expired" | "disconnected",
+): Record<string, unknown> {
+  const approval = {
+    approvalId,
+    threadId: "thr_store",
+    turnId: "turn_store",
+    itemId: "item_store",
+    action: { kind: "shell", command: "pnpm test", cwd: "C:\\dev\\rust\\ja" },
+    risk: "medium",
+    accessMode: "workspace",
+    expiresAt: "2099-08-17T12:00:00+08:00",
+  };
+  return {
+    jsonrpc: "2.0",
+    method,
+    params: {
+      serverInstanceId: "srv_store",
+      threadId: "thr_store",
+      seq,
+      eventId,
+      occurredAt: `2026-08-16T00:00:0${seq}Z`,
+      ...(method === "approval/requested"
+        ? { approval }
+        : { approvalId, decision, resolvedAt: "2026-08-16T00:00:03+08:00" }),
     },
   };
 }
@@ -124,5 +158,35 @@ describe("timeline Zustand RuntimeHost seam", () => {
     expect(store.applyHostEvent(stopped)).toBe("applied");
     expect(useTimelineStore.getState().turns).toEqual({});
     expect(store.applyEvent(timelineFrame(2))).toBe("rejected");
+  });
+
+  it("keeps requested and resolved approvals in the store projection", () => {
+    const store = useTimelineStore.getState();
+    store.reset();
+    const ready = parseRuntimeHostEvent(statusFrame(4, "ready"));
+    if (ready.kind !== "status") {
+      throw new Error("fixture must be a status event");
+    }
+    store.applyHostEvent(ready);
+
+    expect(store.applyEvent(approvalFrame(1, "evt_store_approval", "approval/requested"))).toBe("applied");
+    expect(store.applyEvent(approvalFrame(2, "evt_store_resolved", "approval/resolved", "appr_store", "allow_once"))).toBe("applied");
+    const state = useTimelineStore.getState();
+    expect(selectApprovals(state)).toHaveLength(1);
+    expect(selectApprovals(state)[0]?.approvalId).toBe("appr_store");
+    expect(selectApprovalDecisions(state)).toEqual({ appr_store: "allow_once" });
+  });
+
+  it("retains approval identity across duplicate requests without adding cards", () => {
+    const store = useTimelineStore.getState();
+    store.reset();
+    const ready = parseRuntimeHostEvent(statusFrame(5, "ready"));
+    if (ready.kind !== "status") {
+      throw new Error("fixture must be a status event");
+    }
+    store.applyHostEvent(ready);
+    expect(store.applyEvent(approvalFrame(1, "evt_store_approval_one", "approval/requested"))).toBe("applied");
+    expect(store.applyEvent(approvalFrame(2, "evt_store_approval_two", "approval/requested"))).toBe("applied");
+    expect(Object.keys(useTimelineStore.getState().approvalsById)).toEqual(["appr_store"]);
   });
 });

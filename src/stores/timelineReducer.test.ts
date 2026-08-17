@@ -47,19 +47,54 @@ function event(
   eventId: string,
   params: Record<string, unknown>,
   method: string = "turn/started",
+  threadId = "thr_one",
 ): JaEvent {
   return parseEvent({
     jsonrpc: "2.0",
     method,
     params: {
       serverInstanceId: "srv_one",
-      threadId: "thr_one",
+      threadId,
       seq,
       eventId,
       occurredAt: "2026-08-16T00:00:00Z",
       ...params,
     },
   });
+}
+
+/** Builds a request fixture whose approvalId remains the business identity. */
+function approvalSummary(approvalId = "appr_one", threadId = "thr_one") {
+  return {
+    approvalId,
+    threadId,
+    turnId: "turn_one",
+    itemId: "item_one",
+    action: { kind: "shell" as const, command: "pnpm test", cwd: "C:\\dev\\rust\\ja" },
+    risk: "medium" as const,
+    accessMode: "workspace" as const,
+    expiresAt: "2099-08-17T12:00:00+08:00",
+  };
+}
+
+/** Keeps approval event fixtures on the same ordered thread stream as turns. */
+function approvalRequestedEvent(seq: number, eventId: string, approval = approvalSummary()): JaEvent {
+  return event(seq, eventId, { approval }, "approval/requested");
+}
+
+/** Creates a terminal decision fixture without adding a frontend-only event. */
+function approvalResolvedEvent(
+  seq: number,
+  eventId: string,
+  approvalId: string,
+  decision: "allow_once" | "allow_session" | "deny" | "expired" | "disconnected",
+  threadId = "thr_one",
+): JaEvent {
+  return event(seq, eventId, {
+    approvalId,
+    decision,
+    resolvedAt: "2026-08-16T00:00:03+08:00",
+  }, "approval/resolved", threadId);
 }
 
 describe("runtime-owned timeline reducer", () => {
@@ -132,6 +167,95 @@ describe("runtime-owned timeline reducer", () => {
     expect(completed.threads["thr_one"]?.status).toBe("idle");
     expect(completed.threads["thr_one"]?.activeTurnId).toBeUndefined();
     expect(completed.lastSeqByThread["thr_one"]).toBe(3);
+  });
+
+  it("projects approval requests once by approvalId and retains terminal decisions", () => {
+    const base = applySnapshot(readyState(), snapshot);
+    const requested = applyLiveEvent(base, approvalRequestedEvent(2, "evt_approval_one"));
+    expect(requested.approvalsById["appr_one"]?.approval?.approvalId).toBe("appr_one");
+    expect(requested.approvalsById["appr_one"]?.decision).toBeUndefined();
+
+    const resolved = applyLiveEvent(
+      requested,
+      approvalResolvedEvent(3, "evt_approval_resolved", "appr_one", "allow_once"),
+    );
+    expect(resolved.approvalsById["appr_one"]?.decision).toBe("allow_once");
+
+    // A new request with the same business identity cannot reopen a terminal
+    // card even when its transport event id and sequence are different.
+    const changed = applyLiveEvent(
+      resolved,
+      approvalRequestedEvent(4, "evt_approval_rerequest", { ...approvalSummary(), action: { kind: "shell", command: "git status", cwd: "C:\\dev\\rust\\ja" } }),
+    );
+    expect(changed.lastOutcome).toBe("resync_required");
+    expect(changed.resyncRequired["thr_one"]).toBe("invalid_event");
+    expect(changed.approvalsById["appr_one"]?.decision).toBe("allow_once");
+    expect(changed.approvalsById["appr_one"]?.approval?.action.command).toBe("pnpm test");
+
+    const equivalent = applyLiveEvent(
+      resolved,
+      approvalRequestedEvent(4, "evt_approval_equivalent_rerequest"),
+    );
+    expect(equivalent.lastOutcome).toBe("applied");
+    expect(Object.keys(equivalent.approvalsById)).toEqual(["appr_one"]);
+    expect(equivalent.approvalsById["appr_one"]?.decision).toBe("allow_once");
+  });
+
+  it("keeps a resolved tombstone when resolution arrives before its request", () => {
+    const base = applySnapshot(readyState(), snapshot);
+    const resolved = applyLiveEvent(
+      base,
+      approvalResolvedEvent(2, "evt_approval_unknown_resolved", "appr_one", "deny"),
+    );
+    const requested = applyLiveEvent(resolved, approvalRequestedEvent(3, "evt_approval_late_request"));
+    expect(requested.approvalsById["appr_one"]?.approval?.approvalId).toBe("appr_one");
+    expect(requested.approvalsById["appr_one"]?.decision).toBe("deny");
+  });
+
+  it("does not let another thread absorb a resolution-first tombstone", () => {
+    const base = applySnapshot(readyState(), snapshot);
+    const resolved = applyLiveEvent(
+      base,
+      approvalResolvedEvent(1, "evt_foreign_resolved", "appr_foreign", "deny", "thr_two"),
+    );
+    const foreignRequest = applyLiveEvent(
+      resolved,
+      approvalRequestedEvent(2, "evt_foreign_request", approvalSummary("appr_foreign", "thr_one")),
+    );
+    expect(foreignRequest.lastOutcome).toBe("resync_required");
+    expect(foreignRequest.resyncRequired["thr_one"]).toBe("invalid_event");
+    expect(foreignRequest.approvalsById["appr_foreign"]?.threadId).toBe("thr_two");
+    expect(foreignRequest.approvalsById["appr_foreign"]?.approval).toBeUndefined();
+  });
+
+  it("does not mutate a resolved approval when its event arrives late or duplicated", () => {
+    const base = applySnapshot(readyState(), snapshot);
+    const requested = applyLiveEvent(base, approvalRequestedEvent(2, "evt_approval_pending"));
+    const resolved = applyLiveEvent(
+      requested,
+      approvalResolvedEvent(3, "evt_approval_allow_session", "appr_one", "allow_session"),
+    );
+    const late = applyLiveEvent(resolved, approvalRequestedEvent(2, "evt_approval_late"));
+    expect(late.lastOutcome).toBe("late");
+    expect(late.approvalsById["appr_one"]?.decision).toBe("allow_session");
+
+    const duplicate = applyLiveEvent(
+      resolved,
+      approvalResolvedEvent(3, "evt_approval_allow_session", "appr_one", "deny"),
+    );
+    expect(duplicate.lastOutcome).toBe("duplicate");
+    expect(duplicate.approvalsById["appr_one"]?.decision).toBe("allow_session");
+  });
+
+  it("keeps independent approval identities and terminal outcomes isolated", () => {
+    const base = applySnapshot(readyState(), snapshot);
+    let state = applyLiveEvent(base, approvalRequestedEvent(2, "evt_approval_a", approvalSummary("appr_a")));
+    state = applyLiveEvent(state, approvalRequestedEvent(3, "evt_approval_b", approvalSummary("appr_b")));
+    state = applyLiveEvent(state, approvalResolvedEvent(4, "evt_approval_a_expired", "appr_a", "expired"));
+    state = applyLiveEvent(state, approvalResolvedEvent(5, "evt_approval_b_disconnected", "appr_b", "disconnected"));
+    expect(state.approvalsById["appr_a"]?.decision).toBe("expired");
+    expect(state.approvalsById["appr_b"]?.decision).toBe("disconnected");
+    expect(Object.keys(state.approvalsById)).toHaveLength(2);
   });
 
   it("maintains UTF-8 byte counts and rejects oversized deltas", () => {
