@@ -42,8 +42,8 @@ EXPECTED = {
 
 
 def expected_rust_contract_tests() -> int:
-    """Keep the shared marker aligned after adding one cross-platform Rust regression while retaining four Windows-only skips on Unix."""
-    return 58 if os.name == "nt" else 54
+    """Keep the shared marker aligned after one cross-platform addition and two Windows-only additions skipped on Unix."""
+    return 61 if os.name == "nt" else 55
 
 
 def rust_test_artifact_exists(target_root: Path | None = None) -> bool:

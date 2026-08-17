@@ -37,8 +37,8 @@ Vitest 使用仓库内的 `tests/contract/vitest.config.ts` 和 `--configLoader 
 size/mtime，并由 runner 内部 self-check 锁定目录 mtime-only、文件新增、改写和删除语义。
 
 Java gate 要求 `java --version` 为 25；Rust gate 使用根 `src-tauri/Cargo.lock` 的
-`cargo test --locked`（Windows 运行 58 个测试，macOS 跳过 4 个 Windows 进程树测试后
-运行 54 个）；前端 gate 使用现有 `pnpm-lock.yaml`，不会安装新依赖。
+`cargo test --locked`（Windows 运行 61 个测试，macOS 跳过 6 个 Windows-only 测试后
+运行 55 个）；前端 gate 使用现有 `pnpm-lock.yaml`，不会安装新依赖。
 临时 contract adapter 也显式使用本机已缓存的锁定依赖并以 offline 模式运行，不访问网络。
 
 Rust 阶段先用 `cargo test --no-run` 验证退出码和平台测试可执行文件，再独立运行
