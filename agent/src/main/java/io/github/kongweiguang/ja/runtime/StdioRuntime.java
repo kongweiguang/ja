@@ -33,6 +33,7 @@ import io.github.kongweiguang.ja.protocol.RpcEnvelope;
 import io.github.kongweiguang.ja.protocol.RpcNotification;
 import io.github.kongweiguang.ja.protocol.RpcRequest;
 import io.github.kongweiguang.ja.protocol.RpcResponse;
+import io.github.kongweiguang.ja.skills.JaSkillSources;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -384,6 +385,10 @@ public final class StdioRuntime implements AutoCloseable {
             handleProfileActivate(request);
             return;
         }
+        if ("skill/list".equals(request.method())) {
+            handleSkillList(request);
+            return;
+        }
         if ("version".equals(request.method())) {
             sendResponse(RpcResponse.success(request, versionResult()));
             return;
@@ -500,6 +505,40 @@ public final class StdioRuntime implements AutoCloseable {
         }
     }
 
+    /** Lists the current upstream projection without adding a Java skill catalog or watcher. */
+    private void handleSkillList(RpcRequest request) {
+        JaSkillSources temporary = null;
+        try {
+            TurnRuntime runtime = activeTurnRuntime.get();
+            List<JaSkillSources.SkillView> skills;
+            if (runtime instanceof AgentScopeRuntimeGraph graph) {
+                // An active graph owns the frozen projection; it must not reread user files.
+                skills = graph.skillProjection();
+            } else {
+                Path userRoot = configuration.dataDirectory() == null
+                        ? null : configuration.dataDirectory().resolve("skills");
+                Path workspaceRoot = workspaceBinding == null ? null : workspaceBinding.rootPath();
+                temporary = new JaSkillSources(userRoot, workspaceRoot);
+                List<String> selected = savedProfile == null
+                        ? List.of() : savedProfile.skillRevisions();
+                skills = temporary.projectionFor(selected);
+            }
+            sendResponse(RpcResponse.success(request, skillListResult(skills)));
+        } catch (ProtocolException exception) {
+            sendFailure(request, exception);
+        } catch (IOException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.SKILL_UNAVAILABLE));
+        } catch (IllegalArgumentException exception) {
+            sendFailure(request, skillProtocolFailure(exception));
+        } catch (RuntimeException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.SKILL_INVALID));
+        } finally {
+            if (temporary != null) {
+                temporary.close();
+            }
+        }
+    }
+
     /**
      * Starts activation without waiting on provider construction in the control lane. A pending
      * secret request is registered before it is written, and its callback only schedules the
@@ -598,7 +637,7 @@ public final class StdioRuntime implements AutoCloseable {
             ModelHandle handle = modelBuilder.build(attempt.profile().model(), secret);
             graph = AgentScopeRuntimeGraph.open(attempt.workspace().rootPath(), attempt.dataDirectory(),
                     serverInstanceId, attempt.profile().wireRevision(), attempt.workspace().trust(),
-                    attempt.profile().accessMode(), handle.model());
+                    attempt.profile().accessMode(), handle.model(), attempt.profile().skillRevisions());
             graph.setApprovalSink(this::requestApproval);
             if (stopping.get() || !activeTurnRuntime.compareAndSet(null, graph)) {
                 graph.close();
@@ -623,6 +662,11 @@ public final class StdioRuntime implements AutoCloseable {
                 graph.close();
             }
             sendFailure(attempt.request(), new ProtocolException(JaErrorCode.MODEL_UNSUPPORTED));
+        } catch (IllegalArgumentException exception) {
+            if (graph != null) {
+                graph.close();
+            }
+            sendFailure(attempt.request(), activationFailure(exception));
         } catch (RuntimeException exception) {
             if (graph != null) {
                 graph.close();
@@ -678,6 +722,45 @@ public final class StdioRuntime implements AutoCloseable {
         result.put("accepted", true);
         result.put("activeProfileRevision", profileRevision);
         return result;
+    }
+
+    /** Maps only the two stable skill startup outcomes and never exposes filesystem details. */
+    private static ProtocolException skillProtocolFailure(IllegalArgumentException exception) {
+        return "SKILL_UNAVAILABLE".equals(exception.getMessage())
+                ? new ProtocolException(JaErrorCode.SKILL_UNAVAILABLE)
+                : new ProtocolException(JaErrorCode.SKILL_INVALID);
+    }
+
+    /** Serializes upstream skill metadata into the contract-owned list result. */
+    private static ObjectNode skillListResult(List<JaSkillSources.SkillView> skills) {
+        ObjectNode result = JsonNodes.object();
+        var values = JsonNodes.array();
+        for (JaSkillSources.SkillView skill : skills) {
+            ObjectNode value = JsonNodes.object();
+            value.put("skillRevision", skill.revision());
+            value.put("name", skill.name());
+            value.put("scope", skill.source().wireName());
+            value.put("enabled", skill.enabled());
+            value.put("status", skill.status());
+            if (!skill.description().isBlank()) {
+                value.put("description", skill.description());
+            }
+            value.put("contentHash", skill.contentHash());
+            values.add(value);
+        }
+        result.set("skills", values);
+        return result;
+    }
+
+    /** Maps non-skill activation failures back to the existing model-unavailable contract. */
+    private static ProtocolException activationFailure(IllegalArgumentException exception) {
+        if ("SKILL_UNAVAILABLE".equals(exception.getMessage())) {
+            return new ProtocolException(JaErrorCode.SKILL_UNAVAILABLE);
+        }
+        if ("SKILL_INVALID".equals(exception.getMessage())) {
+            return new ProtocolException(JaErrorCode.SKILL_INVALID);
+        }
+        return new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE);
     }
 
     /** Reads an exact profile revision from activation or turn parameters. */
@@ -1017,7 +1100,7 @@ public final class StdioRuntime implements AutoCloseable {
     /** Builds one stable capability advertisement for initialize and read. */
     private static Capabilities capabilities() {
         List<String> methods = List.of("initialize", "version", "capabilities/read", "health/read", "shutdown",
-                "workspace/open", "profile/save", "profile/activate", "turn/start");
+                "workspace/open", "profile/save", "profile/activate", "skill/list", "turn/start");
         return new Capabilities(methods,
                 List.of("runtime/statusChanged", "turn/started", "item/started", "item/delta",
                         "item/completed", "turn/completed"),

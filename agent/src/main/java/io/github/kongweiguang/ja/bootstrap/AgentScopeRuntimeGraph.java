@@ -27,6 +27,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -80,7 +81,8 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
                 + UUID.randomUUID().toString().replace("-", ""));
         // Kept for focused direct-runtime tests; production activation always uses the overload
         // carrying the handshake identity and exact wire profile revision below.
-        return open(workspace, dataDirectory, generated, null, "trusted", "full_access", model);
+        return open(workspace, dataDirectory, generated, null, "trusted", "full_access", model,
+                List.of());
     }
 
     /**
@@ -92,7 +94,7 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
                                               ServerInstanceId serverInstanceId,
                                               String wireProfileRevision, Model model) {
         return open(workspace, dataDirectory, serverInstanceId, wireProfileRevision,
-                "trusted", "full_access", model);
+                "trusted", "full_access", model, List.of());
     }
 
     /**
@@ -105,6 +107,22 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
                                               String workspaceTrust,
                                               String profileAccessMode,
                                               Model model) {
+        return open(workspace, dataDirectory, serverInstanceId, wireProfileRevision,
+                workspaceTrust, profileAccessMode, model, List.of());
+    }
+
+    /**
+     * Opens a graph with the profile's selected skill revisions frozen before Harness creation.
+     * The list is the only JA skill selection input; parsing, loading, middleware, and filtering
+     * remain AgentScope-owned so a disk edit cannot mutate an active generation.
+     */
+    public static AgentScopeRuntimeGraph open(Path workspace, Path dataDirectory,
+                                              ServerInstanceId serverInstanceId,
+                                              String wireProfileRevision,
+                                              String workspaceTrust,
+                                              String profileAccessMode,
+                                              Model model,
+                                              List<String> skillRevisions) {
         Path root = requireDirectory(workspace, "workspace");
         Path data = requireDataDirectory(dataDirectory);
         Objects.requireNonNull(serverInstanceId, "serverInstanceId");
@@ -125,6 +143,9 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
             // Keep user skills in the explicit sidecar data directory while the workspace source
             // remains rooted at the selected project; AgentScope still owns parsing and loading.
             skillSources = new JaSkillSources(data.resolve("skills"), root);
+            // Freeze the selected upstream AgentSkill values before the Harness graph is built;
+            // unknown/stale references therefore fail atomically without a half-installed engine.
+            skillSources.freeze(skillRevisions == null ? List.of() : skillRevisions);
             Toolkit toolkit = new Toolkit();
             mcpRuntime = new McpRuntime(reference -> {
                 throw new IllegalArgumentException("secret_ref_unavailable");
@@ -154,6 +175,11 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
     /** Returns the immutable wire revision that this graph was activated for, when configured. */
     public String profileRevision() {
         return wireProfileRevision;
+    }
+
+    /** Returns the immutable skill projection captured by this active generation. */
+    public List<JaSkillSources.SkillView> skillProjection() {
+        return skillSources.projection();
     }
 
     /** Returns the immutable workspace trust captured when this graph was opened. */

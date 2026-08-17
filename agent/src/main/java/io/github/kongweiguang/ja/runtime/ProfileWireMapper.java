@@ -14,6 +14,7 @@ import io.github.kongweiguang.ja.profiles.ModelProfile;
 import io.github.kongweiguang.ja.profiles.ModelProvider;
 import io.github.kongweiguang.ja.profiles.SecretRef;
 
+import java.util.List;
 import java.util.Map;
 
 /** Thin mapper that keeps the wire profile contract separate from the stdio lifecycle loop. */
@@ -30,7 +31,7 @@ final class ProfileWireMapper {
         String revision = requiredIdentifier(profile, "profileRevision", "profile_");
         String name = requiredText(profile, "name", 256);
         String accessMode = requiredEnum(profile, "accessMode", "read_only", "workspace", "full_access");
-        validateRevisionArray(profile, "skillRevisions", "skill_");
+        List<String> skillRevisions = revisionArray(profile, "skillRevisions", "skill_");
         validateRevisionArray(profile, "mcpRevisions", "mcp_");
         JsonNode modelNode = profile.get("model");
         if (modelNode == null || !modelNode.isObject()) {
@@ -94,7 +95,7 @@ final class ProfileWireMapper {
                 .secretRef(secretRef)
                 .capabilityOverrides(overrides)
                 .build();
-        return new SavedProfile(revision, accessMode, model, profile);
+        return new SavedProfile(revision, accessMode, model, profile, skillRevisions);
     }
 
     /** Reads a non-blank bounded text property without echoing its value in errors. */
@@ -152,29 +153,39 @@ final class ProfileWireMapper {
     }
 
     /** Preserves Rust-owned skill/MCP references while checking only the stable wire shape. */
-    private static void validateRevisionArray(JsonNode parent, String field, String prefix) {
+    private static List<String> revisionArray(JsonNode parent, String field, String prefix) {
         JsonNode values = parent.get(field);
         if (values == null || values.isNull()) {
-            return;
+            // Missing references intentionally mean builtin-only for the first generation.
+            return List.of();
         }
         if (!values.isArray() || values.size() > 128) {
             throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
         }
         java.util.Set<String> unique = new java.util.HashSet<>();
+        List<String> revisions = new java.util.ArrayList<>();
         for (JsonNode value : values) {
             if (!value.isTextual() || !value.textValue().matches(java.util.regex.Pattern.quote(prefix)
                     + "[A-Za-z0-9][A-Za-z0-9._-]{0,95}") || !unique.add(value.textValue())) {
                 throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
             }
+            revisions.add(value.textValue());
         }
+        return List.copyOf(revisions);
+    }
+
+    /** Validates a reference array whose values are not consumed by this Java generation. */
+    private static void validateRevisionArray(JsonNode parent, String field, String prefix) {
+        revisionArray(parent, field, prefix);
     }
 }
 
 /** Secret-free profile snapshot paired with the exact wire revision used for activation. */
 record SavedProfile(String wireRevision, String accessMode, ModelProfile model,
-                    ObjectNode wireProfile) {
+                    ObjectNode wireProfile, List<String> skillRevisions) {
     SavedProfile {
         wireProfile = wireProfile.deepCopy();
+        skillRevisions = skillRevisions == null ? List.of() : List.copyOf(skillRevisions);
     }
 
     /** Prevents response serialization from mutating the process-local settings snapshot. */

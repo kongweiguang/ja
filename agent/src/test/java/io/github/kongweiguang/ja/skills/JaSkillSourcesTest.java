@@ -4,7 +4,11 @@
 package io.github.kongweiguang.ja.skills;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.agentscope.core.agent.RuntimeContext;
@@ -38,12 +42,12 @@ class JaSkillSourcesTest {
                 "workspace body", "workspace");
 
         try (JaSkillSources sources = new JaSkillSources(userRoot, workspaceRoot)) {
-            JaSkillSources.ReloadResult first = sources.reload();
-            assertTrue(first.skills().stream().anyMatch(skill -> skill.source() == JaSkillSources.Source.BUILTIN
+            List<JaSkillSources.SkillView> first = sources.projection();
+            assertTrue(first.stream().anyMatch(skill -> skill.source() == JaSkillSources.Source.BUILTIN
                     && skill.name().equals("coding")));
-            assertTrue(first.skills().stream().anyMatch(skill -> skill.source() == JaSkillSources.Source.USER
+            assertTrue(first.stream().anyMatch(skill -> skill.source() == JaSkillSources.Source.USER
                     && skill.name().equals("user-skill")));
-            assertTrue(first.skills().stream().anyMatch(skill -> skill.source() == JaSkillSources.Source.WORKSPACE
+            assertTrue(first.stream().anyMatch(skill -> skill.source() == JaSkillSources.Source.WORKSPACE
                     && skill.name().equals("workspace-skill")));
 
             AgentSkill workspaceSkill = sources.repository(JaSkillSources.Source.WORKSPACE)
@@ -51,13 +55,11 @@ class JaSkillSourcesTest {
             assertNotNull(workspaceSkill);
             assertTrue(workspaceSkill.getSkillContent().contains("workspace body"));
             assertTrue(sources.repository(JaSkillSources.Source.WORKSPACE) instanceof LazyResourceCapable);
-            assertTrue(first.generation() == 1);
 
             writeSkill(workspaceRoot.resolve("skills"), "workspace-skill", "updated summary",
                     "updated body", "workspace");
-            JaSkillSources.ReloadResult second = sources.reload();
-            assertTrue(second.generation() == 2);
-            assertTrue(second.skills().stream().anyMatch(skill -> skill.name().equals("workspace-skill")
+            List<JaSkillSources.SkillView> second = sources.projection();
+            assertTrue(second.stream().anyMatch(skill -> skill.name().equals("workspace-skill")
                     && skill.description().equals("updated summary")));
         }
     }
@@ -101,14 +103,6 @@ class JaSkillSourcesTest {
             String guide = load(loader, context, skill, "references/guide.md");
             assertTrue(guide.contains("harness resource"), guide);
 
-            sources.disable("harness-skill");
-            assertFalse(sources.skillFilter().isAllowed("harness-skill"));
-            assertTrue(sources.projection().stream().anyMatch(row -> row.name().equals("harness-skill")
-                    && !row.enabled()));
-            HarnessSkillMiddleware filteredMiddleware = new HarnessSkillMiddleware(
-                    sources.repositories(), new Toolkit(), sources.skillFilter());
-            String filteredPrompt = filteredMiddleware.onSystemPrompt(null, context, "base").block();
-            assertFalse(filteredPrompt.contains("harness-skill"));
         }
     }
 
@@ -121,9 +115,159 @@ class JaSkillSourcesTest {
         Files.writeString(invalid.resolve("SKILL.md"), "not markdown metadata", StandardCharsets.UTF_8);
 
         try (JaSkillSources sources = new JaSkillSources(userRoot, workspaceRoot)) {
-            assertTrue(sources.reload().skills().stream().noneMatch(row -> row.name().equals("invalid-skill")));
-            assertTrue(sources.reload().skills().stream().anyMatch(row -> row.name().equals("valid-skill")));
+            assertTrue(sources.projection().stream().noneMatch(row -> row.name().equals("invalid-skill")));
+            assertTrue(sources.projection().stream().anyMatch(row -> row.name().equals("valid-skill")));
         }
+    }
+
+    @Test
+    void revisionsAreStableAndIncludeSkillAndResourceContent() throws Exception {
+        Path userRoot = Files.createDirectories(tempDir.resolve("user-skills"));
+        Path workspaceRoot = Files.createDirectories(tempDir.resolve("workspace"));
+        Path skillRoot = workspaceRoot.resolve("skills/revision-skill");
+        writeSkill(workspaceRoot.resolve("skills"), "revision-skill", "summary", "body", "workspace");
+        Path resource = Files.createDirectories(skillRoot.resolve("references"))
+                .resolve("guide.md");
+        Files.writeString(resource, "one", StandardCharsets.UTF_8);
+
+        try (JaSkillSources sources = new JaSkillSources(userRoot, workspaceRoot)) {
+            String first = revisionOf(sources, "revision-skill");
+            assertEquals(first, revisionOf(sources, "revision-skill"));
+            Files.writeString(resource, "two", StandardCharsets.UTF_8);
+            String changedResource = sources.projection().stream()
+                    .filter(row -> row.name().equals("revision-skill"))
+                    .findFirst().orElseThrow().revision();
+            assertNotEquals(first, changedResource);
+            writeSkill(workspaceRoot.resolve("skills"), "revision-skill", "summary", "changed body",
+                    "workspace");
+            assertNotEquals(changedResource, revisionOf(sources, "revision-skill"));
+        }
+    }
+
+    @Test
+    void revisionAndFrozenResourcesPreserveInvalidUtf8Bytes() throws Exception {
+        Path userRoot = Files.createDirectories(tempDir.resolve("user-skills"));
+        Path workspaceRoot = Files.createDirectories(tempDir.resolve("workspace"));
+        writeSkill(workspaceRoot.resolve("skills"), "binary-skill", "summary", "body", "workspace");
+        Path resource = Files.createDirectories(workspaceRoot.resolve(
+                "skills/binary-skill/references")).resolve("blob.bin");
+        byte[] original = {(byte) 0xc3, (byte) 0x28, (byte) 0x00, (byte) 0xff};
+        byte[] changed = {(byte) 0xc3, (byte) 0x29, (byte) 0x00, (byte) 0xff};
+        Files.write(resource, original);
+
+        try (JaSkillSources sources = new JaSkillSources(userRoot, workspaceRoot)) {
+            String first = revisionOf(sources, "binary-skill");
+            Files.write(resource, changed);
+            assertNotEquals(first, revisionOf(sources, "binary-skill"));
+
+            Files.write(resource, original);
+            String originalRevision = revisionOf(sources, "binary-skill");
+            sources.freeze(List.of(originalRevision));
+            LazyResourceCapable frozen = (LazyResourceCapable) sources.repository(
+                    JaSkillSources.Source.WORKSPACE);
+            byte[] captured = frozen.resourcesFor("binary-skill", RuntimeContext.empty())
+                    .readBinary("references/blob.bin").orElseThrow();
+            assertArrayEquals(original, captured);
+
+            captured[0] = 0;
+            assertArrayEquals(original, frozen.resourcesFor("binary-skill", RuntimeContext.empty())
+                    .readBinary("references/blob.bin").orElseThrow());
+            Files.write(resource, changed);
+            assertArrayEquals(original, frozen.resourcesFor("binary-skill", RuntimeContext.empty())
+                    .readBinary("references/blob.bin").orElseThrow());
+        }
+    }
+
+    @Test
+    void freezeUsesBuiltinOnlyOrSelectedRevisionAndRejectsStaleSelection() throws Exception {
+        Path userRoot = Files.createDirectories(tempDir.resolve("user-skills"));
+        Path workspaceRoot = Files.createDirectories(tempDir.resolve("workspace"));
+        writeSkill(userRoot, "selected-skill", "summary", "body", "user");
+
+        try (JaSkillSources sources = new JaSkillSources(userRoot, workspaceRoot)) {
+            sources.freeze(List.of());
+            assertTrue(sources.skillFilter().isAllowed("coding"));
+            assertFalse(sources.skillFilter().isAllowed("selected-skill"));
+        }
+        try (JaSkillSources sources = new JaSkillSources(userRoot, workspaceRoot)) {
+            String revision = revisionOf(sources, "selected-skill");
+            sources.freeze(List.of(revision));
+            assertTrue(sources.skillFilter().isAllowed("coding"));
+            assertTrue(sources.skillFilter().isAllowed("selected-skill"));
+        }
+        try (JaSkillSources sources = new JaSkillSources(userRoot, workspaceRoot)) {
+            assertEquals("SKILL_UNAVAILABLE", assertThrows(IllegalArgumentException.class,
+                    () -> sources.freeze(List.of("skill_stale"))).getMessage());
+        }
+    }
+
+    @Test
+    void freezeRejectsSameNameAcrossSourcesAndPreservesSnapshotAfterDiskEdit() throws Exception {
+        Path userRoot = Files.createDirectories(tempDir.resolve("user-skills"));
+        Path workspaceRoot = Files.createDirectories(tempDir.resolve("workspace"));
+        writeSkill(userRoot, "duplicate-skill", "user", "user body", "user");
+        writeSkill(workspaceRoot.resolve("skills"), "duplicate-skill", "workspace", "workspace body",
+                "workspace");
+        try (JaSkillSources sources = new JaSkillSources(userRoot, workspaceRoot)) {
+            assertEquals("SKILL_INVALID", assertThrows(IllegalArgumentException.class,
+                    () -> sources.freeze(List.of())).getMessage());
+        }
+
+        Path snapshotWorkspace = Files.createDirectories(tempDir.resolve("snapshot-workspace"));
+        Path snapshotRoot = snapshotWorkspace.resolve("skills");
+        writeSkill(snapshotRoot, "snapshot-skill", "snapshot", "original body", "workspace");
+        Path resource = Files.createDirectories(snapshotRoot.resolve("snapshot-skill/references"))
+                .resolve("guide.md");
+        Files.writeString(resource, "original resource", StandardCharsets.UTF_8);
+        try (JaSkillSources sources = new JaSkillSources(userRoot, snapshotWorkspace)) {
+            String revision = revisionOf(sources, "snapshot-skill");
+            sources.freeze(List.of(revision));
+            AgentSkill captured = sources.repository(JaSkillSources.Source.WORKSPACE)
+                    .getSkill("snapshot-skill");
+            Files.writeString(snapshotRoot.resolve("snapshot-skill/SKILL.md"),
+                    "---\nname: snapshot-skill\ndescription: changed\n---\nchanged body",
+                    StandardCharsets.UTF_8);
+            Files.writeString(resource, "changed resource", StandardCharsets.UTF_8);
+            assertTrue(captured.getSkillContent().contains("original body"));
+            assertEquals(revision, revisionOf(sources, "snapshot-skill"));
+            LazyResourceCapable frozen = (LazyResourceCapable) sources.repository(
+                    JaSkillSources.Source.WORKSPACE);
+            assertEquals("original resource", frozen.resourcesFor("snapshot-skill",
+                    RuntimeContext.empty()).read("references/guide.md").orElseThrow());
+        }
+    }
+
+    @Test
+    void frozenRepositoryRemainsVisibleToRealSkillLoadTool() throws Exception {
+        Path userRoot = Files.createDirectories(tempDir.resolve("user-skills"));
+        Path workspaceRoot = Files.createDirectories(tempDir.resolve("workspace"));
+        writeSkill(workspaceRoot.resolve("skills"), "frozen-load-skill", "summary", "frozen body",
+                "workspace");
+        Path resource = Files.createDirectories(workspaceRoot.resolve(
+                "skills/frozen-load-skill/references")).resolve("guide.md");
+        Files.writeString(resource, "frozen resource", StandardCharsets.UTF_8);
+
+        try (JaSkillSources sources = new JaSkillSources(userRoot, workspaceRoot)) {
+            String revision = revisionOf(sources, "frozen-load-skill");
+            sources.freeze(List.of(revision));
+            RuntimeContext context = RuntimeContext.empty();
+            HarnessSkillMiddleware middleware = new HarnessSkillMiddleware(
+                    sources.repositories(), new Toolkit(), sources.skillFilter());
+            String prompt = middleware.onSystemPrompt(null, context, "base").block();
+            assertTrue(prompt.contains("frozen-load-skill"));
+            SkillLoadTool loader = (SkillLoadTool) middleware.runtime().loadTool();
+            AgentSkill skill = sources.repository(JaSkillSources.Source.WORKSPACE)
+                    .getSkill("frozen-load-skill");
+            assertTrue(load(loader, context, skill, "SKILL.md").contains("frozen body"));
+            assertTrue(load(loader, context, skill, "references/guide.md")
+                    .contains("frozen resource"));
+        }
+    }
+
+    /** Looks up the immutable projection value without duplicating hash calculation in tests. */
+    private static String revisionOf(JaSkillSources sources, String name) {
+        return sources.projection().stream().filter(row -> row.name().equals(name))
+                .findFirst().orElseThrow().revision();
     }
 
     /** Uses AgentScope's documented scalar frontmatter shape instead of a JA parser fixture. */
