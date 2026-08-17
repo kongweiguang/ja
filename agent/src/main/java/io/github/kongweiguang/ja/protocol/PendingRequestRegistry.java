@@ -6,6 +6,7 @@ package io.github.kongweiguang.ja.protocol;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Consumer;
 
 /**
  * Connection-scoped request ledger. Every id remains reserved for the whole
@@ -23,6 +24,7 @@ public final class PendingRequestRegistry {
     private final int maxLifetimeIds;
     private final Object monitor = new Object();
     private final Map<String, RpcDirection> pending = new HashMap<>();
+    private final Map<String, Consumer<RpcResponse>> responseHandlers = new HashMap<>();
     private final Map<String, RequestState> usedIds = new HashMap<>();
     private boolean rotationRequired;
 
@@ -45,6 +47,15 @@ public final class PendingRequestRegistry {
 
     /** Registers one outbound request before bytes are handed to the writer. */
     public void register(RpcRequest request) {
+        register(request, null);
+    }
+
+    /**
+     * Registers one outbound request and an optional completion callback. The callback is invoked
+     * after the id has been consumed, outside the registry monitor, so a response handler can
+     * enqueue AgentScope resume work without holding protocol correlation state hostage.
+     */
+    public void register(RpcRequest request, Consumer<RpcResponse> responseHandler) {
         Objects.requireNonNull(request, "request");
         synchronized (monitor) {
             RequestState previous = usedIds.get(request.id());
@@ -59,6 +70,9 @@ public final class PendingRequestRegistry {
                 throw new ProtocolException(JaErrorCode.PENDING_LIMIT);
             }
             pending.put(request.id(), request.direction());
+            if (responseHandler != null) {
+                responseHandlers.put(request.id(), responseHandler);
+            }
             usedIds.put(request.id(), RequestState.PENDING);
             if (usedIds.size() >= maxLifetimeIds) {
                 rotationRequired = true;
@@ -66,9 +80,60 @@ public final class PendingRequestRegistry {
         }
     }
 
+    /**
+     * Reserves one inbound client request id in the same connection ledger as server requests.
+     * Keeping inbound tombstones here prevents a replayed request from reaching a second turn
+     * without introducing a parallel request registry or an unbounded deduplication map.
+     */
+    public InboundAdmission registerInbound(RpcRequest request) {
+        Objects.requireNonNull(request, "request");
+        synchronized (monitor) {
+            RequestState previous = usedIds.get(request.id());
+            if (previous != null) {
+                return previous == RequestState.PENDING
+                        ? InboundAdmission.PENDING_DUPLICATE
+                        : InboundAdmission.REPLAY;
+            }
+            if (rotationRequired || usedIds.size() >= maxLifetimeIds) {
+                rotationRequired = true;
+                throw new ProtocolException(JaErrorCode.RESYNC_REQUIRED);
+            }
+            usedIds.put(request.id(), RequestState.PENDING);
+            pending.put(request.id(), request.direction());
+            if (usedIds.size() >= maxLifetimeIds) {
+                rotationRequired = true;
+            }
+            return InboundAdmission.ACCEPTED;
+        }
+    }
+
+    /** Distinguishes a duplicate still awaiting its original response from a replayed request. */
+    public enum InboundAdmission {
+        ACCEPTED,
+        PENDING_DUPLICATE,
+        REPLAY
+    }
+
+    /**
+     * Retires an inbound request id after its response has been scheduled. The tombstone remains
+     * permanent for this generation, so a late replay cannot execute another side effect.
+     */
+    public boolean completeInbound(String id) {
+        ProtocolChecks.genericRequestId(id);
+        synchronized (monitor) {
+            if (usedIds.get(id) != RequestState.PENDING) {
+                return false;
+            }
+            pending.remove(id);
+            usedIds.put(id, RequestState.RESPONDED);
+            return true;
+        }
+    }
+
     /** Consumes a response exactly once and validates the original request direction. */
     public void accept(RpcResponse response) {
         Objects.requireNonNull(response, "response");
+        Consumer<RpcResponse> handler;
         synchronized (monitor) {
             RequestState state = usedIds.get(response.id());
             if (state == null) {
@@ -87,6 +152,10 @@ public final class PendingRequestRegistry {
             ProtocolChecks.requestId(response.id(), expected);
             pending.remove(response.id());
             usedIds.put(response.id(), RequestState.RESPONDED);
+            handler = responseHandlers.remove(response.id());
+        }
+        if (handler != null) {
+            handler.accept(response);
         }
     }
 
@@ -98,6 +167,7 @@ public final class PendingRequestRegistry {
                 return false;
             }
             pending.remove(id);
+            responseHandlers.remove(id);
             usedIds.put(id, RequestState.CANCELLED);
             return true;
         }
@@ -121,6 +191,7 @@ public final class PendingRequestRegistry {
                 usedIds.put(id, RequestState.DISCONNECTED);
             }
             pending.clear();
+            responseHandlers.clear();
         }
     }
 
@@ -153,6 +224,7 @@ public final class PendingRequestRegistry {
                 return false;
             }
             pending.remove(id);
+            responseHandlers.remove(id);
             usedIds.put(id, terminal);
             return true;
         }

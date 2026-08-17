@@ -62,6 +62,9 @@ class McpRuntimeTest {
                     .input(Map.of("value", "x"))
                     .build()).block(Duration.ofSeconds(3));
             assertNotNull(result);
+            // A real AgentScope MCP tool is a normal Toolkit call: it returns a ToolResultBlock
+            // directly and must not enter the unsupported external-execution pause path.
+            assertFalse(result.isSuspended());
             assertTrue(fixture.called.await(1, TimeUnit.SECONDS));
         }
     }

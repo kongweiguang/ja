@@ -83,6 +83,60 @@ class StdioRuntimeChildIntegrationTest {
         assertFalse(diagnostic.contains("Fake response"));
     }
 
+    /** Verifies an identical client request id cannot admit a second fake turn. */
+    @Test
+    void duplicateTurnRequestIdIsRejectedWithoutSecondTurn() throws Exception {
+        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        Process process = startChild(java);
+        BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
+                process.getOutputStream(), StandardCharsets.UTF_8));
+        BufferedReader output = new BufferedReader(new InputStreamReader(
+                process.getInputStream(), StandardCharsets.UTF_8));
+        try {
+            send(input, initializeFrame());
+            send(input, initializedFrame());
+            assertEquals("c:init", readJson(output).path("id").textValue());
+            assertEquals("ready", readJson(output).path("params").path("status").textValue());
+            String duplicate = turnStartFrame("c:duplicate", "thr_duplicate", "duplicate request");
+            send(input, duplicate);
+            send(input, duplicate);
+
+            int accepted = 0;
+            int terminals = 0;
+            for (int index = 0; index < 16 && (accepted == 0 || terminals == 0); index++) {
+                JsonNode frame = readJson(output);
+                if ("c:duplicate".equals(frame.path("id").textValue())) {
+                    if (frame.has("result")) {
+                        accepted++;
+                    }
+                }
+                if ("turn/completed".equals(frame.path("method").textValue())) {
+                    terminals++;
+                }
+            }
+            assertEquals(1, accepted);
+            assertEquals(1, terminals);
+
+            // Once the original result is queued, the same id is a replay and receives one
+            // stable duplicate error; it must not start a second fake turn.
+            send(input, duplicate);
+            JsonNode replay = readJson(output);
+            assertEquals("c:duplicate", replay.path("id").textValue());
+            assertEquals("DUPLICATE_REQUEST", replay.path("error").path("data")
+                    .path("jaCode").textValue());
+            send(input, "{\"jsonrpc\":\"2.0\",\"id\":\"c:stop\",\"method\":\"shutdown\",\"params\":{}}");
+            assertEquals("c:stop", readJson(output).path("id").textValue());
+            assertTrue(process.waitFor(5, TimeUnit.SECONDS));
+            assertEquals(0, process.exitValue());
+        } finally {
+            input.close();
+            output.close();
+            if (process.isAlive()) {
+                process.destroyForcibly();
+            }
+        }
+    }
+
     /** Verifies business requests are rejected before ready and EOF still exits normally. */
     @Test
     void childRejectsTurnBeforeHandshakeAndExitsOnEof() throws Exception {
@@ -268,12 +322,20 @@ class StdioRuntimeChildIntegrationTest {
 
     /** Builds one valid turn/start request whose text must appear in the fake item. */
     private static String turnStartFrame() throws Exception {
-        return turnStartFrame("thr_child", "hello child");
+        return turnStartFrame("c:turn", "thr_child", "hello child");
     }
 
     /** Builds a valid turn request with caller-controlled text for boundary tests. */
     private static String turnStartFrame(String threadId, String text) throws Exception {
-        return "{\"jsonrpc\":\"2.0\",\"id\":\"c:turn\",\"method\":\"turn/start\",\"params\":{" +
+        return turnStartFrame("c:turn", threadId, text);
+    }
+
+    /** Builds one request with a caller-controlled id for replay protection tests. */
+    private static String turnStartFrame(String requestId, String threadId, String text)
+            throws Exception {
+        return "{\"jsonrpc\":\"2.0\",\"id\":"
+                + JSON.writeValueAsString(requestId)
+                + ",\"method\":\"turn/start\",\"params\":{" +
                 "\"threadId\":" + JSON.writeValueAsString(threadId) +
                 ",\"input\":[{\"type\":\"text\",\"text\":" + JSON.writeValueAsString(text) + "}]," +
                 "\"accessMode\":\"workspace\",\"profileRevision\":\"profile_child\"}}";

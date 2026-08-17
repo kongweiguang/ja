@@ -8,6 +8,7 @@ import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.extensions.model.anthropic.AnthropicChatModel;
 import io.agentscope.extensions.model.openai.OpenAIChatModel;
 import io.github.kongweiguang.ja.profiles.GenerationSettings;
+import io.github.kongweiguang.ja.profiles.CapabilitySet;
 import io.github.kongweiguang.ja.profiles.ModelApi;
 import io.github.kongweiguang.ja.profiles.ModelProfile;
 import io.github.kongweiguang.ja.profiles.ModelProfileValidator;
@@ -19,6 +20,31 @@ import java.util.Objects;
 
 /** Strategy/adapter boundary that maps stable JA profiles to real AgentScope providers. */
 public final class AgentScopeModelFactory {
+    /**
+     * Builds an official AgentScope provider without manufacturing a successful probe result.
+     * Activation may happen before a network probe; conservative adapter defaults and explicit
+     * settings overrides are therefore the only capabilities asserted at this boundary.
+     */
+    public ModelHandle create(ModelProfile profile, SecretResolver resolver) {
+        Objects.requireNonNull(profile, "profile");
+        ModelProfileValidator.requireValid(profile);
+        if (profile.api() == ModelApi.OPENAI_RESPONSES) {
+            throw new UnsupportedModelApiException();
+        }
+        CapabilitySet capabilities = CapabilitySet.defaults(profile.provider(), profile.api())
+                .apply(profile.capabilityOverrides());
+        if (profile.api() == ModelApi.ANTHROPIC_MESSAGES) {
+            capabilities = capabilities.without(io.github.kongweiguang.ja.profiles.ModelCapability.REASONING);
+        }
+        String apiKey = resolveKey(profile, resolver);
+        ChatModelBase model = switch (profile.api()) {
+            case ANTHROPIC_MESSAGES -> buildAnthropic(profile, apiKey);
+            case OPENAI_CHAT_COMPLETIONS -> buildOpenAi(profile, apiKey, capabilities);
+            case OPENAI_RESPONSES -> throw new UnsupportedModelApiException();
+        };
+        return new ModelHandle(model, profile.fingerprint(), capabilities);
+    }
+
     /** Builds a native Messages or Chat Completions model and rejects unsupported Responses explicitly. */
     public ModelHandle create(ModelProfile profile, SecretResolver resolver, CapabilityProbeResult probe) {
         Objects.requireNonNull(profile, "profile");

@@ -51,9 +51,9 @@ public final class JavaCorpusProbe {
             int parseFrames = consumeParseCorpus(golden);
             PropertyResult property = consumePropertyCorpus(Path.of(Objects.requireNonNull(
                     System.getenv(PROPERTY_PATH_ENV), "property path")));
-            assertCondition(valid[0] == 44, "valid frame count mismatch");
-            assertCondition(valid[1] == 11, "method result count mismatch");
-            assertCondition(parseFrames == 31, "parse frame count mismatch");
+            assertCondition(valid[0] == 54, "valid frame count mismatch");
+            assertCondition(valid[1] == 16, "method result count mismatch");
+            assertCondition(parseFrames == 47, "parse frame count mismatch");
             assertCondition(property.valid() == 100 && property.invalid() == 100, "property count mismatch");
             assertCondition(property.digest().equals(System.getenv(PROPERTY_DIGEST_ENV)), "property digest mismatch");
             System.out.println("JAVA_CONTRACT_OK digest=" + digest
@@ -168,7 +168,7 @@ public final class JavaCorpusProbe {
                 "valid handshake sequence mismatch");
     }
 
-    /** Maps all twelve frozen responses through the production response DTO and initialize mapper. */
+    /** Maps every frozen method response through field-level checks so fixture additions cannot bypass Java consumption. */
     private static void validateMethodResult(String method, JsonNode result) {
         assertCondition(result != null, "method result missing");
         assertCondition(result.isObject(), "method result must be object");
@@ -193,6 +193,20 @@ public final class JavaCorpusProbe {
                 requiredBoolean(object, "enabled");
                 optionalEnum(object, "scope", "user", "workspace", "thread");
             }
+            case "skill/list" -> {
+                JsonNode skills = object.get("skills");
+                assertCondition(skills != null && skills.isArray(), "skill list must be array");
+                for (JsonNode skill : skills) {
+                    assertCondition(skill.isObject(), "skill summary must be object");
+                    ObjectNode summary = (ObjectNode) skill;
+                    requiredPattern(summary, "skillRevision", "^skill_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$");
+                    requiredText(summary, "name");
+                    requiredEnum(summary, "scope", "builtin", "user", "workspace", "thread");
+                    requiredBoolean(summary, "enabled");
+                    requiredEnum(summary, "status", "healthy", "degraded", "invalid", "disabled");
+                    optionalText(summary, "description");
+                }
+            }
             case "mcp/save" -> {
                 ObjectNode server = requiredObject(object, "server");
                 requiredPattern(server, "mcpRevision", "^mcp_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$");
@@ -212,6 +226,14 @@ public final class JavaCorpusProbe {
                     requiredText(toolObject, "name");
                     requiredObject(toolObject, "inputSchema");
                     requiredEnum(toolObject, "policy", "allow", "ask", "deny");
+                }
+            }
+            case "mcp/test" -> {
+                requiredPattern(object, "mcpRevision", "^mcp_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$");
+                requiredEnum(object, "status", "healthy", "degraded", "unavailable");
+                optionalEnum(object, "protocolVersion", "2024-11-05", "2025-03-26", "2025-06-18");
+                if (object.has("toolCount")) {
+                    requiredInteger(object, "toolCount");
                 }
             }
             case "secret/resolve" -> {

@@ -56,9 +56,9 @@ fn run() -> Result<(), ()> {
         return Err(());
     }
     check_framing_boundaries()?;
-    if valid_frames != 44
-        || method_results != 11
-        || parse_frames != 31
+    if valid_frames != 54
+        || method_results != 16
+        || parse_frames != 47
         || property_valid != 100
         || property_invalid != 100
     {
@@ -218,6 +218,12 @@ fn consume_invalid(golden: &Path) -> Result<usize, ()> {
         }
         count += 1;
     }
+    for document in documents(&invalid.join("mcp.jsonl"))? {
+        if decode_document(&document).is_ok() {
+            return Err(());
+        }
+        count += 1;
+    }
     for document in documents(&golden.join("version").join("major-incompatible.json"))? {
         let frame = decode_document(&document).map_err(|_| ())?;
         let params = frame.params().ok_or(())?;
@@ -231,7 +237,7 @@ fn consume_invalid(golden: &Path) -> Result<usize, ()> {
     for document in documents(&golden.join("version").join("minor-compatible.json"))? {
         replay_minor_compatibility_through_supervisor(&document)?;
     }
-    if count != 31 {
+    if count != 47 {
         return Err(());
     }
     Ok(count)

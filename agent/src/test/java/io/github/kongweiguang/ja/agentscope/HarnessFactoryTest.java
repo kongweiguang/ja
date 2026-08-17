@@ -296,7 +296,8 @@ final class HarnessFactoryTest {
         params.put("sessionId", sessionId);
         params.put("userId", "user");
         params.put("mode", "coding");
-        params.put("permissionMode", "workspace");
+        params.put("accessMode", "workspace");
+        params.put("profileRevision", "profile_harness_test");
         var input = JsonNodes.array();
         var part = JsonNodes.object();
         part.put("type", "text");

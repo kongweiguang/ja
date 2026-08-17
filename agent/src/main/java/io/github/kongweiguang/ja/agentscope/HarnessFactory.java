@@ -4,6 +4,11 @@
 package io.github.kongweiguang.ja.agentscope;
 
 import io.agentscope.core.model.Model;
+import io.agentscope.core.permission.PermissionBehavior;
+import io.agentscope.core.permission.PermissionContextState;
+import io.agentscope.core.permission.PermissionMode;
+import io.agentscope.core.permission.PermissionRule;
+import io.agentscope.core.state.AgentStateStore;
 import io.agentscope.core.state.InMemoryAgentStateStore;
 import io.agentscope.core.tool.Toolkit;
 import io.agentscope.harness.agent.HarnessAgent;
@@ -27,6 +32,9 @@ public final class HarnessFactory {
     private final AbstractSandboxFilesystem filesystem;
     private final Path workspace;
     private final JaSkillSources skillSources;
+    private final AgentStateStore stateStore;
+    private final Toolkit toolkit;
+    private volatile HarnessAgent agent;
 
     /** Creates a factory with JA's credential-stripping workspace boundary. */
     public HarnessFactory() {
@@ -51,16 +59,38 @@ public final class HarnessFactory {
      * optional AgentScope-backed skill repositories, while this factory only wires them together.
      */
     public HarnessFactory(Config config, AbstractSandboxFilesystem filesystem, Path workspace,
-                          JaSkillSources skillSources) {
+                           JaSkillSources skillSources) {
+        this(config, filesystem, workspace, skillSources, new InMemoryAgentStateStore());
+    }
+
+    /**
+     * Injects the upstream state contract so production can use SQLite while
+     * focused tests keep an in-memory store; no JA state registry is introduced.
+     */
+    public HarnessFactory(Config config, AbstractSandboxFilesystem filesystem, Path workspace,
+                           JaSkillSources skillSources, AgentStateStore stateStore) {
+        this(config, filesystem, workspace, skillSources, stateStore, new Toolkit());
+    }
+
+    /**
+     * Shares the upstream Toolkit with the MCP adapter so MCP registrations and Harness calls
+     * have one source of truth instead of parallel tool registries.
+     */
+    public HarnessFactory(Config config, AbstractSandboxFilesystem filesystem, Path workspace,
+                          JaSkillSources skillSources, AgentStateStore stateStore,
+                          Toolkit toolkit) {
         this.config = Objects.requireNonNull(config, "config");
         this.filesystem = Objects.requireNonNull(filesystem, "filesystem");
         this.workspace = requireWorkspace(workspace);
         this.skillSources = skillSources;
+        this.stateStore = Objects.requireNonNull(stateStore, "stateStore");
+        this.toolkit = Objects.requireNonNull(toolkit, "toolkit");
     }
 
     /** Uses the JA shell/filesystem adapter so child processes cannot inherit provider secrets. */
     private HarnessFactory(Config config, Path workspace) {
-        this(config, new JaSandboxFilesystem(workspace), workspace, null);
+        this(config, new JaSandboxFilesystem(workspace), workspace, null,
+                new InMemoryAgentStateStore());
     }
 
     /** Creates a process-scoped temporary workspace so smoke runs never point at the repository. */
@@ -94,6 +124,19 @@ public final class HarnessFactory {
      */
     HarnessAgent create(Model model) {
         Objects.requireNonNull(model, "model");
+        PermissionContextState.Builder permissionContext = PermissionContextState.builder()
+                .mode(PermissionMode.ACCEPT_EDITS);
+        // AgentScope's ACCEPT_EDITS mode intentionally only auto-allows read-only tools.  JA's
+        // expected-hash patch is the one bounded workspace edit, so allow exactly that tool while
+        // leaving shell execution on the upstream ASK/HITL path.
+        permissionContext.addAllowRule("apply_patch",
+                new PermissionRule("apply_patch", null, PermissionBehavior.ALLOW, "ja-workspace"));
+        // File edits are bounded by AgentScope's workspace filesystem; explicit rules keep full
+        // access useful without ever applying BYPASS, so the shell remains ASK/HITL.
+        for (String toolName : java.util.List.of("write_file", "edit_file")) {
+            permissionContext.addAllowRule(toolName,
+                    new PermissionRule(toolName, null, PermissionBehavior.ALLOW, "ja-workspace"));
+        }
         HarnessAgent.Builder builder = HarnessAgent.builder()
                 .name(config.agentName())
                 .agentId(config.agentId())
@@ -101,7 +144,10 @@ public final class HarnessFactory {
                 .sysPrompt(config.systemPrompt())
                 .maxIters(config.maxIters())
                 .maxContextTokens(config.maxContextTokens())
-                .stateStore(new InMemoryAgentStateStore())
+                .stateStore(stateStore)
+                // Workspace is the safe production baseline: the explicit patch rule permits
+                // bounded edits while shell remains AgentScope's ASK/HITL path.
+                .permissionContext(permissionContext.build())
                 .workspace(workspace)
                 .abstractFilesystem(filesystem)
                 .toolkit(toolkit())
@@ -112,15 +158,40 @@ public final class HarnessFactory {
         if (skillSources != null) {
             skillSources.configure(builder);
         }
-        HarnessAgent agent = builder.build();
-        verifyConstruction(agent, workspace);
-        return agent;
+        HarnessAgent built = builder.build();
+        verifyConstruction(built, workspace);
+        agent = built;
+        return built;
+    }
+
+    /**
+     * Applies the wire access mode to AgentScope's per-user/session permission state before a
+     * turn starts; this keeps the upstream engine authoritative instead of adding a JA policy
+     * evaluator or a second approval registry.
+     */
+    public void applyAccessMode(String userId, String sessionId, String accessMode) {
+        HarnessAgent current = Objects.requireNonNull(agent,
+                "HarnessAgent must be created before access mode selection");
+        PermissionMode mode = switch (Objects.requireNonNull(accessMode, "accessMode")) {
+            case "read_only" -> PermissionMode.EXPLORE;
+            case "workspace" -> PermissionMode.ACCEPT_EDITS;
+            // DEFAULT retains explicit file allow rules while shell keeps its upstream ASK path.
+            case "full_access" -> PermissionMode.DEFAULT;
+            default -> throw new IllegalArgumentException("unsupported access mode");
+        };
+        current.setPermissionMode(userId, sessionId, mode);
+    }
+
+    /** Exposes the upstream skill composition for one package-level graph assertion. */
+    public boolean hasUpstreamSkills() {
+        HarnessAgent current = agent;
+        return current != null && !current.getSkillRepositories().isEmpty();
     }
 
     /** Registers only the JA-owned patch delta while Harness supplies all standard tools. */
     private Toolkit toolkit() {
-        Toolkit toolkit = new Toolkit();
-        if (filesystem instanceof JaSandboxFilesystem sandbox) {
+        if (filesystem instanceof JaSandboxFilesystem sandbox
+                && !toolkit.getToolNames().contains("apply_patch")) {
             toolkit.registerTool(new JaApplyPatchTool(sandbox));
         }
         return toolkit;

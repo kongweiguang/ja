@@ -7,6 +7,9 @@ import {
   assertSafePayload,
   assertNoReadyTokenLeak,
   InitializeParamsSchema,
+  McpServerSchema,
+  McpProtocolVersionSchema,
+  SkillSummarySchema,
   ProfileSchema,
   parseEvent,
   parseRequest,
@@ -234,6 +237,8 @@ describe("JA protocol boundary", () => {
     expect(() => parseMethodParams("thread/read", { threadId: "thr_valid", afterSeq: 1 })).not.toThrow();
     expect(() => parseMethodParams("mcp/reload", {})).toThrow();
     expect(() => parseMethodParams("mcp/reload", { mcpRevision: "mcp_valid" })).not.toThrow();
+    expect(parseMethodParams("mcp/test", { mcpRevision: "mcp_valid" })).toMatchObject({ mcpRevision: "mcp_valid" });
+    expect(parseMethodParams("mcp/test", { mcpRevision: "mcp_valid", profileRevision: "profile_valid" })).toMatchObject({ profileRevision: "profile_valid" });
     expect(() => parseMethodParams("turn/start", {
       threadId: "thr_valid",
       input: [{ type: "text", text: "hello" }],
@@ -274,6 +279,14 @@ describe("JA protocol boundary", () => {
   });
 
   it("keeps optional result entities typed instead of accepting arbitrary values", () => {
+    expect(SkillSummarySchema.parse({
+      skillRevision: "skill_valid",
+      name: "fixture",
+      scope: "builtin",
+      enabled: true,
+      status: "healthy",
+      description: "Read-only coding guidance",
+    })).toMatchObject({ description: "Read-only coding guidance" });
     expect(parseMethodResult("health/read", { status: "healthy", checks: {}, serverInstanceId: "srv_valid" })).toMatchObject({
       serverInstanceId: "srv_valid",
     });
@@ -294,17 +307,134 @@ describe("JA protocol boundary", () => {
         mcpRevision: "mcp_valid",
         name: "local",
         transport: "stdio",
-        endpoint: "node server.js",
+        endpoint: "C:/Program Files/JA/fixture.exe",
+        args: ["server.js"],
         protocolVersion: "2025-06-18",
         status: "healthy",
       },
       created: true,
     })).toMatchObject({ created: true });
+    expect(() => parseMethodResult("mcp/test", { mcpRevision: "mcp_valid", status: "healthy", protocolVersion: "2025-11-25" })).toThrow();
     expect(parseMethodResult("externalTool/request", {
       accepted: true,
       status: "completed",
       output: { summary: "ok" },
     })).toMatchObject({ output: { summary: "ok" } });
+  });
+
+  it("keeps MCP transport/auth DTOs explicit and bounded", () => {
+    expect(McpProtocolVersionSchema.parse("2024-11-05")).toBe("2024-11-05");
+    expect(McpServerSchema.parse({
+      mcpRevision: "mcp_valid",
+      name: "stdio",
+      transport: "stdio",
+      endpoint: "C:/Program Files/JA/fixture.exe",
+      args: ["--stdio"],
+      env: { FIXTURE_MODE: "true" },
+      auth: { kind: "env", name: "FIXTURE_TOKEN", credentialRef: "cred_fixture" },
+      protocolVersion: "2025-06-18",
+    })).toMatchObject({ transport: "stdio", args: ["--stdio"] });
+    expect(McpServerSchema.parse({
+      mcpRevision: "mcp_valid_http",
+      name: "http",
+      transport: "streamable_http",
+      endpoint: "https://example.test/mcp",
+      headers: { "X-Fixture-Mode": "read-only" },
+      queryParams: { workspace: "fixture" },
+      auth: { kind: "header", name: "X-Fixture-Auth", credentialRef: "cred_fixture" },
+      protocolVersion: "2025-03-26",
+    })).toMatchObject({ transport: "streamable_http" });
+    expect(McpServerSchema.parse({
+      mcpRevision: "mcp_legacy_http",
+      name: "legacy-http",
+      transport: "streamable_http",
+      endpoint: "https://example.test/legacy",
+      credentialRef: "cred_fixture",
+      protocolVersion: "2024-11-05",
+    })).toMatchObject({ credentialRef: "cred_fixture" });
+    expect(McpServerSchema.parse({
+      mcpRevision: "mcp_encoded_path",
+      name: "encoded-path",
+      transport: "streamable_http",
+      endpoint: "https://example.test/mcp%20path?mode=fixture",
+      protocolVersion: "2025-06-18",
+    })).toMatchObject({ endpoint: "https://example.test/mcp%20path?mode=fixture" });
+    expect(() => McpServerSchema.parse({
+      mcpRevision: "mcp_invalid",
+      name: "shell",
+      transport: "stdio",
+      endpoint: "npx -y",
+      protocolVersion: "2025-06-18",
+    })).toThrow();
+    expect(() => McpServerSchema.parse({
+      mcpRevision: "mcp_invalid",
+      name: "literal",
+      transport: "stdio",
+      endpoint: "fixture-mcp",
+      env: { API_KEY: "literal-secret" },
+      protocolVersion: "2025-06-18",
+    })).toThrow();
+    expect(() => McpServerSchema.parse({
+      mcpRevision: "mcp_invalid",
+      name: "url",
+      transport: "streamable_http",
+      endpoint: "https://example.test/mcp?api_key=literal-secret",
+      protocolVersion: "2025-06-18",
+    })).toThrow();
+    expect(() => McpServerSchema.parse({
+      mcpRevision: "mcp_invalid",
+      name: "mixed-header",
+      transport: "streamable_http",
+      endpoint: "https://example.test/mcp",
+      headers: { Authorization: "literal-secret" },
+      protocolVersion: "2025-06-18",
+    })).toThrow();
+    expect(() => McpServerSchema.parse({
+      mcpRevision: "mcp_invalid",
+      name: "mixed-query",
+      transport: "streamable_http",
+      endpoint: "https://example.test/mcp?Api-Key=literal-secret",
+      protocolVersion: "2025-06-18",
+    })).toThrow();
+    expect(() => McpServerSchema.parse({
+      mcpRevision: "mcp_invalid",
+      name: "encoded-query",
+      transport: "streamable_http",
+      endpoint: "https://example.test/mcp?api%5Fkey=literal-secret",
+      protocolVersion: "2025-06-18",
+    })).toThrow();
+    expect(() => McpServerSchema.parse({
+      mcpRevision: "mcp_invalid",
+      name: "mixed-bearer-value",
+      transport: "streamable_http",
+      endpoint: "https://example.test/mcp",
+      headers: { "X-Fixture-Mode": "BeArEr x" },
+      protocolVersion: "2025-06-18",
+    })).toThrow();
+    expect(() => McpServerSchema.parse({
+      mcpRevision: "mcp_invalid",
+      name: "auth-shorthand-conflict",
+      transport: "streamable_http",
+      endpoint: "https://example.test/mcp",
+      credentialRef: "cred_fixture",
+      auth: { kind: "bearer", credentialRef: "cred_fixture" },
+      protocolVersion: "2025-06-18",
+    })).toThrow();
+    expect(() => McpServerSchema.parse({
+      mcpRevision: "mcp_invalid",
+      name: "stdio-header-auth",
+      transport: "stdio",
+      endpoint: "fixture-mcp",
+      auth: { kind: "header", name: "X-Fixture-Auth", credentialRef: "cred_fixture" },
+      protocolVersion: "2025-06-18",
+    })).toThrow();
+    expect(() => McpServerSchema.parse({
+      mcpRevision: "mcp_invalid",
+      name: "version",
+      transport: "stdio",
+      endpoint: "fixture-mcp",
+      protocolVersion: "2025-11-25",
+    })).toThrow();
   });
 
   it("rejects deep prototype poison and cyclic payloads instead of silently truncating", () => {

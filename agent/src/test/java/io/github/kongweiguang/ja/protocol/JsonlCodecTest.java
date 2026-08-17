@@ -204,6 +204,22 @@ class JsonlCodecTest {
                 () -> registry.accept(RpcResponse.success("c:unknown", JsonNodeFactory.instance.objectNode())));
     }
 
+    /** Verifies inbound request ids share the generation tombstone with outbound requests. */
+    @Test
+    void inboundRequestIdsCannotBeReplayed() {
+        PendingRequestRegistry registry = new PendingRequestRegistry(2);
+        RpcRequest request = RpcRequest.client("c:inbound", "turn/start",
+                JsonNodeFactory.instance.objectNode());
+        assertEquals(PendingRequestRegistry.InboundAdmission.ACCEPTED,
+                registry.registerInbound(request));
+        assertEquals(PendingRequestRegistry.InboundAdmission.PENDING_DUPLICATE,
+                registry.registerInbound(request));
+        assertTrue(registry.completeInbound(request.id()));
+        assertEquals(PendingRequestRegistry.InboundAdmission.REPLAY,
+                registry.registerInbound(request));
+        assertEquals(0, registry.pendingCount());
+    }
+
     /** Verifies a late response can never collide with a reused id or an evicted tombstone. */
     @Test
     void pendingIdsArePermanentUntilConnectionRotation() {

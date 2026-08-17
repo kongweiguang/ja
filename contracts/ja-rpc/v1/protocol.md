@@ -214,9 +214,25 @@ response。它不是 Java 把 Agent Shell 委托给 Rust；coding Agent 的文�
 
 ## 7. Skills 与 MCP
 
-- `skill/import` 只导入 built-in、user 或 workspace 本地目录/归档，校验 `SKILL.md`、编码、大小、来源和 hash；激活以不可变 revision 原子切换，坏 revision 保留 last-good。
+- `skill/import` 只导入 built-in、user 或 workspace 本地目录/归档，校验 `SKILL.md`、编码、大小、来源和 hash；激活以不可变 revision 原子切换，坏 revision 被拒绝且不改变当前启用状态。
+- Profile 的 `skillRevisions` 缺失或为空表示 builtin-only；user/workspace/thread Skill 必须通过显式 revision 启用，不能因导入或 UI 默认值隐式注入。
 - Skill 脚本不会因导入而执行；后续执行必须重新进入 Java permission/approval/sandbox Tool 链路。
 - MCP 首发仅 `tools/list` 与 `tools/call`，传输仅 stdio 与 Streamable HTTP；Server 进程受限于生命周期、输出、timeout、Secret 和 sandbox policy。
+- `protocolVersion` 只允许 AgentScope 当前接线支持的 `2024-11-05`、`2025-03-26` 和
+  `2025-06-18`，能力广告不得写入其他版本。
+- stdio 的 `endpoint` 是单一 executable/path，不能承载命令行字符串；命令参数必须放在有界
+  `args[]`，非敏感环境覆盖放在有界 `env`。认证省略或显式写 `auth:{kind:"none"}`，也可以写
+  `auth:{kind:"env",name,credentialRef}`；stdio 裸 `credentialRef` 和 bearer/header auth
+  都拒绝，避免猜测 secret 应注入到哪个环境变量。
+- Streamable HTTP 的 `endpoint` 必须是无 userinfo、无 credential query 的 http(s) URL；非敏感
+  `headers`/`queryParams` 均为有界 map。认证省略或显式写 `none`，也可以写 `bearer(credentialRef)` 或
+  `header(name,credentialRef)`。旧顶层 `credentialRef` 只作为 HTTP bearer shorthand 保留，
+  已 deprecated，不能与 `auth` 同时出现；map/args/URL 不接受 secret literal。为保持 TS URL
+  parser 与 JSON Schema 原始字符串检查一致，endpoint query 禁止 percent-encoding；需要编码的
+  query value 使用 `queryParams`。
+- `mcp/test` 使用专用 `mcpTestParams`：`mcpRevision` 必填，认证 server 还必须关联
+  `profileRevision` 供 `secret/resolve` 校验；无认证 server 可省略。其他 mcpId 方法不携带
+  profile revision。`mcp/reload` 可由协议保留，但首版运行时不会广告。
 - MCP OAuth、Resources、Prompts、Sampling、Roots、Elicitation、Apps 和插件市场不属于 v1；对应 capability 显示 unsupported，不能把认证 token 放进 URL。
 - v1 输入仅接受有界文本；图片和二进制内容能力后置到独立版本。
 

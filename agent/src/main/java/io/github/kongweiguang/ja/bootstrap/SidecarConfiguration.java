@@ -3,6 +3,7 @@
 
 package io.github.kongweiguang.ja.bootstrap;
 
+import java.nio.file.Path;
 import java.util.Objects;
 
 /**
@@ -12,7 +13,7 @@ import java.util.Objects;
  * accidentally selected by a production launcher or a missing environment
  * variable.
  */
-public record SidecarConfiguration(RuntimeMode runtimeMode) {
+public record SidecarConfiguration(RuntimeMode runtimeMode, Path dataDirectory) {
     /** The only runtime modes understood by the composition root. */
     public enum RuntimeMode {
         PRODUCTION,
@@ -22,6 +23,14 @@ public record SidecarConfiguration(RuntimeMode runtimeMode) {
     /** Preserves an immutable mode so worker code cannot reinterpret argv. */
     public SidecarConfiguration {
         Objects.requireNonNull(runtimeMode, "runtimeMode");
+        if (dataDirectory != null) {
+            dataDirectory = dataDirectory.toAbsolutePath().normalize();
+        }
+    }
+
+    /** Keeps focused callers source-compatible while production launchers opt into an explicit data directory. */
+    public SidecarConfiguration(RuntimeMode runtimeMode) {
+        this(runtimeMode, null);
     }
 
     /**
@@ -30,8 +39,9 @@ public record SidecarConfiguration(RuntimeMode runtimeMode) {
      */
     public static SidecarConfiguration fromArgs(String[] args) {
         RuntimeMode mode = RuntimeMode.PRODUCTION;
+        Path dataDirectory = null;
         if (args == null) {
-            return new SidecarConfiguration(mode);
+            return new SidecarConfiguration(mode, null);
         }
         for (int index = 0; index < args.length; index++) {
             String arg = Objects.requireNonNull(args[index], "args[" + index + "]");
@@ -48,11 +58,23 @@ public record SidecarConfiguration(RuntimeMode runtimeMode) {
                 } else {
                     throw new IllegalArgumentException("unsupported runtime mode");
                 }
+            } else if (arg.startsWith("--data-dir=")) {
+                dataDirectory = parseDataDirectory(arg.substring("--data-dir=".length()));
+            } else if ("--data-dir".equals(arg) && index + 1 < args.length) {
+                dataDirectory = parseDataDirectory(args[++index]);
             } else {
                 throw new IllegalArgumentException("unsupported sidecar argument");
             }
         }
-        return new SidecarConfiguration(mode);
+        return new SidecarConfiguration(mode, dataDirectory);
+    }
+
+    /** Rejects blank data paths before they can silently fall back to a repository or temp root. */
+    private static Path parseDataDirectory(String value) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("data directory is required");
+        }
+        return Path.of(value);
     }
 
     /** Returns whether the deterministic fixture runtime was explicitly enabled. */

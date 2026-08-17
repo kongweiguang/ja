@@ -9,7 +9,9 @@ import {
   InitializeParamsSchema,
   InputPartSchema,
   LimitsSchema,
+  McpProtocolVersionSchema,
   McpServerSchema,
+  McpServerSummarySchema,
   McpToolSchema,
   McpRevisionSchema,
   ProfileSchema,
@@ -111,6 +113,15 @@ const turnControlParams = z
     reason: z.string().max(512).optional(),
   })
   .passthrough();
+
+/**
+ * Test carries profileRevision only when secret resolution may be needed; it
+ * stays local to mcp/test so ordinary revision methods remain transport-only.
+ */
+export const McpTestParamsSchema = z
+  .object({ mcpRevision: McpRevisionSchema, profileRevision: ProfileRevisionSchema.optional() })
+  .passthrough();
+
 const ParamsSchemaByMethod = {
   initialize: InitializeParamsSchema,
   version: z.object({ includeBuild: z.boolean().optional() }).passthrough(),
@@ -148,7 +159,7 @@ const ParamsSchemaByMethod = {
   "mcp/list": emptyParams,
   "mcp/save": z.object({ server: McpServerSchema, expectedRevision: McpRevisionSchema.optional() }).passthrough(),
   "mcp/delete": idParams("mcpRevision", McpRevisionSchema),
-  "mcp/test": idParams("mcpRevision", McpRevisionSchema),
+  "mcp/test": McpTestParamsSchema,
   "mcp/reload": z.object({ mcpRevision: McpRevisionSchema }).passthrough(),
   "mcp/tools/read": idParams("mcpRevision", McpRevisionSchema),
   "mcp/toolPolicy/set": z.object({ mcpRevision: McpRevisionSchema, toolName: z.string().min(1).max(256), policy: z.enum(["allow", "ask", "deny"]) }).passthrough(),
@@ -209,11 +220,11 @@ const skillListResultSchema = z.object({ skills: z.array(SkillSummarySchema).max
 const skillImportResultSchema = z.object({ skillRevision: SkillRevisionSchema, status: z.enum(["healthy", "degraded", "invalid"]), contentHash: z.string().regex(/^[A-Fa-f0-9]{64}$/).optional() }).passthrough();
 const skillEnableResultSchema = z.object({ skillRevision: SkillRevisionSchema, enabled: z.boolean(), scope: z.enum(["user", "workspace", "thread"]).optional() }).passthrough();
 const skillHealthResultSchema = z.object({ skillRevision: SkillRevisionSchema, status: z.enum(["healthy", "degraded", "invalid", "disabled"]), issues: z.array(z.string().max(1024)).max(128).optional() }).passthrough();
-const mcpServerSummarySchema = McpServerSchema.extend({ status: z.enum(["healthy", "degraded", "unavailable", "disabled"]), toolCount: z.number().int().min(0).max(10_000).optional() });
+const mcpServerSummarySchema = McpServerSummarySchema;
 const mcpListResultSchema = z.object({ servers: z.array(mcpServerSummarySchema).max(256) }).passthrough();
 const mcpSaveResultSchema = z.object({ server: mcpServerSummarySchema, created: z.boolean().optional() }).passthrough();
 const mcpDeleteResultSchema = z.object({ accepted: z.boolean(), mcpRevision: McpRevisionSchema }).passthrough();
-const mcpTestResultSchema = z.object({ mcpRevision: McpRevisionSchema, status: z.enum(["healthy", "degraded", "unavailable"]), protocolVersion: z.string().max(32).optional(), toolCount: z.number().int().min(0).max(10_000).optional() }).passthrough();
+const mcpTestResultSchema = z.object({ mcpRevision: McpRevisionSchema, status: z.enum(["healthy", "degraded", "unavailable"]), protocolVersion: McpProtocolVersionSchema.optional(), toolCount: z.number().int().min(0).max(10_000).optional() }).passthrough();
 const mcpToolsReadResultSchema = z.object({ mcpRevision: McpRevisionSchema, tools: z.array(McpToolSchema).max(10_000) }).passthrough();
 const mcpToolPolicyResultSchema = z.object({ mcpRevision: McpRevisionSchema, toolName: z.string().min(1).max(256), policy: z.enum(["allow", "ask", "deny"]) }).passthrough();
 const approvalResponseResultSchema = z.object({ decision: z.enum(["allow_once", "allow_session", "deny", "expired", "disconnected"]), resolvedAt: z.string().datetime({ offset: true }).max(64) }).passthrough();

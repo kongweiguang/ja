@@ -351,9 +351,9 @@ it("consumes the frozen corpus and bounded property corpus through production pa
   const validFrames = corpusFiles(GOLDEN)
     .filter((path) => !path.split(/[\\/]/).includes("invalid") && !path.endsWith("major-incompatible.json"))
     .map(parseProductionDocuments);
-  expect(validFrames.reduce((count, file) => count + file.frames.length, 0)).toBe(44);
+  expect(validFrames.reduce((count, file) => count + file.frames.length, 0)).toBe(54);
   const methodResults = validFrames.reduce((count, file) => count + file.methodResults, 0);
-  expect(methodResults).toBe(11);
+  expect(methodResults).toBe(16);
   replayValidHandshake(documents(join(validRoot, "handshake.jsonl")));
   const invalidCases = documents(join(GOLDEN, "invalid", "handshake-challenge.jsonl"));
   expect(invalidCases).toHaveLength(23);
@@ -361,11 +361,11 @@ it("consumes the frozen corpus and bounded property corpus through production pa
     replayInvalidHandshake(fixture);
   }
   const parseFrames = await replayParseInvalidCorpus();
-  expect(parseFrames).toBe(31);
+  expect(parseFrames).toBe(47);
   const property = consumePropertyCorpus();
   expect(property[0]).toBe(100);
   expect(property[1]).toBe(100);
   expect(property[2]).toBe(EXPECTED_PROPERTY_DIGEST);
   // This marker is intentionally the only success output consumed by run.py.
-  console.log(`TS_CONTRACT_OK digest=${EXPECTED_DIGEST} validFrames=44 methodResults=${methodResults} parseFrames=${parseFrames} propertyValid=${property[0]} propertyInvalid=${property[1]} propertyDigest=${property[2]}`);
+  console.log(`TS_CONTRACT_OK digest=${EXPECTED_DIGEST} validFrames=54 methodResults=${methodResults} parseFrames=${parseFrames} propertyValid=${property[0]} propertyInvalid=${property[1]} propertyDigest=${property[2]}`);
 });

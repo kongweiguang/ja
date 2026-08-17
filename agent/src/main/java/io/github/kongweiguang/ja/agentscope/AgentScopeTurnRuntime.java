@@ -7,7 +7,13 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEvent;
+import io.agentscope.core.event.AgentEventType;
 import io.agentscope.core.event.AgentStartEvent;
+import io.agentscope.core.event.ConfirmResult;
+import io.agentscope.core.event.RequireUserConfirmEvent;
+import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.MsgRole;
+import io.agentscope.core.message.ToolUseBlock;
 import io.github.kongweiguang.ja.domain.ServerInstanceId;
 import io.github.kongweiguang.ja.domain.ThreadId;
 import io.github.kongweiguang.ja.domain.TurnId;
@@ -18,8 +24,12 @@ import io.github.kongweiguang.ja.runtime.TurnEvent;
 import io.github.kongweiguang.ja.runtime.TurnHandle;
 import io.github.kongweiguang.ja.runtime.TurnRuntime;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -54,13 +64,19 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
     private final ScheduledExecutorService deadlines;
     private final ConcurrentMap<SessionKey, SessionLane> lanes = new ConcurrentHashMap<>();
     private final ConcurrentMap<TurnId, Run> runs = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Run> approvals = new ConcurrentHashMap<>();
     private final AtomicLong turnSequence = new AtomicLong();
+    private final AtomicLong approvalSequence = new AtomicLong();
     private final AtomicInteger acceptedCount = new AtomicInteger();
     private final AtomicInteger acceptedInputBytes = new AtomicInteger();
     private final Object admissionMonitor = new Object();
     private final Object quiescenceMonitor = new Object();
     private final AtomicBoolean accepting = new AtomicBoolean(true);
     private final AtomicBoolean closed = new AtomicBoolean();
+    private volatile TurnRuntime.ApprovalSink approvalSink = (prompt, resolver) -> {
+        // Direct runtime callers may omit a transport; the run remains waiting until cancelled or
+        // its deadline expires, which is safer than silently executing an ASK tool.
+    };
 
     /** Builds a runtime with the bounded production defaults. */
     public AgentScopeTurnRuntime(AgentScopeEngine engine, ServerInstanceId serverInstanceId) {
@@ -83,6 +99,12 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         ThreadFactory deadlineThreads = Thread.ofPlatform().daemon(true)
                 .name("ja-agentscope-deadline", 0).factory();
         this.deadlines = Executors.newSingleThreadScheduledExecutor(deadlineThreads);
+    }
+
+    /** Installs the one host approval sink; response handling remains asynchronous and one-shot. */
+    @Override
+    public void setApprovalSink(TurnRuntime.ApprovalSink sink) {
+        approvalSink = sink == null ? (prompt, resolver) -> { } : sink;
     }
 
     /**
@@ -318,7 +340,7 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
             return;
         }
             run.normalized = normalizer.open(run.input.threadId, run.turnId,
-                    run.input.mode, run.input.permissionMode);
+                    run.input.mode, run.input.accessMode);
             run.context = contextFactory.create(run.sessionKey, Map.of(
                     "ja.threadId", run.input.threadId.value(),
                     "ja.turnId", run.turnId.value(),
@@ -331,19 +353,24 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
             if (run.finished.get() || run.cancelled.get()) {
                 return;
             }
-            Flux<AgentEvent> stream = engine.stream(run.input.text, run.context);
-            Disposable subscription = stream.subscribe(
-                    event -> publishNormalized(run, event),
-                    error -> streamFailed(run, error),
-                    () -> streamCompleted(run));
-            synchronized (run) {
-                run.subscription = subscription;
-                if (run.cancelled.get()) {
-                    subscription.dispose();
-                }
-            }
+            subscribeStream(run, engine.stream(run.input.text, run.context));
         } catch (RuntimeException exception) {
             streamFailed(run, exception);
+        }
+    }
+
+    /** Subscribes one stream without blocking the control lane or the session FIFO. */
+    private void subscribeStream(Run run, Flux<AgentEvent> stream) {
+        Objects.requireNonNull(stream, "stream");
+        Disposable subscription = stream.subscribe(
+                event -> publishNormalized(run, event),
+                error -> streamFailed(run, error),
+                () -> streamCompleted(run));
+        synchronized (run) {
+            run.subscription = subscription;
+            if (run.cancelled.get() || run.finished.get()) {
+                subscription.dispose();
+            }
         }
     }
 
@@ -354,6 +381,12 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         }
         if (deadlineExpired(run)) {
             cancelInternal(run.turnId, "deadline_exceeded");
+            return;
+        }
+        if (run.waitingApproval.get() && isPermissionPauseStop(event)) {
+            // AgentScope closes the asking Flux with REQUEST_STOP after emitting the HITL event;
+            // treating that provider bookkeeping as terminal would release the FIFO lane before
+            // the host response and make the later confirmation impossible to resume.
             return;
         }
         try {
@@ -369,13 +402,164 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                     run.publisher.accept(output);
                 }
             }
+            if (event instanceof RequireUserConfirmEvent confirmation) {
+                registerApproval(run, confirmation);
+            }
         } catch (RuntimeException exception) {
             streamFailed(run, exception);
         }
     }
 
+    /** Keeps AgentScope's permission-pause bookkeeping non-terminal until the host decision arrives. */
+    private static boolean isPermissionPauseStop(AgentEvent event) {
+        return event != null && event.getType() == AgentEventType.REQUEST_STOP;
+    }
+
+    /**
+     * Turns AgentScope's upstream ASK event into one resumable JA approval prompt. The provider
+     * Flux is allowed to complete after this event; the run stays in its session lane until the
+     * transport calls the one-shot resolver.
+     */
+    private void registerApproval(Run run, RequireUserConfirmEvent confirmation) {
+        if (confirmation.getToolCalls().isEmpty() || run.waitingApproval.get()) {
+            throw new IllegalStateException("invalid AgentScope approval pause");
+        }
+        String itemId = normalizer.approvalItemId(run.normalized);
+        if (itemId == null) {
+            throw new IllegalStateException("approval item was not normalized");
+        }
+        String approvalId = nextApprovalId(run);
+        ActionSummary action = summarizeAction(confirmation.getToolCalls());
+        TurnRuntime.ApprovalPrompt prompt = new TurnRuntime.ApprovalPrompt(
+                approvalId, run.input.threadId.value(), run.turnId.value(), itemId,
+                action.kind(), action.command(), action.cwd(), action.relativePaths(), action.risk(),
+                run.input.accessMode, Instant.now().plus(config.turnTimeout()), action.reason());
+        PendingApproval pending = new PendingApproval(prompt, confirmation.getToolCalls());
+        run.pendingApproval = pending;
+        run.waitingApproval.set(true);
+        approvals.put(approvalId, run);
+        try {
+            approvalSink.request(prompt, decision -> resolveApproval(approvalId, decision));
+        } catch (RuntimeException exception) {
+            approvals.remove(approvalId, run);
+            run.pendingApproval = null;
+            run.waitingApproval.set(false);
+            throw exception;
+        }
+    }
+
+    /** Generates a protocol-shaped approval id while allowing more than one ASK in one turn. */
+    private String nextApprovalId(Run run) {
+        String suffix = run.turnId.value().startsWith("turn_")
+                ? run.turnId.value().substring("turn_".length()) : run.turnId.value();
+        long sequence = approvalSequence.incrementAndGet();
+        String candidate = "appr_" + suffix + "_" + sequence;
+        return candidate.length() <= 101 ? candidate : candidate.substring(0, 101);
+    }
+
+    /** Converts an accepted response into an asynchronous AgentScope resume operation. */
+    private void resolveApproval(String approvalId, TurnRuntime.ApprovalDecision decision) {
+        Objects.requireNonNull(decision, "decision");
+        Run run = approvals.get(approvalId);
+        if (run == null || run.finished.get() || !run.waitingApproval.get()) {
+            return;
+        }
+        PendingApproval pending = run.pendingApproval;
+        if (pending == null || !pending.prompt.approvalId().equals(approvalId)
+                || !pending.resolved.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            workers.submit(() -> resumeAfterApproval(run, pending, decision));
+        } catch (RuntimeException exception) {
+            streamFailed(run, exception);
+        }
+    }
+
+    /** Applies the decision and resubscribes the same AgentScope session without waiting in stdio. */
+    private void resumeAfterApproval(Run run, PendingApproval pending,
+                                     TurnRuntime.ApprovalDecision decision) {
+        if (run.finished.get() || run.cancelled.get() || !run.waitingApproval.get()) {
+            return;
+        }
+        try {
+            boolean allowed = "allow_once".equals(decision.decision())
+                    || "allow_session".equals(decision.decision());
+            if ("allow_session".equals(decision.decision())) {
+                engine.allowSession(run.input.userId, run.input.sessionId, pending.toolCalls);
+            }
+            List<ConfirmResult> confirmations = pending.toolCalls.stream()
+                    .map(tool -> new ConfirmResult(allowed, tool))
+                    .toList();
+            Map<String, Object> metadata = new HashMap<>();
+            metadata.put(Msg.METADATA_CONFIRM_RESULTS, confirmations);
+            Msg resume = Msg.builder()
+                    .name("user")
+                    .role(MsgRole.USER)
+                    .textContent(allowed ? "approved" : "denied")
+                    .metadata(metadata)
+                    .build();
+            approvals.remove(pending.prompt.approvalId(), run);
+            run.pendingApproval = null;
+            run.waitingApproval.set(false);
+            subscribeStream(run, engine.resume(resume, run.context));
+        } catch (RuntimeException exception) {
+            streamFailed(run, exception);
+        }
+    }
+
+    /** Keeps approval summaries useful without copying arbitrary tool arguments to Rust. */
+    private static ActionSummary summarizeAction(List<ToolUseBlock> toolCalls) {
+        ToolUseBlock first = toolCalls.getFirst();
+        String toolName = boundedText(first.getName(), 256);
+        String normalized = toolName.toLowerCase(Locale.ROOT);
+        String kind = normalized.contains("shell") || normalized.contains("execute")
+                || normalized.contains("command") ? "shell"
+                : normalized.contains("read") ? "file_read"
+                : normalized.contains("write") || normalized.contains("edit")
+                || normalized.contains("patch") ? "file_write"
+                : normalized.contains("delete") || normalized.contains("remove") ? "file_delete"
+                : normalized.contains("mcp") ? "mcp_tool" : "external_tool";
+        Map<String, Object> input = first.getInput();
+        String command = boundedNullable(input.get("command"), 4_096);
+        String cwd = boundedNullable(input.get("cwd"), 4_096);
+        List<String> paths = new ArrayList<>();
+        Object path = input.get("path");
+        if (path instanceof String value) {
+            paths.add(boundedText(value, 4_096));
+        }
+        Object pathList = input.get("paths");
+        if (pathList instanceof List<?> values) {
+            values.stream().filter(String.class::isInstance).map(String.class::cast)
+                    .map(value -> boundedText(value, 4_096)).limit(128).forEach(paths::add);
+        }
+        String risk = "shell".equals(kind) || "file_delete".equals(kind) ? "high"
+                : "file_read".equals(kind) ? "low" : "medium";
+        return new ActionSummary(kind, command, cwd, List.copyOf(paths), risk,
+                "AgentScope requested confirmation for " + toolName);
+    }
+
+    /** Bounds optional model-provided values before they cross the approval request boundary. */
+    private static String boundedNullable(Object value, int maxLength) {
+        return value instanceof String text && !text.isBlank()
+                ? boundedText(text, maxLength) : null;
+    }
+
+    /** Bounds one display string without retaining arbitrary provider payloads. */
+    private static String boundedText(String value, int maxLength) {
+        if (value == null || value.isEmpty()) {
+            return "";
+        }
+        return value.length() <= maxLength ? value : value.substring(0, maxLength);
+    }
+
     /** Completes an event stream with a successful terminal status when needed. */
     private void streamCompleted(Run run) {
+        if (run.waitingApproval.get()) {
+            // AgentScope intentionally completes the asking Flux with PERMISSION_ASKING. The
+            // session lane remains occupied so a same-session turn cannot bypass the pending tool.
+            return;
+        }
         finish(run, run.cancelled.get() ? "interrupted" : "completed",
                 run.cancelled.get() ? "cancelled" : null);
     }
@@ -459,6 +643,12 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         if (!run.finished.compareAndSet(false, true)) {
             return;
         }
+        PendingApproval pending = run.pendingApproval;
+        if (pending != null) {
+            approvals.remove(pending.prompt.approvalId(), run);
+            run.pendingApproval = null;
+            run.waitingApproval.set(false);
+        }
         ScheduledFuture<?> deadlineTask = run.deadlineTask;
         if (deadlineTask != null) {
             deadlineTask.cancel(false);
@@ -467,7 +657,7 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
             EventNormalizer.Context context = run.normalized;
             if (context == null) {
                 context = normalizer.open(run.input.threadId, run.turnId,
-                        run.input.mode, run.input.permissionMode);
+                        run.input.mode, run.input.accessMode);
                 run.normalized = context;
             }
             for (TurnEvent terminal : normalizer.terminal(context, status, reason)) {
@@ -618,6 +808,7 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         private final AtomicBoolean cancelled = new AtomicBoolean();
         private final AtomicBoolean finished = new AtomicBoolean();
         private final AtomicBoolean resourceOverflow = new AtomicBoolean();
+        private final AtomicBoolean waitingApproval = new AtomicBoolean();
         private volatile SessionLane lane;
         private volatile long deadlineNanos;
         private volatile ScheduledFuture<?> deadlineTask;
@@ -628,6 +819,7 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         private volatile RuntimeContext context;
         private volatile EventNormalizer.Context normalized;
         private volatile Disposable subscription;
+        private volatile PendingApproval pendingApproval;
 
         private Run(TurnId turnId, SessionKey sessionKey, Input input,
                     Consumer<TurnEvent> publisher) {
@@ -638,8 +830,25 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         }
     }
 
+    /** Keeps the exact upstream ASK blocks needed by AgentScope's resume contract. */
+    private static final class PendingApproval {
+        private final TurnRuntime.ApprovalPrompt prompt;
+        private final List<ToolUseBlock> toolCalls;
+        private final AtomicBoolean resolved = new AtomicBoolean();
+
+        private PendingApproval(TurnRuntime.ApprovalPrompt prompt, List<ToolUseBlock> toolCalls) {
+            this.prompt = Objects.requireNonNull(prompt, "prompt");
+            this.toolCalls = List.copyOf(toolCalls);
+        }
+    }
+
+    /** Redacted action details used only to construct the frozen approval/request params. */
+    private record ActionSummary(String kind, String command, String cwd, List<String> relativePaths,
+                                 String risk, String reason) {
+    }
+
     private record Input(ThreadId threadId, String userId, String sessionId, String text,
-                         String requestedTurnId, String mode, String permissionMode,
+                         String requestedTurnId, String mode, String accessMode,
                          int inputBytes) {
         /** Parses and bounds the public turn/start request before AgentScope sees it. */
         private static Input parse(ObjectNode params, int maxInputBytes) {
@@ -652,7 +861,16 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                     throw new IllegalArgumentException("turn id prefix");
                 }
                 String mode = optional(params, "mode", "coding");
-                String permission = optional(params, "permissionMode", "workspace");
+                // The public contract calls this value accessMode. Keep the old internal field as
+                // a direct-runtime test fallback only; the production graph requires accessMode
+                // before this parser is reached and maps it to AgentScope PermissionMode.
+                String accessMode = params.has("accessMode")
+                        ? required(params, "accessMode")
+                        : optional(params, "permissionMode", "workspace");
+                if (!java.util.Set.of("read_only", "workspace", "full_access")
+                        .contains(accessMode)) {
+                    throw new IllegalArgumentException("access mode");
+                }
                 JsonNode input = params.get("input");
                 if (input == null || !input.isArray() || input.isEmpty() || input.size() > 128) {
                     throw new IllegalArgumentException("input");
@@ -678,7 +896,7 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                     throw new IllegalArgumentException("input size");
                 }
                 return new Input(threadId, userId, sessionId, value, requestedTurnId,
-                        mode, permission, text.bytes());
+                        mode, accessMode, text.bytes());
             } catch (RuntimeException exception) {
                 if (exception instanceof ProtocolException protocol) {
                     throw protocol;

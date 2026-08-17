@@ -25,9 +25,6 @@ import io.agentscope.core.event.RequireUserConfirmEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.event.TextBlockEndEvent;
 import io.agentscope.core.event.TextBlockStartEvent;
-import io.agentscope.core.event.ThinkingBlockDeltaEvent;
-import io.agentscope.core.event.ThinkingBlockEndEvent;
-import io.agentscope.core.event.ThinkingBlockStartEvent;
 import io.agentscope.core.event.ToolCallDeltaEvent;
 import io.agentscope.core.event.ToolCallEndEvent;
 import io.agentscope.core.event.ToolCallStartEvent;
@@ -113,9 +110,9 @@ public final class EventNormalizer {
      * Opens context with the negotiated turn modes so the UI can render the
      * same permission boundary that the caller requested.
      */
-    public Context open(ThreadId threadId, TurnId turnId, String mode, String permissionMode) {
+    public Context open(ThreadId threadId, TurnId turnId, String mode, String accessMode) {
         return new Context(Objects.requireNonNull(threadId, "threadId"),
-                Objects.requireNonNull(turnId, "turnId"), bounded(mode), bounded(permissionMode),
+                Objects.requireNonNull(turnId, "turnId"), bounded(mode), bounded(accessMode),
                 contextSequence.incrementAndGet());
     }
 
@@ -147,13 +144,10 @@ public final class EventNormalizer {
                 case TEXT_BLOCK_DELTA -> appendBlock(context, ((TextBlockDeltaEvent) event).getBlockId(),
                         ((TextBlockDeltaEvent) event).getDelta(), false);
                 case TEXT_BLOCK_END -> endBlock(context, ((TextBlockEndEvent) event).getBlockId());
-                case THINKING_BLOCK_START -> startBlock(context,
-                        ((ThinkingBlockStartEvent) event).getBlockId(), ItemKind.REASONING_SUMMARY,
-                        "Reasoning summary", true);
-                case THINKING_BLOCK_DELTA -> List.of();
-                case THINKING_BLOCK_END -> endBlock(context, ((ThinkingBlockEndEvent) event).getBlockId());
+                case THINKING_BLOCK_START, THINKING_BLOCK_DELTA, THINKING_BLOCK_END ->
+                        dropHiddenReasoning();
                 case DATA_BLOCK_START -> startBlock(context, ((DataBlockStartEvent) event).getBlockId(),
-                        ItemKind.RUNTIME_NOTICE, "Data output", true);
+                        ItemKind.COMMENTARY, "Data output", true);
                 case DATA_BLOCK_DELTA -> appendBlock(context, ((DataBlockDeltaEvent) event).getBlockId(),
                         ((DataBlockDeltaEvent) event).getDelta(), true);
                 case DATA_BLOCK_END -> endBlock(context, ((DataBlockEndEvent) event).getBlockId());
@@ -168,8 +162,7 @@ public final class EventNormalizer {
                 case TOOL_RESULT_END -> normalizeToolResultEnd((ToolResultEndEvent) event, context);
                 case REQUIRE_USER_CONFIRM -> normalizeApproval(((RequireUserConfirmEvent) event)
                         .getToolCalls().size(), context, "user confirmation");
-                case REQUIRE_EXTERNAL_EXECUTION -> normalizeApproval(((RequireExternalExecutionEvent) event)
-                        .getToolCalls().size(), context, "external execution");
+                case REQUIRE_EXTERNAL_EXECUTION -> unsupportedExternalExecution(context);
                 case USER_CONFIRM_RESULT -> normalizeUserConfirmResult(
                         (UserConfirmResultEvent) event, context);
                 case EXTERNAL_EXECUTION_RESULT -> normalizeExternalExecutionResult(
@@ -224,7 +217,7 @@ public final class EventNormalizer {
             turn.put("status", safeStatus);
             turn.put("terminalStatus", safeStatus);
             turn.put("mode", context.mode);
-            turn.put("permissionMode", context.permissionMode);
+            turn.put("accessMode", context.accessMode);
             String safeReason = terminalReason(reason);
             if (!safeReason.isEmpty()) {
                 turn.put("reason", safeReason);
@@ -277,6 +270,16 @@ public final class EventNormalizer {
         }
     }
 
+    /** Returns the already-normalized approval item identity for the standard approval/request. */
+    String approvalItemId(Context context) {
+        Context required = Objects.requireNonNull(context, "context");
+        synchronized (required) {
+            ItemAccumulator item = required.items.get(key("approval:user confirmation",
+                    ItemKind.APPROVAL.name()));
+            return item == null ? null : item.itemId;
+        }
+    }
+
     /** Suppresses provider duplicate starts because the runtime owns the boundary. */
     private List<TurnEvent> normalizeAgentStart(AgentStartEvent event, Context context) {
         if (context.started) {
@@ -292,21 +295,22 @@ public final class EventNormalizer {
 
     /** Keeps model-call lifecycle visible without forwarding prompts or provider payloads. */
     private List<TurnEvent> normalizeModelCallStart(ModelCallStartEvent event, Context context) {
-        return runtimeNotice(context, "MODEL_CALL_START", "start", safeIdentifier(event.getReplyId()));
+        return commentaryNotice(context, "model-call-start:" + event.getReplyId(),
+                "Model call started", Map.of("phase", "start",
+                        "replyId", safeIdentifier(event.getReplyId())));
     }
 
     /** Keeps only bounded token counters from a model-call completion event. */
     private List<TurnEvent> normalizeModelCallEnd(ModelCallEndEvent event, Context context) {
-        ObjectNode params = base(context);
-        params.put("kind", "model_call");
-        params.put("eventType", "MODEL_CALL_END");
-        params.put("phase", "end");
-        params.put("replyId", safeIdentifier(event.getReplyId()));
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("phase", "end");
+        metadata.put("replyId", safeIdentifier(event.getReplyId()));
         if (event.getUsage() != null) {
-            params.put("usageInputTokens", nonNegative(event.getUsage().getInputTokens()));
-            params.put("usageOutputTokens", nonNegative(event.getUsage().getOutputTokens()));
+            metadata.put("usageInputTokens", nonNegative(event.getUsage().getInputTokens()));
+            metadata.put("usageOutputTokens", nonNegative(event.getUsage().getOutputTokens()));
         }
-        return List.of(new TurnEvent("runtime/notice", params));
+        return commentaryNotice(context, "model-call-end:" + event.getReplyId(),
+                "Model call completed", metadata);
     }
 
     /** Reports confirmation outcome counts while keeping modified tool calls private. */
@@ -314,24 +318,19 @@ public final class EventNormalizer {
                                                         Context context) {
         long confirmed = event.getConfirmResults().stream()
                 .filter(result -> result != null && result.isConfirmed()).count();
-        ObjectNode params = base(context);
-        params.put("kind", "approval_result");
-        params.put("eventType", "USER_CONFIRM_RESULT");
-        params.put("replyId", safeIdentifier(event.getReplyId()));
-        params.put("resultCount", event.getConfirmResults().size());
-        params.put("confirmedCount", confirmed);
-        return List.of(new TurnEvent("runtime/notice", params));
+        return commentaryNotice(context, "approval-result:" + event.getReplyId(),
+                "Approval result", Map.of("replyId", safeIdentifier(event.getReplyId()),
+                        "toolCount", event.getConfirmResults().size(),
+                        "status", confirmed == event.getConfirmResults().size()
+                                ? "confirmed" : "partial"));
     }
 
     /** Reports external execution count without exposing tool result blocks or their payloads. */
     private List<TurnEvent> normalizeExternalExecutionResult(ExternalExecutionResultEvent event,
                                                               Context context) {
-        ObjectNode params = base(context);
-        params.put("kind", "external_execution_result");
-        params.put("eventType", "EXTERNAL_EXECUTION_RESULT");
-        params.put("replyId", safeIdentifier(event.getReplyId()));
-        params.put("resultCount", event.getToolResults().size());
-        return List.of(new TurnEvent("runtime/notice", params));
+        return commentaryNotice(context, "external-result:" + event.getReplyId(),
+                "External execution completed", Map.of("replyId", safeIdentifier(event.getReplyId()),
+                        "toolCount", event.getToolResults().size(), "status", "completed"));
     }
 
     /** Recovers a final text block when a provider emits only an aggregate result. */
@@ -377,7 +376,7 @@ public final class EventNormalizer {
         ItemAccumulator item = findBlock(context, rawKey, hidden);
         List<TurnEvent> result = new ArrayList<>();
         if (item == null) {
-            result.addAll(startBlock(context, rawKey, hidden ? ItemKind.RUNTIME_NOTICE
+            result.addAll(startBlock(context, rawKey, hidden ? ItemKind.COMMENTARY
                     : ItemKind.AGENT_MESSAGE, hidden ? "Data output" : "Agent response", hidden));
             item = findBlock(context, rawKey, hidden);
         }
@@ -433,10 +432,10 @@ public final class EventNormalizer {
      */
     private ItemAccumulator findBlock(Context context, String rawKey, boolean hidden) {
         List<String> categories = hidden
-                ? List.of(ItemKind.RUNTIME_NOTICE.name(), ItemKind.REASONING_SUMMARY.name(),
+                ? List.of(ItemKind.COMMENTARY.name(),
                 ItemKind.COMMAND.name(), ItemKind.APPROVAL.name())
                 : List.of(ItemKind.AGENT_MESSAGE.name(), ItemKind.TOOL_CALL.name(),
-                ItemKind.COMMAND.name(), ItemKind.RUNTIME_NOTICE.name());
+                ItemKind.COMMAND.name(), ItemKind.COMMENTARY.name());
         for (String category : categories) {
             ItemAccumulator item = context.items.get(key(rawKey, category));
             if (item != null) {
@@ -560,13 +559,20 @@ public final class EventNormalizer {
         return result;
     }
 
+    /** Terminates unsupported external execution deterministically instead of creating a false HITL pause. */
+    private List<TurnEvent> unsupportedExternalExecution(Context context) {
+        // JA v1 keeps Rust as the host for shell/process execution; AgentScope's external execution
+        // callback therefore has no valid responder and must never leave a turn waiting forever.
+        return terminal(context, "failed", "unsupported_external_execution");
+    }
+
     /** Converts harness hints to a closed runtime row so background context is inspectable. */
     private List<TurnEvent> normalizeHint(HintBlockEvent event, Context context) {
         String key = "hint:" + event.getBlockId();
-        List<TurnEvent> result = new ArrayList<>(startBlock(context, key, ItemKind.RUNTIME_NOTICE,
+        List<TurnEvent> result = new ArrayList<>(startBlock(context, key, ItemKind.COMMENTARY,
                 "Agent hint", true));
         result.addAll(appendBlock(context, key, "", true));
-        ItemAccumulator item = context.items.get(key(key, ItemKind.RUNTIME_NOTICE.name()));
+        ItemAccumulator item = context.items.get(key(key, ItemKind.COMMENTARY.name()));
         if (item != null) {
             putMetadata(context, item, "hintSource", safeIdentifier(event.getHintSource()));
             putMetadata(context, item, "outputBytes", safeByteCount(event.getHint()));
@@ -591,29 +597,40 @@ public final class EventNormalizer {
         result.set(0, new TurnEvent("item/started", params));
     }
 
-    /** Keeps known non-authoritative lifecycle events visible as bounded diagnostics. */
-    private List<TurnEvent> runtimeNotice(Context context, String eventType, String phase,
-                                          String replyId) {
-        ObjectNode params = base(context);
-        params.put("kind", "agentscope_event");
-        params.put("eventType", bounded(eventType));
-        if (phase != null) {
-            params.put("phase", bounded(phase));
+    /**
+     * Projects non-content lifecycle signals into the existing commentary item kind.
+     * A separate runtime wire kind would make the AgentScope stream incompatible with
+     * the frozen JA v1 item union, while allowlisted metadata still gives the UI useful
+     * progress context without forwarding provider payloads.
+     */
+    private List<TurnEvent> commentaryNotice(Context context, String rawKey, String title,
+                                              Map<String, Object> metadata) {
+        List<TurnEvent> result = new ArrayList<>(startBlock(context, rawKey,
+                ItemKind.COMMENTARY, title, false));
+        ItemAccumulator item = context.items.get(key(rawKey, ItemKind.COMMENTARY.name()));
+        if (item != null) {
+            metadata.forEach((name, value) -> putMetadata(context, item, name, value));
+            rewriteStartedItem(result, context, item);
+            result.addAll(endBlock(context, rawKey));
         }
-        if (replyId != null) {
-            params.put("replyId", safeIdentifier(replyId));
-        }
-        return List.of(new TurnEvent("runtime/notice", params));
+        return result;
     }
 
-    /** Marks an event type unknown to this adapter without advancing item/turn state. */
+    /**
+     * Drops event types that JA v1 cannot represent instead of emitting an unknown
+     * method that would make the frontend parser reject the entire stdio stream.
+     */
     private List<TurnEvent> unsupportedEvent(Context context, String eventType) {
-        ObjectNode params = base(context);
-        params.put("kind", "unsupported");
-        params.put("unsupported", true);
-        params.put("diagnosticCode", "agentscope_event_unsupported");
-        params.put("eventType", bounded(eventType));
-        return List.of(new TurnEvent("runtime/unsupported", params));
+        return List.of();
+    }
+
+    /**
+     * Discards chain-of-thought blocks at the adapter boundary; AgentScope's raw
+     * thinking deltas are not a product-safe progress summary and must never reach
+     * item text or metadata.
+     */
+    private static List<TurnEvent> dropHiddenReasoning() {
+        return List.of();
     }
 
     /** Adds a sequence envelope and reserves an event budget slot for this turn. */
@@ -679,7 +696,7 @@ public final class EventNormalizer {
         turn.put("threadId", context.threadId.value());
         turn.put("status", status);
         turn.put("mode", context.mode);
-        turn.put("permissionMode", context.permissionMode);
+        turn.put("accessMode", context.accessMode);
         turn.put("startedAt", clock.instant().toString());
         return turn;
     }
@@ -806,7 +823,7 @@ public final class EventNormalizer {
         private final ThreadId threadId;
         private final TurnId turnId;
         private final String mode;
-        private final String permissionMode;
+        private final String accessMode;
         private final long instanceSequence;
         private final Map<String, ItemAccumulator> items = new LinkedHashMap<>();
         private boolean started;
@@ -817,12 +834,12 @@ public final class EventNormalizer {
         private int eventBytes;
         private int metadataBytes;
 
-        private Context(ThreadId threadId, TurnId turnId, String mode, String permissionMode,
+        private Context(ThreadId threadId, TurnId turnId, String mode, String accessMode,
                         long instanceSequence) {
             this.threadId = threadId;
             this.turnId = turnId;
             this.mode = mode;
-            this.permissionMode = permissionMode;
+            this.accessMode = accessMode;
             this.instanceSequence = instanceSequence;
         }
 

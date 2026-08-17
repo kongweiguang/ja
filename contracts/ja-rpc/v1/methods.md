@@ -77,9 +77,9 @@ OpenAI Responses API 不在 v1；UI 不得把它显示为可用。
 
 | 方法 | 方向 | params 要点 | 边界 |
 | --- | --- | --- | --- |
-| `skill/list` | C→S | 空对象 | 返回来源、hash、scope、enabled、health、last-good revision |
+| `skill/list` | C→S | 空对象 | 返回来源、描述、hash、scope、enabled、health |
 | `skill/import` | C→S | builtin/directory/archive source | 校验 `SKILL.md`、路径、大小、编码、hash；不执行脚本 |
-| `skill/enable` | C→S | skill revision、enabled、scope | 原子切换；失败保留 last-good |
+| `skill/enable` | C→S | skill revision、enabled、scope | 只切换已校验的显式 revision；失败不改变当前启用状态 |
 | `skill/reload` | C→S | skill revision 可选 | 重新校验并生成 revision |
 | `skill/health/read` | C→S | skill revision 可选 | 返回明确 degraded/invalid，不静默降级 |
 
@@ -91,15 +91,16 @@ OpenAI Responses API 不在 v1；UI 不得把它显示为可用。
 | 方法 | 方向 | params 要点 | 首发限制 |
 | --- | --- | --- | --- |
 | `mcp/list` | C→S | 空对象 | 列出健康、协议、transport、revision 和 unsupported 原因 |
-| `mcp/save` | C→S | name/transport/endpoint/protocol/credential ref | secret 不进入 URL/query |
+| `mcp/save` | C→S | name/transport/endpoint/protocol/auth/args/env/headers/queryParams | stdio endpoint 只能是 executable/path；HTTP endpoint 无 userinfo/credential query；secret 只能通过 credentialRef |
 | `mcp/delete` | C→S | `mcpRevision` | 先撤销 Tool revision，再回收连接 |
-| `mcp/test` | C→S | `mcpRevision` | tools/list 健康探测，不自动执行副作用 Tool |
+| `mcp/test` | C→S | `mcpRevision`、认证时 `profileRevision?` | tools/list 健康探测，不自动执行副作用 Tool；认证 server 必须携带 profileRevision |
 | `mcp/reload` | C→S | `mcpRevision` | 有界重连/熔断，旧 revision 可回退 |
 | `mcp/tools/read` | C→S | `mcpRevision` | 返回 namespaced Tool schema 和 policy |
 | `mcp/toolPolicy/set` | C→S | revision/toolName/policy | 新 Tool 默认 ask；不信任 server 自报 read-only |
 
 首发只支持 MCP `tools/list`、`tools/call`，stdio 与 Streamable HTTP、无认证或 OS
-credential `static secret-ref`。OAuth、Resources、Prompts、Sampling、Roots、
+credential `static secret-ref`。stdio 认证使用 named env，HTTP 认证使用 bearer 或 named
+custom header；顶层 `credentialRef` 仅为 HTTP bearer shorthand 且 deprecated。OAuth、Resources、Prompts、Sampling、Roots、
 Elicitation、Apps 和插件市场返回稳定 unsupported。
 
 ## Input boundary

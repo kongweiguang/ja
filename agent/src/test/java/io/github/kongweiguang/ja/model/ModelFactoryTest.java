@@ -118,6 +118,16 @@ class ModelFactoryTest {
         assertFalse(handle.capabilities().supports(io.github.kongweiguang.ja.profiles.ModelCapability.STRUCTURED_OUTPUT));
     }
 
+    /** Ensures activation without a probe does not overclaim generic provider capabilities. */
+    @Test
+    void noProbeCompatibleFactoryUsesConservativeCapabilities() {
+        ModelProfile profile = localProfile();
+        ModelHandle handle = new AgentScopeModelFactory().create(profile, null);
+        assertFalse(handle.capabilities().supports(io.github.kongweiguang.ja.profiles.ModelCapability.IMAGE));
+        assertFalse(handle.capabilities().supports(io.github.kongweiguang.ja.profiles.ModelCapability.STRUCTURED_OUTPUT));
+        assertFalse(((OpenAIChatModel) handle.model()).supportsNativeStructuredOutput());
+    }
+
     /** Keeps Anthropic reasoning absent because AgentScope 2.0.2 does not expose typed request thinking support. */
     @Test
     void anthropicDoesNotClaimReasoningByDefaultOrFromUntrustedProbe() {

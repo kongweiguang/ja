@@ -68,6 +68,7 @@ HANDSHAKE_METHODS = {"initialized", "runtime/statusChanged"}
 NON_READY_STATUSES = {"starting", "degraded", "shutting_down", "stopped", "crashed"}
 HANDSHAKE_VALID_FIXTURE = BASE / "valid" / "handshake.jsonl"
 HANDSHAKE_INVALID_FIXTURE = BASE / "invalid" / "handshake-challenge.jsonl"
+MCP_INVALID_FIXTURE = BASE / "invalid" / "mcp.jsonl"
 ERRORS_DOC = BASE.parent / "ja-rpc" / "v1" / "errors.md"
 ERROR_ROW = re.compile(r"^\|\s*(-?\d+)\s+\|\s+`([A-Z][A-Z0-9_]*)`\s+\|\s+(是|否)\s+\|")
 
@@ -391,6 +392,18 @@ def validate_parse_only_fixtures() -> int:
     return count
 
 
+def validate_mcp_constraint_cases(validator: Draft202012Validator) -> int:
+    """校验 MCP 负例确实在 Schema 边界失败，防止只做 JSON parse 的假覆盖。"""
+    cases = load_documents(MCP_INVALID_FIXTURE)
+    for index, case in enumerate(cases, start=1):
+        if not isinstance(case, dict) or case.get("schemaValid") is not False or not isinstance(case.get("frame"), dict):
+            raise ValueError(f"{MCP_INVALID_FIXTURE}:{index}: invalid case metadata")
+        errors = list(validator.iter_errors(case["frame"]))
+        if not errors:
+            raise ValueError(f"{MCP_INVALID_FIXTURE}:{index}: expected schema rejection for {case.get('case')}")
+    return len(cases)
+
+
 def validate_markdown_headers() -> int:
     """检查契约说明具备作者和许可证，避免可审查的协议规则变成无归属文本。"""
     count = 0
@@ -429,6 +442,7 @@ def main() -> int:
     catalog = load_error_catalog()
     frame_count, result_count = validate_valid_fixtures(validator, catalog)
     handshake_valid_count, handshake_invalid_count = validate_handshake_cases(validator, catalog)
+    mcp_invalid_count = validate_mcp_constraint_cases(validator)
     parse_count = validate_parse_only_fixtures()
     markdown_count = validate_markdown_headers()
     validate_no_path_or_secret_leaks()
@@ -438,6 +452,7 @@ def main() -> int:
         f"validFrames={handshake_valid_count} invalidCases={handshake_invalid_count} "
         "runtimeInvariant=echo-order-generation"
     )
+    print(f"MCP_CONSTRAINTS_OK invalidCases={mcp_invalid_count}")
     print(f"PARSE_ONLY_OK invalidOrMajorFrames={parse_count}")
     print(f"HEADERS_OK markdown={markdown_count}")
     print("PATH_SECRET_SCAN_OK")

@@ -89,7 +89,7 @@ object key 或 value。`details`
 | -32052 | `MODEL_UNSUPPORTED` | 否 | provider/protocol 或能力（如 vision）未探测支持 |
 | -32053 | `MODEL_UNAVAILABLE` | 是 | Provider 暂时不可用；遵守 retryAfterMs 和用户预算 |
 | -32054 | `SKILL_INVALID` | 否 | SKILL.md、编码、归档路径/hash/大小校验失败 |
-| -32055 | `SKILL_UNAVAILABLE` | 是 | last-good revision 不可用或加载失败；显示 degraded |
+| -32055 | `SKILL_UNAVAILABLE` | 是 | Skill revision 不可用或加载失败；显示 degraded |
 | -32056 | `MCP_UNSUPPORTED_AUTH` | 否 | 首发不支持 OAuth 等远程认证；不能把 token 填 URL |
 | -32057 | `MCP_SERVER_UNAVAILABLE` | 是 | MCP 进程/HTTP server 不健康；只撤销该 server Tool revision |
 | -32058 | `MCP_PROTOCOL_UNSUPPORTED` | 否 | MCP version/transport/features 不在协商集合 |

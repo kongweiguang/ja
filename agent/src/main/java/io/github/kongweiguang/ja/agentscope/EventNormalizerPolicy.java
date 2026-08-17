@@ -151,7 +151,8 @@ final class EventNormalizerPolicy {
         return switch (value) {
             case "cancelled", "cancelled_before_start", "cancelled_before_execution",
                     "deadline_exceeded", "provider_error", "event_budget_exceeded",
-                    "max_iterations", "all_tools_denied", "request_stop", "scheduler_rejected" -> value;
+                    "max_iterations", "all_tools_denied", "request_stop", "scheduler_rejected",
+                    "unsupported_external_execution" -> value;
             default -> "provider_error";
         };
     }

@@ -46,6 +46,13 @@ export const SkillRevisionSchema = id("skill_", 104);
 export const McpRevisionSchema = id("mcp_", 102);
 export const ServerInstanceIdSchema = id("srv_", 101);
 export const DiagnosticIdSchema = id("diag_", 101);
+
+/**
+ * MCP protocol negotiation is intentionally closed to versions implemented
+ * by the AgentScope runtime, so a profile cannot silently select an unknown
+ * wire dialect and then fail after a server process has already started.
+ */
+export const McpProtocolVersionSchema = z.enum(["2024-11-05", "2025-03-26", "2025-06-18"]);
 /**
  * The UI accepts only the canonical lowercase spelling so a challenge has
  * one wire representation across Rust, Java, logs, and fixture comparisons.
@@ -98,7 +105,7 @@ export const CapabilitiesSchema = z
     itemKinds: z.array(boundedString(64)).max(64),
     mcp: z
       .object({
-        protocolVersions: z.array(boundedString(32)).max(16),
+        protocolVersions: z.array(McpProtocolVersionSchema).max(3),
         transports: z.array(z.enum(["stdio", "streamable_http"])).max(2),
         features: z.array(z.enum(["tools_list", "tools_call"])).max(2),
       })
@@ -230,21 +237,158 @@ export const SkillSummarySchema = z
     scope: z.enum(["builtin", "user", "workspace", "thread"]),
     enabled: z.boolean(),
     status: z.enum(["healthy", "degraded", "invalid", "disabled"]),
+    description: z.string().max(4096).optional(),
     contentHash: z.string().regex(/^[A-Fa-f0-9]{64}$/).optional(),
   })
   .passthrough();
 
-export const McpServerSchema = z
+const McpCredentialRefSchema = z
+  .string()
+  .regex(/^cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
+  .max(100);
+const McpMapKeySchema = z.string().min(1).max(128);
+const MCP_CREDENTIAL_NAME_PATTERN = /(?:api[_-]?key|access[_-]?token|authorization|credential|password|secret|token)/i;
+const MCP_CREDENTIAL_LITERAL_PATTERN = /(?:sk-[A-Za-z0-9_-]{12,}|bearer\s+[A-Za-z0-9._-]+|(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=])/i;
+const McpNonSensitiveValueSchema = z
+  .string()
+  .max(4096)
+  .refine(isSafeMcpConfigValue, { message: "MCP config values must not contain credential literals" });
+
+/**
+ * An MCP auth value is a closed tagged union so transports can map it to the
+ * AgentScope builder without guessing whether an opaque reference belongs in
+ * an environment variable, a bearer header, or a custom header.
+ */
+export const McpAuthSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("none") }).strict(),
+  z.object({ kind: z.literal("bearer"), credentialRef: McpCredentialRefSchema }).strict(),
+  z.object({ kind: z.literal("header"), name: z.string().regex(/^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$/), credentialRef: McpCredentialRefSchema }).strict(),
+  z.object({ kind: z.literal("env"), name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/), credentialRef: McpCredentialRefSchema }).strict(),
+]);
+
+/**
+ * Headers, query parameters, and environment overrides are bounded maps of
+ * non-secret configuration; secrets travel only through credentialRef.
+ */
+const McpStringMapSchema = z
+  .record(McpMapKeySchema, McpNonSensitiveValueSchema)
+  .superRefine((values, context) => {
+    if (Object.keys(values).length > 64) {
+      context.addIssue({ code: "custom", message: "MCP config maps are limited to 64 entries" });
+    }
+    for (const key of Object.keys(values)) {
+      if (MCP_CREDENTIAL_NAME_PATTERN.test(key)) {
+        context.addIssue({ code: "custom", path: [key], message: "MCP config maps cannot carry credential-like keys" });
+      }
+    }
+  });
+
+/**
+ * Rejects common literal-token forms and credential-looking assignments while
+ * keeping ordinary server flags, modes, and non-sensitive headers usable.
+ */
+function isSafeMcpConfigValue(value: string): boolean {
+  return !MCP_CREDENTIAL_LITERAL_PATTERN.test(value);
+}
+
+/**
+ * Stdio endpoints are paths, not shell command lines; this guard preserves
+ * spaces inside a path while rejecting whitespace-separated command flags.
+ */
+function isSingleMcpExecutable(endpoint: string): boolean {
+  if (endpoint.trim() !== endpoint || /[\u0000\r\n;&|`$<>]/.test(endpoint)) return false;
+  if (/\s+[-/]{1,2}\S*/.test(endpoint)) return false;
+  if (/\s/.test(endpoint) && !/[\\/]/.test(endpoint)) return false;
+  return isSafeMcpConfigValue(endpoint);
+}
+
+/**
+ * HTTP MCP endpoints must be origin/path URLs without userinfo or credential
+ * query parameters; query values belong in the bounded queryParams map.
+ */
+function isSafeMcpHttpEndpoint(endpoint: string): boolean {
+  try {
+    if (/\s/.test(endpoint)) return false;
+    const url = new URL(endpoint);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    if (url.username || url.password) return false;
+    if (url.search.includes("%")) return false;
+    if (/(?:^|[?&])(?:api[_-]?key|access[_-]?token|authorization|credential|password|secret|token)=/i.test(url.search)) return false;
+    return isSafeMcpConfigValue(endpoint);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Applies the transport/auth matrix once at the DTO boundary so Java and Rust
+ * receive the same explicit shape and never need to infer a secret channel.
+ */
+function validateMcpServer(server: {
+  transport: "stdio" | "streamable_http";
+  endpoint: string;
+  protocolVersion: string;
+  args?: string[];
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+  queryParams?: Record<string, string>;
+  auth?: z.infer<typeof McpAuthSchema>;
+  credentialRef?: string;
+}, context: z.RefinementCtx): void {
+  if (!McpProtocolVersionSchema.safeParse(server.protocolVersion ?? undefined).success) {
+    context.addIssue({ code: "custom", path: ["protocolVersion"], message: "unsupported MCP protocol version" });
+  }
+  if (server.transport === "stdio") {
+    if (!isSingleMcpExecutable(server.endpoint)) {
+      context.addIssue({ code: "custom", path: ["endpoint"], message: "stdio endpoint must be one executable/path without arguments" });
+    }
+    if (server.headers !== undefined || server.queryParams !== undefined) {
+      context.addIssue({ code: "custom", path: ["transport"], message: "stdio does not accept HTTP headers or query parameters" });
+    }
+    if (server.credentialRef !== undefined || (server.auth !== undefined && server.auth.kind !== "none" && server.auth.kind !== "env")) {
+      context.addIssue({ code: "custom", path: ["auth"], message: "stdio credentials require auth.kind=env" });
+    }
+    return;
+  }
+
+  if (!isSafeMcpHttpEndpoint(server.endpoint)) {
+    context.addIssue({ code: "custom", path: ["endpoint"], message: "HTTP endpoint must be an http(s) URL without userinfo or credential query" });
+  }
+  if (server.args !== undefined || server.env !== undefined) {
+    context.addIssue({ code: "custom", path: ["transport"], message: "streamable_http does not accept stdio args or env" });
+  }
+  if (server.auth?.kind === "env") {
+    context.addIssue({ code: "custom", path: ["auth"], message: "HTTP credentials require bearer or header auth" });
+  }
+  if (server.auth !== undefined && server.credentialRef !== undefined) {
+    context.addIssue({ code: "custom", path: ["credentialRef"], message: "credentialRef shorthand cannot be combined with auth" });
+  }
+}
+
+const McpServerObjectSchema = z
   .object({
     mcpRevision: McpRevisionSchema,
     name: boundedString(256),
     transport: z.enum(["stdio", "streamable_http"]),
     endpoint: boundedString(4096),
-    protocolVersion: boundedString(32),
+    protocolVersion: McpProtocolVersionSchema,
+    args: z.array(McpNonSensitiveValueSchema.min(1)).max(64).optional(),
+    env: McpStringMapSchema.optional(),
+    headers: McpStringMapSchema.optional(),
+    queryParams: McpStringMapSchema.optional(),
+    auth: McpAuthSchema.optional(),
     credentialRef: z.string().regex(/^cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(100).optional(),
     enabled: z.boolean().optional(),
   })
-  .passthrough();
+  .strict();
+
+export const McpServerSchema = McpServerObjectSchema.superRefine(validateMcpServer);
+export const McpServerSummarySchema = McpServerObjectSchema
+  .extend({
+    status: z.enum(["healthy", "degraded", "unavailable", "disabled"]),
+    toolCount: z.number().int().min(0).max(10_000).optional(),
+  })
+  .superRefine(validateMcpServer);
 
 export const McpToolSchema = z
   .object({

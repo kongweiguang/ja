@@ -70,7 +70,7 @@ OpenAI Responses、OAuth 或未实现 provider 不得通过 result shape 伪装�
 
 | request method | result `$defs` | 必填核心字段 |
 | --- | --- | --- |
-| `skill/list` | `skillListResult` | `skills[]`，每项含 revision/name/scope/enabled/status |
+| `skill/list` | `skillListResult` | `skills[]`，每项含 revision/name/description?/scope/enabled/status |
 | `skill/import` | `skillImportResult` | `skillRevision`、`status`；可选 contentHash |
 | `skill/enable` | `skillEnableResult` | `skillRevision`、`enabled`；可选 scope |
 | `skill/reload` | `skillReloadResult` | `skillRevision`、`status` |
@@ -86,7 +86,7 @@ Skill result 只描述不可变 revision 和健康状态；导入/enable/reload 
 | `mcp/list` | `mcpListResult` | `servers[]`，每项含 mcpRevision/status |
 | `mcp/save` | `mcpSaveResult` | `server`；可选 `created` |
 | `mcp/delete` | `mcpDeleteResult` | `accepted`、`mcpRevision` |
-| `mcp/test` | `mcpTestResult` | `mcpRevision`、`status`；可选协议/Tool 数 |
+| `mcp/test` | `mcpTestResult` | `mcpRevision`、`status`；可选已协商 `protocolVersion`/Tool 数 |
 | `mcp/reload` | `mcpReloadResult` | `mcpRevision`、`status` |
 | `mcp/tools/read` | `mcpToolsReadResult` | `mcpRevision`、`tools[]` |
 | `mcp/toolPolicy/set` | `mcpToolPolicyResult` | `mcpRevision`、`toolName`、`policy` |

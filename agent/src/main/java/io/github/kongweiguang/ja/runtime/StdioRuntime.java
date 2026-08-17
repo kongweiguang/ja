@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.runtime;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.JsonNode;
 import io.github.kongweiguang.ja.application.Capabilities;
 import io.github.kongweiguang.ja.application.HandshakeStateMachine;
 import io.github.kongweiguang.ja.application.InitializeUseCase;
@@ -12,13 +13,21 @@ import io.github.kongweiguang.ja.application.McpCapabilities;
 import io.github.kongweiguang.ja.application.NegotiatedInitialization;
 import io.github.kongweiguang.ja.application.ProtocolVersion;
 import io.github.kongweiguang.ja.bootstrap.SidecarConfiguration;
+import io.github.kongweiguang.ja.bootstrap.AgentScopeRuntimeGraph;
 import io.github.kongweiguang.ja.domain.EventId;
 import io.github.kongweiguang.ja.domain.ServerInstanceId;
+import io.github.kongweiguang.ja.model.AgentScopeModelFactory;
+import io.github.kongweiguang.ja.model.ModelHandle;
+import io.github.kongweiguang.ja.profiles.ModelProfile;
+import io.github.kongweiguang.ja.profiles.SecretAccessException;
+import io.github.kongweiguang.ja.profiles.SecretRef;
+import io.github.kongweiguang.ja.profiles.SecretValue;
 import io.github.kongweiguang.ja.protocol.HandshakeJsonlCodec;
 import io.github.kongweiguang.ja.protocol.JaErrorCode;
 import io.github.kongweiguang.ja.protocol.JsonNodes;
 import io.github.kongweiguang.ja.protocol.ProtocolException;
 import io.github.kongweiguang.ja.protocol.ProtocolLimits;
+import io.github.kongweiguang.ja.protocol.PendingRequestRegistry;
 import io.github.kongweiguang.ja.protocol.RpcDirection;
 import io.github.kongweiguang.ja.protocol.RpcEnvelope;
 import io.github.kongweiguang.ja.protocol.RpcNotification;
@@ -30,19 +39,25 @@ import org.slf4j.LoggerFactory;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Consumer;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Owns one sidecar's JSONL reader, bounded control lane, and shutdown gate.
@@ -55,17 +70,29 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class StdioRuntime implements AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger(StdioRuntime.class);
     private static final Duration SHUTDOWN_TIMEOUT = Duration.ofSeconds(2);
+    private static final Duration SECRET_RESOLVE_TIMEOUT = Duration.ofSeconds(5);
     private static final String PROBE_TOKEN = "0123456789abcdef0123456789abcdef";
 
     private final ProtocolLimits limits;
     private final Clock clock;
     private final boolean fakeRuntime;
+    private final SidecarConfiguration configuration;
     private final ServerInstanceId serverInstanceId;
     private final HandshakeStateMachine stateMachine;
     private final HandshakeJsonlCodec codec;
     private final InitializeUseCase initializeUseCase;
     private final StdioWriter writer;
-    private final TurnRuntime turnRuntime;
+    private final PendingRequestRegistry pendingRequests;
+    private final TurnRuntime initialTurnRuntime;
+    private final AtomicReference<TurnRuntime> activeTurnRuntime;
+    private final AgentScopeModelFactory modelFactory = new AgentScopeModelFactory();
+    private final ModelBuilder modelBuilder;
+    private final ExecutorService activationLane;
+    private final AtomicBoolean activationInProgress = new AtomicBoolean();
+    private final AtomicLong secretRequestSequence = new AtomicLong();
+    private volatile WorkspaceBinding workspaceBinding;
+    private volatile SavedProfile savedProfile;
+    private volatile String activeProfileRevision;
     private final ThreadPoolExecutor controlLane;
     private final CountDownLatch terminated = new CountDownLatch(1);
     private final AtomicBoolean readerStarted = new AtomicBoolean(false);
@@ -75,6 +102,7 @@ public final class StdioRuntime implements AutoCloseable {
     private final AtomicBoolean faulted = new AtomicBoolean(false);
     private final AtomicBoolean initializeClaimed = new AtomicBoolean(false);
     private final AtomicBoolean initializedSeen = new AtomicBoolean(false);
+    private final AtomicLong approvalRequestSequence = new AtomicLong();
     private final AtomicBoolean readyPublished = new AtomicBoolean(false);
     private final CompletableFuture<Void> initializeResponse = new CompletableFuture<>();
     private final FrameCaptureInputStream capturedInput;
@@ -91,27 +119,66 @@ public final class StdioRuntime implements AutoCloseable {
     /** Injects a clock for deterministic lifecycle tests while preserving production wiring. */
     public StdioRuntime(InputStream input, java.io.OutputStream output,
                         SidecarConfiguration configuration, Clock clock) {
+        this(input, output, configuration, clock, null);
+    }
+
+    /**
+     * Injects the already-composed AgentScope turn runtime so stdio remains a
+     * transport adapter and never creates a second agent engine.
+     */
+    public StdioRuntime(InputStream input, java.io.OutputStream output,
+                        SidecarConfiguration configuration, Clock clock,
+                        TurnRuntime injectedTurnRuntime) {
+        this(input, output, configuration, clock, injectedTurnRuntime, null);
+    }
+
+    /**
+     * Injects only provider model construction for deterministic integration tests; the resulting
+     * model still enters the real AgentScope Harness and graph, so tests cannot bypass tools or
+     * permission handling.
+     */
+    public StdioRuntime(InputStream input, java.io.OutputStream output,
+                        SidecarConfiguration configuration, Clock clock,
+                        TurnRuntime injectedTurnRuntime, ModelBuilder modelBuilder) {
         this.clock = Objects.requireNonNull(clock, "clock");
-        this.fakeRuntime = Objects.requireNonNull(configuration, "configuration").fakeRuntime();
+        this.configuration = Objects.requireNonNull(configuration, "configuration");
+        this.fakeRuntime = configuration.fakeRuntime();
+        this.modelBuilder = modelBuilder == null ? this::buildModel : modelBuilder;
         this.capturedInput = new FrameCaptureInputStream(Objects.requireNonNull(input, "input"));
         this.limits = ProtocolLimits.defaults();
-        this.serverInstanceId = new ServerInstanceId("srv_ja_" + java.util.UUID.randomUUID()
-                .toString().replace("-", ""));
+        this.serverInstanceId = injectedTurnRuntime instanceof AgentScopeRuntimeGraph graph
+                ? graph.serverInstanceId()
+                : new ServerInstanceId("srv_ja_" + java.util.UUID.randomUUID()
+                        .toString().replace("-", ""));
         this.stateMachine = new HandshakeStateMachine(serverInstanceId);
         this.codec = new HandshakeJsonlCodec(stateMachine);
-        Capabilities capabilities = capabilities(fakeRuntime);
+        Capabilities capabilities = capabilities();
         this.initializeUseCase = new InitializeUseCase(new ProtocolVersion(1, 0, 0),
                 "ja-preview", serverInstanceId, capabilities, limits);
         this.writer = new StdioWriter(Objects.requireNonNull(output, "output"), codec, limits,
                 exception -> failClosed("stdio writer failed", exception));
-        this.turnRuntime = fakeRuntime
+        this.pendingRequests = new PendingRequestRegistry(limits.maxPendingRequests());
+        this.initialTurnRuntime = injectedTurnRuntime != null
+                ? injectedTurnRuntime
+                : fakeRuntime
                 ? new DeterministicFakeTurnRuntime(serverInstanceId, clock, new CountDownLatch(0), limits)
                 : TurnRuntime.unavailable();
+        this.activeTurnRuntime = fakeRuntime || injectedTurnRuntime != null
+                ? new AtomicReference<>(initialTurnRuntime) : new AtomicReference<>();
+        this.initialTurnRuntime.setApprovalSink(this::requestApproval);
+        this.activationLane = Executors.newSingleThreadExecutor(
+                Thread.ofVirtual().name("ja-activation", 0).factory());
         this.controlLane = new ThreadPoolExecutor(
                 1, 1, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(limits.maxInboundQueueFrames()),
                 Thread.ofVirtual().name("ja-control", 0).factory(),
                 new ThreadPoolExecutor.AbortPolicy());
+    }
+
+    /** Provider seam used only to replace network calls while retaining the production graph. */
+    @FunctionalInterface
+    public interface ModelBuilder {
+        ModelHandle build(ModelProfile profile, String secret);
     }
 
     /**
@@ -198,8 +265,33 @@ public final class StdioRuntime implements AutoCloseable {
 
     /** Routes the already decoded envelope onto the one bounded control lane. */
     private void route(RpcEnvelope envelope, ProtocolException admissionFailure) {
+        if (envelope instanceof RpcResponse response) {
+            // Responses are admitted on the bounded control lane; the registered handler only
+            // schedules AgentScope resume work and never waits for a provider Flux.
+            enqueueControl(() -> handleResponse(response), null);
+            return;
+        }
         if (envelope instanceof RpcRequest request) {
-            enqueueControl(() -> handleRequest(request, admissionFailure), request);
+            PendingRequestRegistry.InboundAdmission admission;
+            try {
+                // Claim on the reader lane before queueing so two pipelined frames cannot both
+                // enter the control lane before the first one becomes visible as PENDING.
+                admission = pendingRequests.registerInbound(request);
+            } catch (ProtocolException exception) {
+                sendFailure(request, exception);
+                return;
+            }
+            if (admission == PendingRequestRegistry.InboundAdmission.PENDING_DUPLICATE) {
+                // The original request still owns its eventual response; do not emit a racing
+                // duplicate response from the reader lane.
+                return;
+            }
+            if (admission == PendingRequestRegistry.InboundAdmission.REPLAY) {
+                enqueueControl(() -> sendFailure(request,
+                        new ProtocolException(JaErrorCode.DUPLICATE_REQUEST)), request);
+                return;
+            }
+            enqueueControl(() -> dispatchClaimedRequest(request, admissionFailure), request);
             return;
         }
         if (envelope instanceof RpcNotification notification
@@ -208,6 +300,22 @@ public final class StdioRuntime implements AutoCloseable {
             return;
         }
         failClosed("unexpected inbound envelope", null);
+    }
+
+    /** Consumes one response exactly once; stale responses are ignored without reviving work. */
+    private void handleResponse(RpcResponse response) {
+        try {
+            pendingRequests.accept(response);
+        } catch (ProtocolException exception) {
+            if (exception.code() == JaErrorCode.LATE_RESPONSE
+                    || exception.code() == JaErrorCode.DUPLICATE_RESPONSE) {
+                // A timed-out or already-consumed secret/approval response is safely discarded;
+                // killing the whole sidecar would turn one stale Rust frame into data loss.
+                LOGGER.warn("ignoring stale stdio response ({})", exception.code().name());
+                return;
+            }
+            failClosed("stdio response correlation failed: " + exception.code(), exception);
+        }
     }
 
     /** Enforces a protocol-sized control queue and reports overflow structurally. */
@@ -229,8 +337,8 @@ public final class StdioRuntime implements AutoCloseable {
         }
     }
 
-    /** Dispatches lifecycle and business methods after control-lane ordering is proven. */
-    private void handleRequest(RpcRequest request, ProtocolException admissionFailure) {
+    /** Dispatches one request whose id was claimed before entering the control lane. */
+    private void dispatchClaimedRequest(RpcRequest request, ProtocolException admissionFailure) {
         // The codec can observe initialized before the control lane has
         // published ready.  Once this lane reaches the request, ready has
         // either been published or the request genuinely arrived too early.
@@ -262,6 +370,18 @@ public final class StdioRuntime implements AutoCloseable {
         }
         if ("turn/start".equals(request.method())) {
             handleTurnStart(request);
+            return;
+        }
+        if ("workspace/open".equals(request.method())) {
+            handleWorkspaceOpen(request);
+            return;
+        }
+        if ("profile/save".equals(request.method())) {
+            handleProfileSave(request);
+            return;
+        }
+        if ("profile/activate".equals(request.method())) {
+            handleProfileActivate(request);
             return;
         }
         if ("version".equals(request.method())) {
@@ -304,6 +424,309 @@ public final class StdioRuntime implements AutoCloseable {
         }
     }
 
+    /**
+     * Binds one existing canonical workspace to this sidecar generation. The host owns the
+     * directory lifecycle; Java only validates and remembers the selected root for the graph.
+     */
+    private void handleWorkspaceOpen(RpcRequest request) {
+        try {
+            ObjectNode params = request.params();
+            String workspaceId = requiredIdentifier(params, "workspaceId", "ws_");
+            String rootPath = requiredText(params, "rootPath");
+            String trust = requiredEnum(params, "trust", "untrusted", "trusted");
+            Path root = Path.of(rootPath).toAbsolutePath().normalize();
+            if (!java.nio.file.Files.isDirectory(root, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    || java.nio.file.Files.isSymbolicLink(root)) {
+                throw new ProtocolException(JaErrorCode.WORKSPACE_NOT_FOUND);
+            }
+            root = root.toRealPath();
+            String displayName = optionalText(params, "displayName");
+            if (displayName == null) {
+                Path fileName = root.getFileName();
+                displayName = fileName == null ? root.toString() : fileName.toString();
+            }
+            WorkspaceBinding candidate = new WorkspaceBinding(workspaceId, root, displayName, trust);
+            WorkspaceBinding existing = workspaceBinding;
+            if (existing != null && !existing.equals(candidate)) {
+                throw new ProtocolException(JaErrorCode.CONFLICT);
+            }
+            workspaceBinding = candidate;
+            ObjectNode workspace = JsonNodes.object();
+            workspace.put("workspaceId", candidate.workspaceId());
+            workspace.put("displayName", candidate.displayName());
+            workspace.put("rootPath", candidate.rootPath().toString());
+            workspace.put("trust", candidate.trust());
+            ObjectNode result = JsonNodes.object();
+            result.set("workspace", workspace);
+            sendResponse(RpcResponse.success(request, result));
+        } catch (ProtocolException exception) {
+            sendFailure(request, exception);
+        } catch (IOException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.WORKSPACE_NOT_FOUND));
+        } catch (RuntimeException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.WORKSPACE_NOT_FOUND));
+        }
+    }
+
+    /**
+     * Keeps one secret-free wire profile in memory for this process. Rust remains the durable
+     * settings owner, so this method intentionally does not add a Java profile repository.
+     */
+    private void handleProfileSave(RpcRequest request) {
+        try {
+            if (workspaceBinding == null) {
+                throw new ProtocolException(JaErrorCode.INVALID_STATE);
+            }
+            ObjectNode params = request.params();
+            JsonNode profileNode = params.get("profile");
+            SavedProfile candidate = ProfileWireMapper.parse(profileNode);
+            JsonNode expected = params.get("expectedRevision");
+            SavedProfile existing = savedProfile;
+            if (expected != null && !expected.isNull()) {
+                if (!expected.isTextual() || existing == null
+                        || !expected.textValue().equals(existing.wireRevision())) {
+                    throw new ProtocolException(JaErrorCode.CONFLICT);
+                }
+            }
+            savedProfile = candidate;
+            ObjectNode result = JsonNodes.object();
+            result.set("profile", candidate.wireProfile());
+            result.put("created", existing == null);
+            sendResponse(RpcResponse.success(request, result));
+        } catch (ProtocolException exception) {
+            sendFailure(request, exception);
+        } catch (RuntimeException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.INVALID_PARAMS));
+        }
+    }
+
+    /**
+     * Starts activation without waiting on provider construction in the control lane. A pending
+     * secret request is registered before it is written, and its callback only schedules the
+     * bounded activation lane so reader/control processing remains responsive.
+     */
+    private void handleProfileActivate(RpcRequest request) {
+        final SavedProfile profile;
+        try {
+            if (workspaceBinding == null) {
+                throw new ProtocolException(JaErrorCode.INVALID_STATE);
+            }
+            String revision = requiredProfileRevision(request.params());
+            profile = savedProfile;
+            if (profile == null || !revision.equals(profile.wireRevision())) {
+                throw new ProtocolException(JaErrorCode.CONFLICT);
+            }
+            String active = activeProfileRevision;
+            if (active != null) {
+                if (active.equals(revision)) {
+                    sendResponse(RpcResponse.success(request, activationResult(revision)));
+                } else {
+                    throw new ProtocolException(JaErrorCode.CONFLICT);
+                }
+                return;
+            }
+            if (!activationInProgress.compareAndSet(false, true)) {
+                throw new ProtocolException(JaErrorCode.CONFLICT);
+            }
+            if (configuration.dataDirectory() == null) {
+                activationInProgress.set(false);
+                throw new ProtocolException(JaErrorCode.INVALID_STATE);
+            }
+            ActivationAttempt attempt = new ActivationAttempt(request, profile,
+                    workspaceBinding, configuration.dataDirectory());
+            SecretRef secretRef = profile.model().secretRef();
+            if (secretRef == null) {
+                submitActivation(attempt, null);
+                return;
+            }
+            String id = "s:secret_" + secretRequestSequence.incrementAndGet();
+            RpcRequest secretRequest = RpcRequest.server(id, "secret/resolve",
+                    secretResolveParams(secretRef, profile.wireRevision()));
+            pendingRequests.register(secretRequest, response -> {
+                try {
+                    activationLane.execute(() -> completeActivation(attempt, response));
+                } catch (RejectedExecutionException exception) {
+                    activationInProgress.set(false);
+                    sendFailure(request, new ProtocolException(JaErrorCode.SHUTTING_DOWN));
+                }
+            });
+            scheduleSecretDeadline(attempt, secretRequest.id());
+            sendResponse(secretRequest);
+        } catch (ProtocolException exception) {
+            sendFailure(request, exception);
+        } catch (RuntimeException exception) {
+            activationInProgress.set(false);
+            sendFailure(request, new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE));
+        }
+    }
+
+    /** Schedules credential-free activation on the same bounded lane as secret-backed activation. */
+    private void submitActivation(ActivationAttempt attempt, RpcResponse response) {
+        try {
+            activationLane.execute(() -> completeActivation(attempt, response));
+        } catch (RejectedExecutionException exception) {
+            activationInProgress.set(false);
+            sendFailure(attempt.request(), new ProtocolException(JaErrorCode.SHUTTING_DOWN));
+        }
+    }
+
+    /**
+     * Bounds the Rust secret round-trip without blocking the reader or control lane. The delayed
+     * executor only marks the existing pending tombstone and releases activation for a retry.
+     */
+    private void scheduleSecretDeadline(ActivationAttempt attempt, String requestId) {
+        CompletableFuture.delayedExecutor(SECRET_RESOLVE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                .execute(() -> {
+                    if (!pendingRequests.deadline(requestId)) {
+                        return;
+                    }
+                    if (activationInProgress.compareAndSet(true, false) && !stopping.get()) {
+                        sendFailure(attempt.request(), new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE));
+                    }
+                });
+    }
+
+    /** Builds and atomically installs one graph only after model and secret validation succeed. */
+    private void completeActivation(ActivationAttempt attempt, RpcResponse response) {
+        AgentScopeRuntimeGraph graph = null;
+        try {
+            if (stopping.get()) {
+                throw new ProtocolException(JaErrorCode.SHUTTING_DOWN);
+            }
+            String secret = attempt.profile().model().secretRef() == null
+                    ? null : secretValue(response);
+            ModelHandle handle = modelBuilder.build(attempt.profile().model(), secret);
+            graph = AgentScopeRuntimeGraph.open(attempt.workspace().rootPath(), attempt.dataDirectory(),
+                    serverInstanceId, attempt.profile().wireRevision(), attempt.workspace().trust(),
+                    attempt.profile().accessMode(), handle.model());
+            graph.setApprovalSink(this::requestApproval);
+            if (stopping.get() || !activeTurnRuntime.compareAndSet(null, graph)) {
+                graph.close();
+                graph = null;
+                throw new ProtocolException(stopping.get() ? JaErrorCode.SHUTTING_DOWN : JaErrorCode.CONFLICT);
+            }
+            activeProfileRevision = attempt.profile().wireRevision();
+            sendResponse(RpcResponse.success(attempt.request(),
+                    activationResult(attempt.profile().wireRevision())));
+        } catch (ProtocolException exception) {
+            if (graph != null) {
+                graph.close();
+            }
+            sendFailure(attempt.request(), exception);
+        } catch (SecretAccessException exception) {
+            if (graph != null) {
+                graph.close();
+            }
+            sendFailure(attempt.request(), new ProtocolException(JaErrorCode.SECRET_ACCESS_DENIED));
+        } catch (io.github.kongweiguang.ja.model.UnsupportedModelApiException exception) {
+            if (graph != null) {
+                graph.close();
+            }
+            sendFailure(attempt.request(), new ProtocolException(JaErrorCode.MODEL_UNSUPPORTED));
+        } catch (RuntimeException exception) {
+            if (graph != null) {
+                graph.close();
+            }
+            sendFailure(attempt.request(), new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE));
+        } finally {
+            activationInProgress.set(false);
+        }
+    }
+
+    /** Extracts only the opaque secret string and maps every other response shape to stable failure. */
+    private static String secretValue(RpcResponse response) {
+        if (response == null) {
+            throw new ProtocolException(JaErrorCode.SECRET_ACCESS_DENIED);
+        }
+        if (response.error() != null) {
+            String code = response.error().data().jaCode();
+            if ("SECRET_NOT_FOUND".equals(code)) {
+                throw new ProtocolException(JaErrorCode.SECRET_NOT_FOUND);
+            }
+            if ("SECRET_ACCESS_DENIED".equals(code)) {
+                throw new ProtocolException(JaErrorCode.SECRET_ACCESS_DENIED);
+            }
+            throw new ProtocolException(JaErrorCode.SECRET_ACCESS_DENIED);
+        }
+        JsonNode result = response.result();
+        JsonNode value = result == null ? null : result.get("secretValue");
+        if (value == null || !value.isTextual() || value.textValue().isEmpty()) {
+            throw new ProtocolException(JaErrorCode.SECRET_NOT_FOUND);
+        }
+        return value.textValue();
+    }
+
+    /** Keeps the default provider path on the existing AgentScope factory and secret boundary. */
+    private ModelHandle buildModel(ModelProfile profile, String secret) {
+        io.github.kongweiguang.ja.profiles.SecretResolver resolver = profile.secretRef() == null
+                ? null : ignored -> SecretValue.of(secret);
+        return modelFactory.create(profile, resolver);
+    }
+
+    /** Creates the narrow secret request without copying profile/provider payloads to Rust. */
+    private static ObjectNode secretResolveParams(SecretRef secretRef, String profileRevision) {
+        ObjectNode params = JsonNodes.object();
+        params.put("credentialRef", secretRef.id());
+        params.put("purpose", "model");
+        params.put("profileRevision", profileRevision);
+        return params;
+    }
+
+    /** Serializes the frozen activation result used by both first activation and idempotent retry. */
+    private static ObjectNode activationResult(String profileRevision) {
+        ObjectNode result = JsonNodes.object();
+        result.put("accepted", true);
+        result.put("activeProfileRevision", profileRevision);
+        return result;
+    }
+
+    /** Reads an exact profile revision from activation or turn parameters. */
+    private static String requiredProfileRevision(ObjectNode params) {
+        return requiredIdentifier(params, "profileRevision", "profile_");
+    }
+
+    /** Reads a non-blank bounded text property without echoing the untrusted value in errors. */
+    private static String requiredText(JsonNode parent, String field) {
+        JsonNode value = parent == null ? null : parent.get(field);
+        if (value == null || !value.isTextual() || value.textValue().isBlank()) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        return value.textValue();
+    }
+
+    /** Reads an optional text property while distinguishing omitted from malformed values. */
+    private static String optionalText(JsonNode parent, String field) {
+        JsonNode value = parent == null ? null : parent.get(field);
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.isTextual() || value.textValue().isBlank()) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        return value.textValue();
+    }
+
+    /** Validates a small enum field before any workspace/profile state is installed. */
+    private static String requiredEnum(JsonNode parent, String field, String... allowed) {
+        String value = requiredText(parent, field);
+        for (String candidate : allowed) {
+            if (candidate.equals(value)) {
+                return value;
+            }
+        }
+        throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+    }
+
+    /** Validates protocol-owned identifiers without adding a second value-object hierarchy. */
+    private static String requiredIdentifier(JsonNode parent, String field, String prefix) {
+        String value = requiredText(parent, field);
+        if (!value.matches(java.util.regex.Pattern.quote(prefix)
+                + "[A-Za-z0-9][A-Za-z0-9._-]{0,95}")) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        return value;
+    }
+
     /** Publishes ready on the same control lane so shutdown cannot overtake it. */
     private void handleInitialized(RpcNotification initialized) {
         if (stopping.get() || !initializedSeen.compareAndSet(false, true)) {
@@ -329,8 +752,15 @@ public final class StdioRuntime implements AutoCloseable {
     /** Starts accepted fake/production work and acknowledges it before its events. */
     private void handleTurnStart(RpcRequest request) {
         try {
+            TurnRuntime runtime = activeTurnRuntime.get();
+            if (runtime == null) {
+                // The protocol advertises turn/start before profile activation so the desktop can
+                // render one stable capability set; execution remains explicitly unavailable.
+                sendFailure(request, new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE));
+                return;
+            }
             CountDownLatch responseSent = new CountDownLatch(1);
-            TurnHandle handle = turnRuntime.start(request, event -> {
+            TurnHandle handle = runtime.start(request, event -> {
                 try {
                     if (!responseSent.await(2, TimeUnit.SECONDS)) {
                         throw new ProtocolException(JaErrorCode.REQUEST_DEADLINE_EXCEEDED);
@@ -368,12 +798,106 @@ public final class StdioRuntime implements AutoCloseable {
         }
     }
 
+    /**
+     * Converts one AgentScope prompt into the frozen Java-to-Rust approval/request. Registration is
+     * completed before the frame is queued, so a very fast Rust response cannot become unknown.
+     */
+    private void requestApproval(TurnRuntime.ApprovalPrompt prompt,
+                                 Consumer<TurnRuntime.ApprovalDecision> resolver) {
+        Objects.requireNonNull(prompt, "prompt");
+        Objects.requireNonNull(resolver, "resolver");
+        String requestId = "s:approval_" + approvalRequestSequence.incrementAndGet();
+        RpcRequest request = RpcRequest.server(requestId, "approval/request",
+                approvalParams(prompt));
+        try {
+            pendingRequests.register(request, response -> {
+                TurnRuntime.ApprovalDecision decision = approvalDecision(response);
+                resolver.accept(decision);
+            });
+            sendResponse(request);
+        } catch (RuntimeException exception) {
+            pendingRequests.cancel(request.id());
+            throw exception;
+        }
+    }
+
+    /** Builds only the bounded fields defined by the approval/request contract. */
+    private static ObjectNode approvalParams(TurnRuntime.ApprovalPrompt prompt) {
+        ObjectNode params = JsonNodes.object();
+        params.put("approvalId", prompt.approvalId());
+        params.put("threadId", prompt.threadId());
+        params.put("turnId", prompt.turnId());
+        params.put("itemId", prompt.itemId());
+        ObjectNode action = JsonNodes.object();
+        action.put("kind", prompt.actionKind());
+        if (prompt.command() != null && !prompt.command().isBlank()) {
+            action.put("command", prompt.command());
+        }
+        if (prompt.cwd() != null && !prompt.cwd().isBlank()) {
+            action.put("cwd", prompt.cwd());
+        }
+        var paths = JsonNodes.array();
+        prompt.relativePaths().forEach(paths::add);
+        if (!prompt.relativePaths().isEmpty()) {
+            action.set("relativePaths", paths);
+        }
+        params.set("action", action);
+        params.put("risk", prompt.risk());
+        params.put("accessMode", prompt.accessMode());
+        params.put("expiresAt", prompt.expiresAt().toString());
+        if (prompt.reason() != null && !prompt.reason().isBlank()) {
+            params.put("reason", prompt.reason());
+        }
+        return params;
+    }
+
+    /** Validates the standard result before handing a decision to the AgentScope resume port. */
+    private TurnRuntime.ApprovalDecision approvalDecision(RpcResponse response) {
+        if (response.error() != null) {
+            // A valid Rust-side error means the requested action was not granted; resume with a
+            // denial rather than allowing an error response to execute the pending tool.
+            return new TurnRuntime.ApprovalDecision("deny", clock.instant());
+        }
+        JsonNode result = response.result();
+        if (result == null || !result.isObject()) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        JsonNode decision = result.get("decision");
+        JsonNode resolvedAt = result.get("resolvedAt");
+        if (decision == null || !decision.isTextual() || resolvedAt == null
+                || !resolvedAt.isTextual()) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        String value = decision.textValue();
+        if (!java.util.Set.of("allow_once", "allow_session", "deny", "expired", "disconnected")
+                .contains(value)) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        try {
+            return new TurnRuntime.ApprovalDecision(value, Instant.parse(resolvedAt.textValue()));
+        } catch (RuntimeException exception) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS, null, exception);
+        }
+    }
+
     /** Sends one envelope through the only stdout writer and keeps stdout pure. */
-    private void sendResponse(RpcEnvelope response) {
+    private boolean sendResponse(RpcEnvelope response) {
         try {
             writer.send(response);
+            if (response instanceof RpcResponse rpcResponse) {
+                // Queue admission is the protocol's observable response boundary. If the writer
+                // rejects the frame, failClosed retires the generation instead of leaving an
+                // inbound id executable after a failed response.
+                pendingRequests.completeInbound(rpcResponse.id());
+            }
+            return true;
         } catch (RuntimeException exception) {
+            String detail = exception instanceof ProtocolException protocolException
+                    ? protocolException.code().name()
+                    : exception.getClass().getSimpleName();
+            LOGGER.error("stdio frame enqueue failed ({})", detail);
             failClosed("stdio frame enqueue failed", exception);
+            return false;
         }
     }
 
@@ -389,7 +913,15 @@ public final class StdioRuntime implements AutoCloseable {
         }
         stopping.set(true);
         stateMachine.shutdown();
-        turnRuntime.stopAccepting();
+        // Retire approval/secret-style server requests before accepted turns are cancelled so a
+        // late Rust response cannot revive an AgentScope tool during shutdown.
+        pendingRequests.closeForRotation();
+        activationInProgress.set(false);
+        TurnRuntime runtime = activeTurnRuntime.get();
+        if (runtime != null) {
+            runtime.stopAccepting();
+        }
+        activationLane.shutdownNow();
         if (request != null && writer.accepting()) {
             ObjectNode result = JsonNodes.object();
             result.put("accepted", true);
@@ -411,16 +943,22 @@ public final class StdioRuntime implements AutoCloseable {
             if (!controlLane.awaitTermination(SHUTDOWN_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
                 faulted.set(true);
             }
-            boolean quiescent = turnRuntime.awaitQuiescence(SHUTDOWN_TIMEOUT);
+            TurnRuntime runtime = activeTurnRuntime.get();
+            boolean quiescent = runtime == null || runtime.awaitQuiescence(SHUTDOWN_TIMEOUT);
             if (!quiescent) {
                 faulted.set(true);
             }
-            turnRuntime.close();
+            if (runtime != null && activeTurnRuntime.compareAndSet(runtime, null)) {
+                runtime.close();
+            }
             writer.close();
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             faulted.set(true);
-            turnRuntime.close();
+            TurnRuntime runtime = activeTurnRuntime.getAndSet(null);
+            if (runtime != null) {
+                runtime.close();
+            }
             writer.close();
         } finally {
             shutdownFinished.set(true);
@@ -433,6 +971,8 @@ public final class StdioRuntime implements AutoCloseable {
         faulted.set(true);
         if (exception == null) {
             LOGGER.error(message);
+        } else if (exception instanceof ProtocolException protocolException) {
+            LOGGER.error(message + " ({})", protocolException.code().name());
         } else {
             LOGGER.error(message + " ({})", exception.getClass().getSimpleName());
         }
@@ -458,7 +998,7 @@ public final class StdioRuntime implements AutoCloseable {
     /** Returns only capabilities wired by this phase. */
     private ObjectNode capabilitiesResult() {
         ObjectNode result = JsonNodes.object();
-        result.set("capabilities", capabilitiesJson(capabilities(fakeRuntime)));
+        result.set("capabilities", capabilitiesJson(capabilities()));
         return result;
     }
 
@@ -475,10 +1015,9 @@ public final class StdioRuntime implements AutoCloseable {
     }
 
     /** Builds one stable capability advertisement for initialize and read. */
-    private static Capabilities capabilities(boolean fake) {
-        List<String> methods = fake
-                ? List.of("initialize", "version", "capabilities/read", "health/read", "shutdown", "turn/start")
-                : List.of("initialize", "version", "capabilities/read", "health/read", "shutdown");
+    private static Capabilities capabilities() {
+        List<String> methods = List.of("initialize", "version", "capabilities/read", "health/read", "shutdown",
+                "workspace/open", "profile/save", "profile/activate", "turn/start");
         return new Capabilities(methods,
                 List.of("runtime/statusChanged", "turn/started", "item/started", "item/delta",
                         "item/completed", "turn/completed"),
@@ -507,6 +1046,16 @@ public final class StdioRuntime implements AutoCloseable {
         com.fasterxml.jackson.databind.node.ArrayNode node = JsonNodes.array();
         values.forEach(node::add);
         return node;
+    }
+
+    /** Immutable one-workspace binding retained only for this sidecar generation. */
+    private record WorkspaceBinding(String workspaceId, Path rootPath, String displayName,
+                                    String trust) {
+    }
+
+    /** Carries one activation request across the asynchronous secret/model construction lane. */
+    private record ActivationAttempt(RpcRequest request, SavedProfile profile,
+                                     WorkspaceBinding workspace, Path dataDirectory) {
     }
 
     /**

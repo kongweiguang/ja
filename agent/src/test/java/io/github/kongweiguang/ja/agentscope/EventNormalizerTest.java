@@ -11,21 +11,43 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.agentscope.core.event.AgentEndEvent;
+import io.agentscope.core.event.AgentEvent;
+import io.agentscope.core.event.AgentResultEvent;
 import io.agentscope.core.event.AgentStartEvent;
+import io.agentscope.core.event.AllToolsDeniedEvent;
+import io.agentscope.core.event.ConfirmResult;
+import io.agentscope.core.event.CustomEvent;
+import io.agentscope.core.event.DataBlockDeltaEvent;
+import io.agentscope.core.event.DataBlockEndEvent;
+import io.agentscope.core.event.DataBlockStartEvent;
 import io.agentscope.core.event.ExceedMaxItersEvent;
 import io.agentscope.core.event.ExternalExecutionResultEvent;
+import io.agentscope.core.event.HintBlockEvent;
 import io.agentscope.core.event.ModelCallEndEvent;
 import io.agentscope.core.event.ModelCallStartEvent;
-import io.agentscope.core.event.UserConfirmResultEvent;
-import io.agentscope.core.event.ConfirmResult;
-import io.agentscope.core.message.ToolResultBlock;
-import io.agentscope.core.model.ChatUsage;
+import io.agentscope.core.event.RequestStopEvent;
+import io.agentscope.core.event.RequireExternalExecutionEvent;
+import io.agentscope.core.event.RequireUserConfirmEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.event.TextBlockEndEvent;
 import io.agentscope.core.event.TextBlockStartEvent;
 import io.agentscope.core.event.ThinkingBlockDeltaEvent;
 import io.agentscope.core.event.ThinkingBlockEndEvent;
 import io.agentscope.core.event.ThinkingBlockStartEvent;
+import io.agentscope.core.event.SubagentExposedEvent;
+import io.agentscope.core.event.ToolCallDeltaEvent;
+import io.agentscope.core.event.ToolCallEndEvent;
+import io.agentscope.core.event.ToolCallStartEvent;
+import io.agentscope.core.event.ToolResultDataDeltaEvent;
+import io.agentscope.core.event.ToolResultEndEvent;
+import io.agentscope.core.event.ToolResultStartEvent;
+import io.agentscope.core.event.ToolResultTextDeltaEvent;
+import io.agentscope.core.event.UserConfirmResultEvent;
+import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.message.ToolResultState;
+import io.agentscope.core.message.ToolUseBlock;
+import io.agentscope.core.model.ChatUsage;
 import io.github.kongweiguang.ja.domain.ServerInstanceId;
 import io.github.kongweiguang.ja.domain.ThreadId;
 import io.github.kongweiguang.ja.domain.TurnId;
@@ -33,6 +55,7 @@ import io.github.kongweiguang.ja.runtime.TurnEvent;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -70,21 +93,19 @@ final class EventNormalizerTest {
         assertTrue(normalizer.terminal(context, "failed", "late").isEmpty());
     }
 
-    /** Ensures hidden AgentScope thinking never becomes visible item text. */
+    /** Ensures raw AgentScope thinking is dropped instead of becoming a visible JA item. */
     @Test
-    void hidesThinkingDeltasButKeepsLifecycleObservable() {
+    void dropsThinkingBlocksWithoutLeakingChainOfThought() {
         EventNormalizer normalizer = normalizer();
         EventNormalizer.Context context = normalizer.open(
                 new ThreadId("thr_reason"), new TurnId("turn_reason"));
-        assertEquals("item/started", normalizer.normalize(
-                new ThinkingBlockStartEvent("reply", "thinking"), context).getFirst().method());
-        assertTrue(normalizer.normalize(new ThinkingBlockDeltaEvent(
-                "reply", "thinking", "private reasoning"), context).isEmpty());
-        TurnEvent end = normalizer.normalize(new ThinkingBlockEndEvent("reply", "thinking"), context)
-                .getFirst();
-        assertEquals("item/completed", end.method());
-        assertFalse(end.params().path("item").has("text"));
-        assertEquals("reasoning_summary", end.params().path("item").path("kind").textValue());
+        List<TurnEvent> events = new ArrayList<>();
+        events.addAll(normalizer.normalize(new ThinkingBlockStartEvent("reply", "thinking"), context));
+        events.addAll(normalizer.normalize(new ThinkingBlockDeltaEvent(
+                "reply", "thinking", "private reasoning must not leak"), context));
+        events.addAll(normalizer.normalize(new ThinkingBlockEndEvent("reply", "thinking"), context));
+        assertTrue(events.isEmpty());
+        assertFalse(events.toString().contains("private reasoning"));
     }
 
     /** Classifies all v2 model/approval result events without promoting provider state. */
@@ -93,18 +114,49 @@ final class EventNormalizerTest {
         EventNormalizer normalizer = normalizer();
         EventNormalizer.Context context = normalizer.open(
                 new ThreadId("thr_lifecycle"), new TurnId("turn_lifecycle"));
-        assertEquals("runtime/notice", normalizer.normalize(
-                new ModelCallStartEvent("reply_1"), context).getFirst().method());
-        TurnEvent modelEnd = normalizer.normalize(new ModelCallEndEvent("reply_1",
-                new ChatUsage(10, 4, 0.1)), context).getFirst();
-        assertEquals(10, modelEnd.params().path("usageInputTokens").intValue());
+        List<TurnEvent> modelStart = normalizer.normalize(
+                new ModelCallStartEvent("reply_1"), context);
+        assertEquals(List.of("item/started", "item/completed"),
+                modelStart.stream().map(TurnEvent::method).toList());
+        assertEquals("commentary", modelStart.getFirst().params().path("item")
+                .path("kind").textValue());
+        List<TurnEvent> modelEndEvents = normalizer.normalize(new ModelCallEndEvent("reply_1",
+                new ChatUsage(10, 4, 0.1)), context);
+        TurnEvent modelEnd = modelEndEvents.getLast();
+        assertEquals(10, modelEnd.params().path("item").path("metadata")
+                .path("usageInputTokens").intValue());
         TurnEvent confirm = normalizer.normalize(new UserConfirmResultEvent("reply_1",
                 List.of(new ConfirmResult(true, null), new ConfirmResult(false, null))), context)
-                .getFirst();
-        assertEquals(1, confirm.params().path("confirmedCount").intValue());
+                .getLast();
+        assertEquals("commentary", confirm.params().path("item").path("kind").textValue());
+        assertEquals("partial", confirm.params().path("item").path("metadata")
+                .path("status").textValue());
         TurnEvent external = normalizer.normalize(new ExternalExecutionResultEvent("reply_1",
-                List.of(new ToolResultBlock("call_1", "safe_tool", List.of()))), context).getFirst();
-        assertEquals("external_execution_result", external.params().path("kind").textValue());
+                List.of(new ToolResultBlock("call_1", "safe_tool", List.of()))), context).getLast();
+        assertEquals("commentary", external.params().path("item").path("kind").textValue());
+        assertEquals("completed", external.params().path("item").path("metadata")
+                .path("status").textValue());
+        assertTrue(modelStart.stream().noneMatch(event -> event.method().equals("runtime/notice")));
+    }
+
+    /** Ensures an unsupported AgentScope external-execution callback cannot become a false approval pause. */
+    @Test
+    void externalExecutionRequestFailsClosedWithoutApprovalItem() {
+        EventNormalizer normalizer = normalizer();
+        EventNormalizer.Context context = normalizer.open(
+                new ThreadId("thr_external_unsupported"), new TurnId("turn_external_unsupported"));
+
+        List<TurnEvent> output = normalizer.normalize(new RequireExternalExecutionEvent(
+                "reply_external", List.of(new ToolUseBlock("external-1", "execute", Map.of()))), context);
+
+        assertEquals(List.of("turn/completed"), output.stream().map(TurnEvent::method).toList());
+        TurnEvent terminal = output.getFirst();
+        assertEquals("failed", terminal.params().path("turn").path("terminalStatus").textValue());
+        assertEquals("unsupported_external_execution",
+                terminal.params().path("turn").path("reason").textValue());
+        assertFalse(terminal.params().has("item"));
+        assertFalse(terminal.params().toString().contains("\"kind\":\"approval\""));
+        assertTrue(normalizer.isTerminal(context));
     }
 
     /** Tool payload deltas become safe markers and never expose command/path/credential content. */
@@ -136,10 +188,71 @@ final class EventNormalizerTest {
                 return null;
             }
         };
-        TurnEvent diagnostic = normalizer.normalize(unknown, context).getFirst();
-        assertEquals("runtime/unsupported", diagnostic.method());
-        assertTrue(diagnostic.params().path("unsupported").booleanValue());
+        assertTrue(normalizer.normalize(unknown, context).isEmpty());
         assertFalse(normalizer.isTerminal(context));
+    }
+
+    /**
+     * Exercises every AgentScope event branch as a table so adding a new upstream event
+     * cannot silently create an item kind or method that JA v1 cannot parse.
+     */
+    @Test
+    void everyAgentScopeBranchStaysInsideTheJaV1ItemUnion() {
+        Set<String> allowedKinds = Set.of("user_message", "agent_message", "commentary",
+                "tool_call", "command", "file_change", "approval");
+        int index = 0;
+        for (AgentEvent event : allAgentScopeEvents()) {
+            EventNormalizer normalizer = normalizer();
+            EventNormalizer.Context context = normalizer.open(
+                    new ThreadId("thr_branch_" + index), new TurnId("turn_branch_" + index));
+            List<TurnEvent> output = normalizer.normalize(event, context);
+            for (TurnEvent normalized : output) {
+                assertFalse(normalized.method().equals("runtime/unsupported"));
+                JsonNode item = normalized.params().path("item");
+                if (item.isObject() && item.has("kind")) {
+                    assertTrue(allowedKinds.contains(item.path("kind").textValue()),
+                            () -> "unexpected JA v1 item kind: " + item.path("kind"));
+                }
+            }
+            index++;
+        }
+    }
+
+    /** Builds one deterministic source event for every currently known AgentScope branch. */
+    private static List<AgentEvent> allAgentScopeEvents() {
+        ToolUseBlock tool = new ToolUseBlock("call_1", "read_file", Map.of());
+        return List.of(
+                new AgentStartEvent("session", "reply", "ja"),
+                new AgentEndEvent("reply"),
+                new AgentResultEvent(Msg.builder().textContent("final").build()),
+                new ModelCallStartEvent("reply"),
+                new ModelCallEndEvent("reply", new ChatUsage(1, 1, 0.1)),
+                new TextBlockStartEvent("reply", "text"),
+                new TextBlockDeltaEvent("reply", "text", "text"),
+                new TextBlockEndEvent("reply", "text"),
+                new ThinkingBlockStartEvent("reply", "thinking"),
+                new ThinkingBlockDeltaEvent("reply", "thinking", "hidden"),
+                new ThinkingBlockEndEvent("reply", "thinking"),
+                new DataBlockStartEvent("reply", "data"),
+                new DataBlockDeltaEvent("reply", "data", "binary"),
+                new DataBlockEndEvent("reply", "data"),
+                new ToolCallStartEvent("reply", "call_1", "read_file"),
+                new ToolCallDeltaEvent("reply", "call_1", "read_file", "{}"),
+                new ToolCallEndEvent("reply", "call_1", "read_file"),
+                new ToolResultStartEvent("reply", "call_1", "read_file"),
+                new ToolResultTextDeltaEvent("reply", "call_1", "read_file", "result"),
+                new ToolResultDataDeltaEvent("reply", "call_1", "read_file", null),
+                new ToolResultEndEvent("reply", "call_1", "read_file", ToolResultState.SUCCESS),
+                new ExceedMaxItersEvent("reply", 2, 2),
+                new RequireUserConfirmEvent("reply", List.of(tool)),
+                new RequireExternalExecutionEvent("reply", List.of(tool)),
+                new UserConfirmResultEvent("reply", List.of(new ConfirmResult(true, null))),
+                new ExternalExecutionResultEvent("reply", List.of()),
+                new RequestStopEvent("stop"),
+                new SubagentExposedEvent("sub", "agent", "session", "label"),
+                new HintBlockEvent("reply", "hint", "system", "hidden hint"),
+                new AllToolsDeniedEvent(List.of(tool)),
+                new CustomEvent("state_updated", Map.of("secret", "must not leak")));
     }
 
     /** Ensures terminal provider errors are redacted and close the turn exactly once. */
