@@ -4933,6 +4933,7 @@ mod unit_tests {
         points: impl IntoIterator<Item = RestoreFaultPoint>,
         expect_success: bool,
     ) {
+        let points = points.into_iter().collect::<Vec<_>>();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -4947,7 +4948,7 @@ mod unit_tests {
         let alternate = b".ja-sandbox-cleaned.ja-sandbox-log-helper-42-12.marker";
         let contents = b"complete-recovery-image\n";
         let (root_directory, root_identity) = open_verified_root_directory(&root).expect("open");
-        let mut plan = RestoreFaultPlan::new(points);
+        let mut plan = RestoreFaultPlan::new(points.iter().copied());
         let result = restore_recovery_evidence_with_fault(
             RecoveryRestoreRequest {
                 root: &root,
@@ -4988,15 +4989,105 @@ mod unit_tests {
             assert!(fs::read_dir(&root).expect("read root").next().is_none());
         } else {
             assert!(result.is_err(), "double fault unexpectedly succeeded");
-            assert!(original_path.exists(), "original candidate was deleted");
-            assert!(alternate_path.exists(), "alternate candidate was deleted");
-            for path in [original_path, alternate_path] {
-                let metadata = fs::metadata(&path).expect("candidate metadata");
-                assert!(metadata.file_type().is_file());
-                assert_eq!(metadata.permissions().mode() & 0o777, MARKER_MODE);
-                assert_eq!(metadata.nlink(), 1);
-                assert_eq!(metadata.uid(), process::current_uid());
+            let candidates = [
+                (original.as_slice(), original_path),
+                (alternate.as_slice(), alternate_path),
+            ];
+            let mut names = fs::read_dir(&root)
+                .expect("candidate entries")
+                .map(|entry| {
+                    entry
+                        .expect("candidate entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            let mut expected_names = candidates
+                .iter()
+                .map(|(_, path)| {
+                    path.file_name()
+                        .expect("candidate basename")
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>();
+            expected_names.sort();
+            assert_eq!(names, expected_names, "unexpected restore evidence");
+
+            let mut retained_identities = Vec::new();
+            for (index, (name, path)) in candidates.iter().enumerate() {
+                let mut file =
+                    fd::open_at_file(root_directory.as_raw_fd(), name).expect("candidate open");
+                let identity = validate_recovery_image(&file).expect("candidate identity");
+                let expected_bytes = if points.contains(&RestoreFaultPoint::Write(index)) {
+                    &[][..]
+                } else {
+                    contents
+                };
+                assert_eq!(fs::read(path).expect("candidate bytes"), expected_bytes);
+                assert_eq!(
+                    read_marker_image(&mut file, Instant::now() + CLEANUP_DEADLINE)
+                        .expect("candidate readback"),
+                    expected_bytes
+                );
+                retained_identities.push(identity);
+                drop(file);
             }
+
+            // The candidates are intentionally malformed or not proven durable
+            // after two independent faults.  A restart must report the state and
+            // retain both inodes instead of treating teardown cleanup as success.
+            let report = root.join("cleanup-report");
+            for _ in 0..2 {
+                assert!(
+                    cleanup_markers_until(
+                        &root,
+                        &report,
+                        false,
+                        Instant::now() + CLEANUP_DEADLINE,
+                    )
+                    .is_err(),
+                    "restart accepted incomplete restore evidence"
+                );
+                let report_contents = fs::read_to_string(&report).expect("restart report");
+                assert!(report_contents.contains("marker-stat-invalid=true"));
+                for (index, (name, path)) in candidates.iter().enumerate() {
+                    let file = fd::open_at_file(root_directory.as_raw_fd(), name)
+                        .expect("retained candidate open");
+                    assert_eq!(
+                        validate_recovery_image(&file).expect("retained candidate identity"),
+                        retained_identities[index]
+                    );
+                    let expected_bytes = if points.contains(&RestoreFaultPoint::Write(index)) {
+                        &[][..]
+                    } else {
+                        contents
+                    };
+                    assert_eq!(
+                        fs::read(path).expect("retained candidate bytes"),
+                        expected_bytes
+                    );
+                    drop(file);
+                }
+            }
+            fs::remove_file(&report).expect("restart report cleanup");
+
+            // Test teardown still uses the verified directory and exact candidate
+            // identities; it cannot hide an unexpected evidence entry or error.
+            for (index, (name, _)) in candidates.iter().enumerate() {
+                let file = fd::open_at_file(root_directory.as_raw_fd(), name)
+                    .expect("teardown candidate open");
+                assert_eq!(
+                    validate_recovery_image(&file).expect("teardown candidate identity"),
+                    retained_identities[index]
+                );
+                drop(file);
+                fd::unlink_at(root_directory.as_raw_fd(), name).expect("teardown candidate unlink");
+            }
+            fd::sync_directory(&root_directory).expect("teardown directory sync");
+            assert!(fs::read_dir(&root).expect("empty root").next().is_none());
         }
         drop(root_directory);
         fs::remove_dir(&root).expect("root cleanup");
