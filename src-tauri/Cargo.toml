@@ -67,6 +67,9 @@ portable-pty = { version = "=0.9.0", default-features = false }
 # Enforce one desktop instance without enabling deep-link integration, which
 # is outside the preview release scope and would widen the capability surface.
 tauri-plugin-single-instance = { version = "=2.4.3", default-features = false }
+# Reuse Tauri's maintained native file chooser; capability policy below exposes
+# only opening so future save/message surfaces cannot appear accidentally.
+tauri-plugin-dialog = { version = "=2.7.2", default-features = false }
 # Persist provider credentials in the native Apple/Windows stores; the 3.x
 # feature names avoid keyring's Linux secret-service backends entirely.
 keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native"] }

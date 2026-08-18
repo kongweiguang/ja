@@ -4,6 +4,7 @@
   "description": "Minimal core capability for the main application window",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "dialog:allow-open"
   ]
 }

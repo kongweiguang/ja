@@ -45,6 +45,10 @@ pub fn run() {
         app.manage(settings);
         Ok(())
     });
+    // Register the official dialog plugin at the composition root so the
+    // frontend can use native open dialogs without adding a duplicate Rust
+    // command or changing the existing runtime/single-instance lifecycle.
+    let builder = builder.plugin(tauri_plugin_dialog::init());
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
         if let Some(window) = app.get_webview_window("main") {
