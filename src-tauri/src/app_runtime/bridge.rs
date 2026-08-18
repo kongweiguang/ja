@@ -545,19 +545,40 @@ impl ExitControl {
     }
 
     /// Starts the first exit attempt exactly once and wakes any active
-    /// session; later calls reuse its deadline instead of extending it.
+    /// session; a caller deadline can only shorten the internal budget.
     fn trigger(&self) -> ExitAttempt {
+        self.trigger_until(None)
+    }
+
+    /// Applies an outer absolute deadline without allowing a repeated exit
+    /// callback to extend an attempt that is already in flight.  The caller
+    /// owns the overall application budget, so this gate stores the minimum
+    /// of that budget and the bridge's normal shutdown timeout.
+    fn trigger_until(&self, caller_deadline: Option<Instant>) -> ExitAttempt {
         let mut attempt = self
             .attempt
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(current) = *attempt {
             self.cancelled.store(true, Ordering::Release);
-            return current;
+            let bounded = caller_deadline.map_or(current.deadline, |deadline| {
+                std::cmp::min(current.deadline, deadline)
+            });
+            if bounded == current.deadline {
+                return current;
+            }
+            let shortened = ExitAttempt {
+                id: current.id,
+                deadline: bounded,
+            };
+            *attempt = Some(shortened);
+            drop(attempt);
+            self.invoke_cancellation_hook(shortened.deadline);
+            return shortened;
         }
         let current = ExitAttempt {
             id: 1,
-            deadline: shutdown_deadline(self.timeout),
+            deadline: bounded_shutdown_deadline(self.timeout, caller_deadline),
         };
         *attempt = Some(current);
         self.cancelled.store(true, Ordering::Release);
@@ -566,10 +587,10 @@ impl ExitControl {
         current
     }
 
-    /// Starts a new bounded retry only after the caller has proved the prior
-    /// attempt reached actor completion; its id makes deadline transitions
-    /// observable in recovery records and tests.
-    fn retry(&self) -> ExitAttempt {
+    /// Starts a retry whose fresh internal budget is still capped by the
+    /// caller's absolute deadline.  A retry is allowed only after the prior
+    /// actor attempt completed, so it cannot lengthen an in-flight attempt.
+    fn retry_until(&self, caller_deadline: Option<Instant>) -> ExitAttempt {
         let mut attempt = self
             .attempt
             .lock()
@@ -577,7 +598,7 @@ impl ExitControl {
         let id = attempt.map_or(1, |current| current.id.saturating_add(1));
         let current = ExitAttempt {
             id,
-            deadline: shutdown_deadline(self.timeout),
+            deadline: bounded_shutdown_deadline(self.timeout, caller_deadline),
         };
         *attempt = Some(current);
         self.cancelled.store(true, Ordering::Release);
@@ -755,6 +776,13 @@ impl RuntimeBridgeInner {
         self.shutdown_with_retry(true)
     }
 
+    /// Reuses the bridge lifecycle while consuming the caller's absolute
+    /// application-exit budget; the inner thirty-second timeout is only a
+    /// fallback for non-Tauri callers and may never extend this deadline.
+    fn shutdown_until(&self, deadline: Instant) -> Result<(), RuntimeCommandError> {
+        self.shutdown_with_retry_until(true, Some(deadline))
+    }
+
     /// Runs Drop cleanup without creating a new retry budget; only an
     /// explicit host exit request may advance the numbered exit attempt.
     fn shutdown_without_retry(&self) -> Result<(), RuntimeCommandError> {
@@ -764,6 +792,17 @@ impl RuntimeBridgeInner {
     /// Performs bounded cleanup and optionally starts an explicit retry
     /// attempt.  The caller decides whether a new user operation is allowed.
     fn shutdown_with_retry(&self, allow_retry: bool) -> Result<(), RuntimeCommandError> {
+        self.shutdown_with_retry_until(allow_retry, None)
+    }
+
+    /// Performs the existing cleanup/retry path under one optional outer
+    /// deadline.  Keeping the old wrapper above preserves direct callers while
+    /// Tauri exit can pass one absolute budget through every bridge stage.
+    fn shutdown_with_retry_until(
+        &self,
+        allow_retry: bool,
+        caller_deadline: Option<Instant>,
+    ) -> Result<(), RuntimeCommandError> {
         #[cfg(feature = "test-support")]
         trace_event(&self.test_trace, "inner_shutdown_begin");
         let needs_retry = self.completion.done.load(Ordering::Acquire)
@@ -771,10 +810,11 @@ impl RuntimeBridgeInner {
                 || self.cleanup_fault.is_pending()
                 || !self.quarantine.is_empty()
                 || self.detached_event_generation.load(Ordering::Acquire) != 0);
-        let attempt = if allow_retry && needs_retry {
-            self.exit_control.retry()
+        let explicit_retry = allow_retry && needs_retry;
+        let attempt = if explicit_retry {
+            self.exit_control.retry_until(caller_deadline)
         } else {
-            self.exit_control.trigger()
+            self.exit_control.trigger_until(caller_deadline)
         };
         let deadline = attempt.deadline;
         if !self.completion.done.load(Ordering::Acquire) {
@@ -858,12 +898,33 @@ impl RuntimeBridgeInner {
             }
         }
         if self.cleanup_fault.is_pending() {
+            let deadline = effective_shutdown_deadline(deadline, &self.exit_control);
             if let Err(error) = self.quarantine.retry_until(deadline, &self.cleanup_fault) {
                 tracing::error!(?error, "quarantined runtime cleanup retry failed");
             }
-            if self.quarantine.is_empty() && !self.cleanup_fault.is_pending() {
+            if self.quarantine.is_empty()
+                && !self.cleanup_fault.is_pending()
+                && self
+                    .exit_control
+                    .deadline()
+                    .is_none_or(|active| Instant::now() < active)
+            {
                 self.shutdown_completed.store(true, Ordering::Release);
             }
+        }
+        // A late cleanup can leave all actual owners empty while the first
+        // caller has already timed out.  Only a later explicit retry may
+        // promote that confirmed empty state to completed; the first attempt
+        // must remain a failure for the Tauri prevent/retry contract.
+        if can_promote_completed_retry(
+            explicit_retry,
+            self.completion.done.load(Ordering::Acquire),
+            self.quarantine.is_empty(),
+            self.cleanup_fault.is_pending(),
+            self.detached_event_generation.load(Ordering::Acquire),
+            deadline,
+        ) {
+            self.shutdown_completed.store(true, Ordering::Release);
         }
         if !self.shutdown_completed.load(Ordering::Acquire) {
             #[cfg(feature = "test-support")]
@@ -1167,6 +1228,13 @@ impl RuntimeBridge {
     /// Requests high-priority application shutdown and joins the actor.
     pub fn shutdown(&self) -> Result<(), RuntimeCommandError> {
         self.inner.shutdown()
+    }
+
+    /// Requests high-priority shutdown under the caller's absolute exit
+    /// deadline so a Tauri callback cannot fall back to the bridge's longer
+    /// standalone timeout after terminal cleanup has consumed part of it.
+    pub fn shutdown_until(&self, deadline: Instant) -> Result<(), RuntimeCommandError> {
+        self.inner.shutdown_until(deadline)
     }
 
     /// Allows the Tauri run loop to prove that a final Exit event is safe.
@@ -1539,6 +1607,7 @@ fn actor_loop(
                 .store(PHASE_SHUTDOWN_RECEIVED, Ordering::Release);
             #[cfg(feature = "test-support")]
             trace_event(&context.test_trace, "actor_shutdown_received");
+            let deadline = effective_shutdown_deadline(request.deadline, &context.exit_control);
             let result = stop_runtime(
                 &context.sink,
                 &mut runtime,
@@ -1546,7 +1615,8 @@ fn actor_loop(
                 &context.current_generation,
                 &context.terminal_fault,
                 &context.cleanup_fault,
-                request.deadline,
+                deadline,
+                &context.exit_control,
             );
             #[cfg(feature = "test-support")]
             trace_event(
@@ -1563,7 +1633,7 @@ fn actor_loop(
                 &context.cleanup_fault,
                 &context.detached_event_generation,
             );
-            if cleanup_confirmed {
+            if cleanup_confirmed && Instant::now() < deadline {
                 #[cfg(feature = "test-support")]
                 context
                     .test_phase
@@ -1588,7 +1658,8 @@ fn actor_loop(
                 &pending_cleanup,
                 &context.cleanup_fault,
                 &context.detached_event_generation,
-            ) {
+            ) && Instant::now() < deadline
+            {
                 shutdown_completed = true;
                 context.shutdown_completed.store(true, Ordering::Release);
                 break;
@@ -1604,6 +1675,7 @@ fn actor_loop(
                 &context.terminal_fault,
                 &context.cleanup_fault,
                 deadline,
+                &context.exit_control,
             ) {
                 tracing::error!(?error, "runtime exit cleanup retry was not confirmed");
             }
@@ -1699,6 +1771,7 @@ fn actor_loop(
                     &context.terminal_fault,
                     &context.cleanup_fault,
                     shutdown_deadline(context.config.shutdown_timeout),
+                    &context.exit_control,
                 );
                 #[cfg(feature = "test-support")]
                 trace_event(
@@ -1787,6 +1860,7 @@ fn actor_loop(
                 &context.terminal_fault,
                 &context.cleanup_fault,
                 deadline,
+                &context.exit_control,
             ) {
                 tracing::error!(?error, "runtime actor cleanup retry was not confirmed");
             }
@@ -1825,7 +1899,8 @@ fn actor_loop(
             &pending_cleanup,
             &context.cleanup_fault,
             &context.detached_event_generation,
-        ) {
+        ) && Instant::now() < deadline
+        {
             context.shutdown_completed.store(true, Ordering::Release);
         }
     }
@@ -2288,6 +2363,10 @@ fn shutdown_components(
 }
 
 /// Performs bounded event-worker and process-tree shutdown in that order.
+/// The explicit owner references keep cleanup mutations local to this narrow
+/// bridge primitive; the clippy exception avoids inventing a state wrapper for
+/// one additional shared-deadline read.
+#[allow(clippy::too_many_arguments)]
 fn stop_runtime(
     sink: &EventSink,
     runtime: &mut Option<RunningRuntime>,
@@ -2296,10 +2375,26 @@ fn stop_runtime(
     terminal_fault: &Arc<TerminalFault>,
     cleanup_fault: &Arc<CleanupFault>,
     deadline: Instant,
+    exit_control: &ExitControl,
 ) -> Result<RuntimeStatus, RuntimeCommandError> {
+    let deadline = effective_shutdown_deadline(deadline, exit_control);
+    if exit_control
+        .deadline()
+        .is_some_and(|active| Instant::now() >= active)
+    {
+        return Err(RuntimeCommandError::shutdown_timeout());
+    }
     if let Some(mut supervisor) = pending_cleanup.take() {
         let generation = supervisor.generation();
-        if let Err(error) = shutdown_supervisor_until(&mut supervisor, deadline) {
+        let mut cleanup_result = shutdown_supervisor_until(&mut supervisor, deadline);
+        if cleanup_result.is_ok()
+            && exit_control
+                .deadline()
+                .is_some_and(|active| Instant::now() >= active)
+        {
+            cleanup_result = Err(RuntimeCommandError::shutdown_timeout());
+        }
+        if let Err(error) = cleanup_result {
             cleanup_fault.mark(generation);
             *pending_cleanup = Some(supervisor);
             return Err(error);
@@ -2323,7 +2418,17 @@ fn stop_runtime(
     terminal_fault.clear();
     let generation = current.generation;
     let server_instance_id = current.server_instance_id.clone();
-    let result = shutdown_components(&mut current, deadline);
+    let mut result = shutdown_components(&mut current, deadline);
+    // A caller can shorten the shared deadline while cleanup is in progress;
+    // retain the owner as unconfirmed if cleanup only returns after that
+    // boundary, so the caller still prevents exit and can retry explicitly.
+    if result.is_ok()
+        && exit_control
+            .deadline()
+            .is_some_and(|active| Instant::now() >= active)
+    {
+        result = Err(RuntimeCommandError::shutdown_timeout());
+    }
     if result.is_err() {
         // Keep the supervisor and worker handles owned by the actor so a later
         // high-priority shutdown can retry the same generation.  The fault is
@@ -2396,6 +2501,42 @@ fn shutdown_deadline(timeout: Duration) -> Instant {
     Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(Instant::now)
+}
+
+/// Builds the bridge's normal absolute budget and caps it at the caller's
+/// already-created deadline, preserving one monotonic exit budget across
+/// terminal, preview, and Java cleanup.
+fn bounded_shutdown_deadline(timeout: Duration, caller_deadline: Option<Instant>) -> Instant {
+    let internal = shutdown_deadline(timeout);
+    caller_deadline.map_or(internal, |deadline| std::cmp::min(internal, deadline))
+}
+
+/// Re-reads the shared exit attempt at each cleanup boundary so a caller that
+/// shortens the application budget cannot leave an actor using its stale
+/// request deadline.
+fn effective_shutdown_deadline(request_deadline: Instant, control: &ExitControl) -> Instant {
+    control.deadline().map_or(request_deadline, |active| {
+        std::cmp::min(request_deadline, active)
+    })
+}
+
+/// Allows only a later explicit retry to acknowledge a late-but-clean actor;
+/// the first caller's expired budget remains a failed exit attempt even when
+/// no process debt is left for the retry to physically reap.
+fn can_promote_completed_retry(
+    explicit_retry: bool,
+    completion_done: bool,
+    quarantine_empty: bool,
+    cleanup_fault_pending: bool,
+    detached_event_generation: u64,
+    deadline: Instant,
+) -> bool {
+    explicit_retry
+        && completion_done
+        && quarantine_empty
+        && !cleanup_fault_pending
+        && detached_event_generation == 0
+        && Instant::now() < deadline
 }
 
 /// Bounds a protocol request by the immutable exit deadline when shutdown is
@@ -3792,9 +3933,108 @@ mod tests {
             cleanup_deadline(&control, Duration::from_secs(1)),
             first.deadline
         );
-        let retry = control.retry();
+        let retry = control.retry_until(None);
         assert_eq!(retry.id, first.id + 1);
         assert!(retry.deadline >= first.deadline);
+    }
+
+    /// An outer Tauri deadline caps the normal bridge timeout and a repeated
+    /// callback cannot move the first attempt later; only an explicit retry
+    /// may create a new attempt after the actor has finished.
+    #[test]
+    fn exit_control_caps_caller_deadline_without_extending_attempt() {
+        let control = ExitControl::new(Duration::from_secs(30));
+        let caller_deadline = Instant::now() + Duration::from_secs(1);
+        let first = control.trigger_until(Some(caller_deadline));
+        assert!(first.deadline <= caller_deadline);
+
+        let repeated = control.trigger_until(Some(Instant::now() + Duration::from_secs(10)));
+        assert_eq!(repeated, first);
+
+        let shortened = control.trigger_until(Some(Instant::now() + Duration::from_millis(10)));
+        assert_eq!(shortened.id, first.id);
+        assert!(shortened.deadline <= first.deadline);
+
+        let retry_deadline = Instant::now() + Duration::from_secs(1);
+        let retry = control.retry_until(Some(retry_deadline));
+        assert_eq!(retry.id, first.id + 1);
+        assert!(retry.deadline <= retry_deadline);
+    }
+
+    /// A first late cleanup remains failed, while the next explicit retry may
+    /// promote the already-completed, debt-free owner without waiting or sleep.
+    #[test]
+    fn late_cleanup_then_explicit_retry_promotes_clean_completion() {
+        let retry_deadline = Instant::now() + Duration::from_secs(1);
+        assert!(!can_promote_completed_retry(
+            false,
+            true,
+            true,
+            false,
+            0,
+            retry_deadline,
+        ));
+        assert!(can_promote_completed_retry(
+            true,
+            true,
+            true,
+            false,
+            0,
+            retry_deadline,
+        ));
+        assert!(!can_promote_completed_retry(
+            true,
+            true,
+            true,
+            true,
+            0,
+            retry_deadline,
+        ));
+        assert!(!can_promote_completed_retry(
+            true,
+            true,
+            true,
+            false,
+            7,
+            retry_deadline,
+        ));
+    }
+
+    /// Reuses the bridge actor seam to model a first late completion with no
+    /// remaining debt, then proves the following explicit retry can join and
+    /// clear the completed lifecycle without timing sleeps.
+    #[test]
+    fn late_cleanup_then_next_bridge_retry_succeeds() {
+        let run_dir = std::env::temp_dir().join(format!(
+            "ja-late-clean-retry-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&run_dir).expect("late cleanup run directory");
+        let sink: EventSink = Arc::new(|_| Ok(()));
+        let bridge = RuntimeBridge::new(
+            LaunchConfig::for_test(
+                PathBuf::from("missing-ja-sidecar"),
+                Vec::new(),
+                run_dir.clone(),
+            ),
+            sink,
+        )
+        .expect("bridge actor");
+        bridge.shutdown().expect("first lifecycle shutdown");
+
+        // The actor has completed and all owners are already empty, but the
+        // first caller timed out after cleanup; this is the state that used to
+        // become permanently un-retryable.
+        bridge
+            .inner
+            .shutdown_completed
+            .store(false, Ordering::Release);
+        bridge
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .expect("explicit retry promotes late clean completion");
+        assert!(bridge.exit_ready());
+        let _ = std::fs::remove_dir_all(run_dir);
     }
 
     /// The cancellation hook must receive the exact attempt deadline, not a

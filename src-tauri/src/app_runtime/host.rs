@@ -18,6 +18,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "tauri-smoke")]
 use std::time::Duration;
+use std::time::Instant;
 
 /// Owns the trusted launch configuration and lazily creates exactly one bridge
 /// after the recovery gate is clear; setup can therefore render recovery UI
@@ -401,6 +402,25 @@ impl RuntimeHost {
             .clone();
         let result = match bridge {
             Some(bridge) => bridge.shutdown(),
+            None => Ok(()),
+        };
+        // Shutdown invalidates every old workspace handle even when native
+        // cleanup needs recovery; a later start must be preceded by configure.
+        self.clear_workspace();
+        result
+    }
+
+    /// Performs the same host cleanup under one caller-owned absolute
+    /// deadline, so time spent closing other native resources is not followed
+    /// by a fresh bridge timeout.
+    pub fn shutdown_until(&self, deadline: Instant) -> Result<(), RuntimeCommandError> {
+        let bridge = self
+            .bridge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let result = match bridge {
+            Some(bridge) => bridge.shutdown_until(deadline),
             None => Ok(()),
         };
         // Shutdown invalidates every old workspace handle even when native

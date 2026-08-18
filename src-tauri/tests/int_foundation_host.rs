@@ -1223,10 +1223,11 @@ fn slow_handshake_shutdown_has_one_total_deadline() {
     }));
     assert_process_marker_visible(&marker, total_deadline);
     let shutdown_started = Instant::now();
-    let shutdown_result = bridge.shutdown();
+    let outer_deadline = shutdown_started + Duration::from_millis(500);
+    let shutdown_result = bridge.shutdown_until(outer_deadline);
     assert!(
-        shutdown_started.elapsed() < Duration::from_secs(20),
-        "priority shutdown exceeded total deadline"
+        shutdown_started.elapsed() < Duration::from_secs(3),
+        "priority shutdown did not honor the short caller deadline"
     );
     let starter_result = starter_receiver
         .recv_timeout(total_deadline.saturating_duration_since(Instant::now()))

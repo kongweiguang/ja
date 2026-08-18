@@ -3,6 +3,8 @@
 
 //! Tauri composition surface for the Java sidecar bridge.
 
+use std::time::Instant;
+
 mod bridge;
 mod config;
 pub(crate) mod history;
@@ -131,4 +133,14 @@ pub fn ja_approval_respond(
 /// callback cannot silently diverge from the managed-state shutdown contract.
 pub fn cleanup_on_exit(state: &RuntimeHost) -> Result<(), RuntimeCommandError> {
     state.shutdown()
+}
+
+/// Shares the Tauri composition root's absolute deadline with the Java host;
+/// callers that already cleaned another native resource must not restart the
+/// bridge's standalone shutdown timeout.
+pub fn cleanup_on_exit_until(
+    state: &RuntimeHost,
+    deadline: Instant,
+) -> Result<(), RuntimeCommandError> {
+    state.shutdown_until(deadline)
 }
