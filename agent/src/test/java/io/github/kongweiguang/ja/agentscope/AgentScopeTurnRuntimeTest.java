@@ -12,11 +12,16 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEndEvent;
 import io.agentscope.core.event.AgentEvent;
 import io.agentscope.core.event.AgentStartEvent;
+import io.agentscope.core.event.RequestStopEvent;
 import io.agentscope.core.event.RequireUserConfirmEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.event.TextBlockEndEvent;
 import io.agentscope.core.event.TextBlockStartEvent;
+import io.agentscope.core.event.ToolResultEndEvent;
+import io.agentscope.core.event.ToolResultStartEvent;
+import io.agentscope.core.event.ToolResultTextDeltaEvent;
 import io.agentscope.core.message.ToolUseBlock;
+import io.agentscope.core.message.ToolResultState;
 import io.github.kongweiguang.ja.domain.ServerInstanceId;
 import io.github.kongweiguang.ja.domain.TurnId;
 import io.github.kongweiguang.ja.protocol.JsonNodes;
@@ -30,8 +35,11 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -40,8 +48,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
+import org.reactivestreams.Publisher;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
+import reactor.core.publisher.Sinks;
 
 /** Scheduler tests use barriers instead of timing sleeps or paid providers. */
 final class AgentScopeTurnRuntimeTest {
@@ -324,6 +336,79 @@ final class AgentScopeTurnRuntimeTest {
         }
     }
 
+    /**
+     * Keeps a permission pause open across AgentScope stop/end events and proves that successive
+     * resume epochs preserve both MCP-like results before the single terminal event. The separate
+     * approvalResumeWaitsForAskingCompletionWithoutTimingSleep test owns the completion barrier;
+     * this test composes that contract with stale-event epoch filtering.
+     */
+    @Test
+    void approvalResumePreservesSequentialToolResultsAcrossTwoEpochs() throws Exception {
+        TwoApprovalEngine engine = new TwoApprovalEngine();
+        AgentScopeTurnRuntime runtime = runtime(engine, AgentScopeTurnRuntime.Config.defaults());
+        List<TurnEvent> events = new java.util.concurrent.CopyOnWriteArrayList<>();
+        BlockingQueue<Consumer<TurnRuntime.ApprovalDecision>> decisions = new ArrayBlockingQueue<>(2);
+        CountDownLatch firstPrompt = new CountDownLatch(1);
+        CountDownLatch secondPrompt = new CountDownLatch(1);
+        AtomicInteger promptCount = new AtomicInteger();
+        AtomicReference<Throwable> approvalOverflow = new AtomicReference<>();
+        runtime.setApprovalSink((prompt, callback) -> {
+            if (!decisions.offer(callback)) {
+                approvalOverflow.compareAndSet(null,
+                        new AssertionError("approval callback queue overflow"));
+                throw new IllegalStateException("approval callback queue overflow");
+            }
+            if (promptCount.incrementAndGet() == 1) {
+                firstPrompt.countDown();
+            } else {
+                secondPrompt.countDown();
+            }
+        });
+        try {
+            runtime.start(request("thr_two_approvals", "session_two_approvals", "two-approvals"),
+                    events::add);
+            assertTrue(firstPrompt.await(2, TimeUnit.SECONDS));
+            assertTrue(engine.lateReady.await(2, TimeUnit.SECONDS));
+            assertTrue(events.stream().noneMatch(event -> "turn/completed".equals(event.method())));
+
+            Consumer<TurnRuntime.ApprovalDecision> firstDecision = decisions.poll();
+            assertTrue(firstDecision != null, "first approval callback must be queued");
+            firstDecision.accept(new TurnRuntime.ApprovalDecision("allow_once", Instant.now()));
+            assertTrue(engine.firstResumeSubscribed.await(2, TimeUnit.SECONDS));
+            assertEquals(Sinks.EmitResult.OK,
+                    engine.lateAskingEvents.tryEmitNext(new AgentEndEvent("late-old-epoch")));
+            assertEquals(Sinks.EmitResult.OK, engine.lateAskingEvents.tryEmitComplete());
+            assertTrue(engine.lateForwarded.await(2, TimeUnit.SECONDS));
+            engine.emitFirstResumeEvents();
+            assertTrue(secondPrompt.await(2, TimeUnit.SECONDS));
+            assertTrue(events.stream().noneMatch(event -> "turn/completed".equals(event.method())));
+            assertEquals(List.of("server-a"), engine.resultTexts(events));
+
+            Consumer<TurnRuntime.ApprovalDecision> secondDecision = decisions.poll();
+            assertTrue(secondDecision != null, "second approval callback must be queued");
+            secondDecision.accept(new TurnRuntime.ApprovalDecision("allow_once", Instant.now()));
+            assertTrue(engine.secondResume.await(2, TimeUnit.SECONDS));
+            assertTrue(runtime.awaitQuiescence(java.time.Duration.ofSeconds(2)));
+
+            assertEquals(List.of("server-a", "server-b"), engine.resultTexts(events));
+            assertEquals(2, engine.resumeCalls.get());
+            assertEquals(2, promptCount.get());
+            assertTrue(decisions.isEmpty(), "all approval callbacks must be consumed");
+            assertTrue(approvalOverflow.get() == null, "approval callback queue must not overflow");
+            List<TurnEvent> terminals = events.stream()
+                    .filter(event -> "turn/completed".equals(event.method())).toList();
+            assertEquals(1, terminals.size());
+            assertEquals(terminals.getFirst(), events.getLast(),
+                    "terminal event must be the final callback");
+            assertEquals(1, events.stream().filter(event -> "turn/completed".equals(event.method()))
+                    .count());
+            assertEquals("completed", events.getLast().params().path("turn")
+                    .path("terminalStatus").textValue());
+        } finally {
+            runtime.close();
+        }
+    }
+
     /** A current asking-stream error still fails the turn instead of leaving approval pending. */
     @Test
     void currentAskingStreamErrorFailsApprovalTurn() throws Exception {
@@ -536,6 +621,166 @@ final class AgentScopeTurnRuntimeTest {
         /** Releases no external resources in this in-memory engine. */
         @Override
         public void close() {
+        }
+    }
+
+    /** Drives two explicit HITL resumes so stale asking terminals cannot finish the replacement. */
+    private static final class TwoApprovalEngine implements AgentScopeEngine {
+        private final Sinks.Many<AgentEvent> lateAskingEvents =
+                Sinks.many().unicast().onBackpressureBuffer(new ArrayBlockingQueue<>(1));
+        private final Sinks.Many<AgentEvent> firstResumeEvents =
+                Sinks.many().unicast().onBackpressureBuffer(new ArrayBlockingQueue<>(6));
+        private final CountDownLatch firstResumeSubscribed = new CountDownLatch(1);
+        private final CountDownLatch secondResume = new CountDownLatch(1);
+        private final CountDownLatch lateReady = new CountDownLatch(1);
+        private final CountDownLatch lateForwarded = new CountDownLatch(1);
+        private final AtomicInteger resumeCalls = new AtomicInteger();
+
+        /** Emits the first approval and keeps a bounded late callback source for epoch filtering. */
+        @Override
+        public Flux<AgentEvent> stream(String input, RuntimeContext context) {
+            return Flux.from(new LateAskingPublisher());
+        }
+
+        /** Returns controllable first-resume events, then a terminal second-resume sequence. */
+        @Override
+        public Flux<AgentEvent> resume(io.agentscope.core.message.Msg confirmation,
+                                       RuntimeContext context) {
+            int call = resumeCalls.incrementAndGet();
+            if (call == 1) {
+                return firstResumeEvents.asFlux()
+                        .doOnSubscribe(subscription -> firstResumeSubscribed.countDown());
+            }
+            secondResume.countDown();
+            List<AgentEvent> events = new ArrayList<>(result("server-b", "reply_b"));
+            events.add(new AgentEndEvent("reply_final"));
+            return Flux.fromIterable(events);
+        }
+
+        /** No session policy is needed for this focused approval-order fixture. */
+        @Override
+        public void allowSession(String userId, String sessionId, List<ToolUseBlock> toolCalls) {
+        }
+
+        /** No provider interruption is required for the bounded synchronous fixture. */
+        @Override
+        public void interrupt(RuntimeContext context) {
+        }
+
+        /** No external resources are allocated by this in-memory fixture. */
+        @Override
+        public void close() {
+        }
+
+        /** Emits the first real result, second approval, and upstream pause markers in order. */
+        private void emitFirstResumeEvents() {
+            result("server-a", "reply_a").forEach(this::emit);
+            emit(new RequireUserConfirmEvent("reply_second", List.of(tool("second"))));
+            emit(new RequestStopEvent("asking-stop-second"));
+            emit(new AgentEndEvent("asking-end-second"));
+            assertEquals(Sinks.EmitResult.OK, firstResumeEvents.tryEmitComplete());
+        }
+
+        /** Pushes one event into the controlled first resume stream without timing assumptions. */
+        private void emit(AgentEvent event) {
+            assertEquals(Sinks.EmitResult.OK, firstResumeEvents.tryEmitNext(event));
+        }
+
+        /** Extracts and validates every normalized result item lifecycle, not just its metadata. */
+        private List<String> resultTexts(List<TurnEvent> events) {
+            Map<String, String> itemNames = new LinkedHashMap<>();
+            Map<String, List<String>> lifecycle = new LinkedHashMap<>();
+            Map<String, String> deltas = new LinkedHashMap<>();
+            List<String> completedNames = new ArrayList<>();
+            for (TurnEvent event : events) {
+                if ("item/started".equals(event.method())) {
+                    var item = event.params().path("item");
+                    String name = item.path("metadata").path("toolName").textValue();
+                    if (name != null && name.startsWith("server-")) {
+                        String itemId = item.path("itemId").textValue();
+                        assertTrue(itemId != null && !itemId.isBlank());
+                        assertEquals("started", item.path("status").textValue());
+                        assertEquals("started", item.path("metadata").path("status").textValue());
+                        assertTrue(item.path("metadata").path("toolCallId").isTextual());
+                        itemNames.put(itemId, name);
+                        lifecycle.put(itemId, new ArrayList<>(List.of("started")));
+                    }
+                } else if ("item/delta".equals(event.method())) {
+                    String itemId = event.params().path("itemId").textValue();
+                    if (itemNames.containsKey(itemId)) {
+                        assertEquals("[tool output redacted]", event.params().path("delta").textValue());
+                        assertTrue(event.params().path("deltaBytes").asInt() > 0);
+                        lifecycle.get(itemId).add("delta");
+                        deltas.put(itemId, event.params().path("delta").textValue());
+                    }
+                } else if ("item/completed".equals(event.method())) {
+                    var item = event.params().path("item");
+                    String itemId = item.path("itemId").textValue();
+                    if (itemNames.containsKey(itemId)) {
+                        assertEquals("completed", item.path("status").textValue());
+                        assertEquals("completed", item.path("metadata").path("status").textValue());
+                        assertEquals(itemNames.get(itemId),
+                                item.path("metadata").path("toolName").textValue());
+                        lifecycle.get(itemId).add("completed");
+                        completedNames.add(itemNames.get(itemId));
+                    }
+                }
+            }
+            assertEquals(itemNames.keySet(), lifecycle.keySet());
+            for (String itemId : itemNames.keySet()) {
+                assertEquals(List.of("started", "delta", "completed"), lifecycle.get(itemId));
+                assertEquals("[tool output redacted]", deltas.get(itemId));
+            }
+            List<String> names = List.copyOf(itemNames.values());
+            assertEquals(names, completedNames, "tool result completion order must match start order");
+            return names;
+        }
+
+        /** Creates the smallest tool request that still enters AgentScope's native permission path. */
+        private static ToolUseBlock tool(String name) {
+            return new ToolUseBlock(name, "mcp_" + name, Map.of("value", name));
+        }
+
+        /** Creates the normal AgentScope result event sequence used by MCP tool calls. */
+        private static List<AgentEvent> result(String value, String replyId) {
+            String callId = "call_" + value;
+            return List.of(
+                    new ToolResultStartEvent(replyId, callId, value),
+                    new ToolResultTextDeltaEvent(replyId, callId, value, value),
+                    new ToolResultEndEvent(replyId, callId, value, ToolResultState.SUCCESS));
+        }
+
+        /**
+         * Forwards one deliberately late old-stream event to exercise the runtime epoch guard.
+         * The completion barrier is asserted by the dedicated approval completion test above;
+         * this fixture does not claim that a second onComplete is observable through Reactor.
+         */
+        private final class LateAskingPublisher implements Publisher<AgentEvent> {
+            @Override
+            public void subscribe(Subscriber<? super AgentEvent> subscriber) {
+                subscriber.onSubscribe(new Subscription() {
+                    @Override
+                    public void request(long demand) {
+                        // The fixture emits only its bounded scripted sequence.
+                    }
+
+                    @Override
+                    public void cancel() {
+                        // Keep forwarding the deliberate late callback for epoch coverage.
+                    }
+                });
+                subscriber.onNext(new RequireUserConfirmEvent(
+                        "reply_first", List.of(tool("first"))));
+                subscriber.onNext(new RequestStopEvent("asking-stop"));
+                subscriber.onNext(new AgentEndEvent("asking-end"));
+                subscriber.onComplete();
+                lateAskingEvents.asFlux().subscribe(
+                        event -> {
+                            subscriber.onNext(event);
+                            lateForwarded.countDown();
+                        });
+                lateReady.countDown();
+            }
         }
     }
 }
