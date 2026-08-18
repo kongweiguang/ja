@@ -237,6 +237,13 @@ fn structured_profile_and_mcp_references_round_trip() {
     let encoded = serde_json::to_vec(&document).expect("settings json");
     let decoded: SettingsDocument = serde_json::from_slice(&encoded).expect("settings decode");
     assert_eq!(decoded, document);
+    let encoded_text = String::from_utf8(encoded.clone()).expect("settings utf8");
+    assert!(encoded_text.contains(r#""protocol":"openai_chat_completions""#));
+    assert!(!encoded_text.contains("open_ai_chat_completions"));
+    let legacy_text = encoded_text.replace("openai_chat_completions", "open_ai_chat_completions");
+    let legacy_decoded: SettingsDocument =
+        serde_json::from_str(&legacy_text).expect("legacy settings protocol alias");
+    assert_eq!(legacy_decoded, document);
     assert_eq!(decoded.profiles[0].access_mode, AccessMode::ReadOnly);
     assert_eq!(
         decoded.profiles[0]
@@ -245,6 +252,50 @@ fn structured_profile_and_mcp_references_round_trip() {
             .expect("mcp selection"),
         &vec!["mcp_files".to_owned()]
     );
+}
+
+/// The canonical OpenAI spelling must be emitted while the pre-fix spelling
+/// remains readable so existing settings do not become invalid on upgrade.
+#[test]
+fn api_protocol_uses_canonical_openai_wire_name_and_reads_legacy_alias() {
+    let canonical = serde_json::to_string(&ApiProtocol::OpenAiChatCompletions)
+        .expect("canonical protocol json");
+    assert_eq!(canonical, r#""openai_chat_completions""#);
+
+    let legacy = serde_json::from_str::<ApiProtocol>(r#""open_ai_chat_completions""#)
+        .expect("legacy protocol alias");
+    assert_eq!(legacy, ApiProtocol::OpenAiChatCompletions);
+
+    let responses =
+        serde_json::to_string(&ApiProtocol::OpenAiResponses).expect("responses protocol json");
+    assert_eq!(responses, r#""openai_responses""#);
+    let legacy_responses = serde_json::from_str::<ApiProtocol>(r#""open_ai_responses""#)
+        .expect("legacy responses alias");
+    assert_eq!(legacy_responses, ApiProtocol::OpenAiResponses);
+}
+
+/// Responses remains a recognized wire enum for migration, but settings
+/// validation keeps it unavailable until the product implements that API.
+#[test]
+fn canonical_responses_protocol_remains_unavailable_to_settings() {
+    let mut document = SettingsDocument::default();
+    document.profiles.push(ProfileSetting {
+        profile_revision: "profile_responses_canonical".to_owned(),
+        name: "Reserved".to_owned(),
+        provider: "openai".to_owned(),
+        protocol: serde_json::from_str(r#""openai_responses""#).expect("canonical responses"),
+        model: "model".to_owned(),
+        base_url: Some("https://example.com/v1".to_owned()),
+        credential_ref: None,
+        supports_vision: false,
+        access_mode: Default::default(),
+        skill_revisions: Vec::new(),
+        mcp_revisions: None,
+    });
+    assert!(matches!(
+        document.validate(),
+        Err(super::model::SettingsModelError::UnsupportedProtocol)
+    ));
 }
 
 #[test]

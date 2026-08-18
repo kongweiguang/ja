@@ -17,8 +17,11 @@ pub const MAX_SETTINGS_STRING: usize = 512;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiProtocol {
+    #[serde(rename = "anthropic_messages")]
     AnthropicMessages,
+    #[serde(rename = "openai_chat_completions", alias = "open_ai_chat_completions")]
     OpenAiChatCompletions,
+    #[serde(rename = "openai_responses", alias = "open_ai_responses")]
     OpenAiResponses,
 }
 
