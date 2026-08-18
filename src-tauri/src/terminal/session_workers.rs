@@ -10,12 +10,17 @@
 use super::{TerminalError, TerminalErrorCode, TerminalEventKind, TerminalRuntime, TerminalSize};
 use portable_pty::{Child, PtySize};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::Barrier;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const PTY_DRAIN_GRACE: Duration = Duration::from_millis(100);
+const WORKER_FINISH_POLL: Duration = Duration::from_millis(1);
 /// Keep the reservation and spawn-failure compensation counts in one place.
 pub(super) const WORKER_COUNT: usize = 4;
 
@@ -270,10 +275,23 @@ impl ResizeQueue {
 
 /// worker 数量由 runtime 所有，便于 close 使用 deadline 等待而不 join 自己。
 pub(super) struct WorkerTracker {
-    remaining: AtomicUsize,
     wake: Condvar,
-    state: Mutex<()>,
+    state: Mutex<WorkerState>,
     handles: Mutex<Vec<JoinHandle<()>>>,
+    #[cfg(test)]
+    joined: AtomicUsize,
+}
+
+struct WorkerState {
+    remaining: usize,
+    #[cfg(test)]
+    wait_before_block: Option<Arc<WaitGate>>,
+}
+
+#[cfg(test)]
+struct WaitGate {
+    entered: Barrier,
+    release: Barrier,
 }
 
 pub(super) enum WorkerReap {
@@ -286,10 +304,15 @@ impl WorkerTracker {
     /// 预登记四类 worker，spawn 失败路径也可准确扣减。
     pub(super) fn new(count: usize) -> Self {
         Self {
-            remaining: AtomicUsize::new(count),
             wake: Condvar::new(),
-            state: Mutex::new(()),
+            state: Mutex::new(WorkerState {
+                remaining: count,
+                #[cfg(test)]
+                wait_before_block: None,
+            }),
             handles: Mutex::new(Vec::with_capacity(count)),
+            #[cfg(test)]
+            joined: AtomicUsize::new(0),
         }
     }
 
@@ -304,8 +327,16 @@ impl WorkerTracker {
 
     /// worker 完成时通知 close waiter。
     pub(super) fn done(&self) {
-        self.remaining.fetch_sub(1, Ordering::AcqRel);
-        self.wake.notify_all();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.remaining != 0 {
+            state.remaining -= 1;
+            // Updating the predicate and notifying while holding the same
+            // mutex makes check-then-wait atomic from the waiter's perspective.
+            self.wake.notify_all();
+        }
     }
 
     /// 完成尚未启动的 worker 槽位，避免 thread spawn 失败留下虚假计数。
@@ -321,17 +352,17 @@ impl WorkerTracker {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while self.remaining.load(Ordering::Acquire) != 0
-            || self
-                .handles
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .any(|handle| !handle.is_finished())
-        {
+        while guard.remaining != 0 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return WorkerReap::Timeout;
+            }
+            #[cfg(test)]
+            if let Some(hook) = guard.wait_before_block.take() {
+                // The hook exists only to make the check-then-wait race
+                // deterministic in unit tests; production has no extra API.
+                hook.entered.wait();
+                hook.release.wait();
             }
             let (next, result) = self
                 .wake
@@ -344,13 +375,54 @@ impl WorkerTracker {
                 continue;
             }
         }
+
+        // `done` is emitted just before a worker closure returns, so the
+        // handle may need a short bounded poll before `join`; never block past
+        // the caller's absolute deadline waiting for that state transition.
+        drop(guard);
+        loop {
+            let all_finished = {
+                let handles = self
+                    .handles
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                handles.iter().all(JoinHandle::is_finished)
+            };
+            if all_finished {
+                break;
+            }
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return WorkerReap::Timeout;
+            }
+            let poll = remaining.min(WORKER_FINISH_POLL);
+            let (next, _) = self
+                .wake
+                .wait_timeout(state, poll)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            drop(state);
+        }
+
         let handles = std::mem::take(
             &mut *self
                 .handles
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        if handles.into_iter().any(|handle| handle.join().is_err()) {
+        let mut join_failed = false;
+        for handle in handles {
+            if handle.join().is_err() {
+                join_failed = true;
+            }
+            #[cfg(test)]
+            self.joined.fetch_add(1, Ordering::Relaxed);
+        }
+        if join_failed {
             WorkerReap::JoinFailed
         } else {
             WorkerReap::Complete
@@ -359,7 +431,12 @@ impl WorkerTracker {
 
     /// A closed generation is reclaimable only after all workers were joined.
     pub(super) fn is_reaped(&self) -> bool {
-        self.remaining.load(Ordering::Acquire) == 0
+        let remaining = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remaining;
+        remaining == 0
             && self
                 .handles
                 .lock()
@@ -396,15 +473,76 @@ mod tests {
     fn unstarted_worker_slots_are_released() {
         let tracker = Arc::new(WorkerTracker::new(WORKER_COUNT));
         let worker_tracker = Arc::clone(&tracker);
+        let started = Arc::new(Barrier::new(2));
+        let worker_started = Arc::clone(&started);
         tracker.register(thread::spawn(move || {
-            thread::sleep(Duration::from_millis(5));
+            worker_started.wait();
             worker_tracker.done();
         }));
+        started.wait();
         tracker.complete_slots(WORKER_COUNT - 1);
         assert!(matches!(
             tracker.wait_until(Instant::now() + Duration::from_secs(1)),
             WorkerReap::Complete
         ));
+        assert!(tracker.is_reaped());
+    }
+
+    /// 同一 accounting mutex 必须覆盖 predicate 检查与进入 condvar，避免
+    /// done 在 waiter 释放 mutex 前发通知而造成永久丢唤醒。
+    #[test]
+    fn wait_until_does_not_lose_done_notification() {
+        let tracker = Arc::new(WorkerTracker::new(1));
+        let wait_hook = Arc::new(WaitGate {
+            entered: Barrier::new(2),
+            release: Barrier::new(2),
+        });
+        tracker
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wait_before_block = Some(Arc::clone(&wait_hook));
+
+        let waiter_tracker = Arc::clone(&tracker);
+        let waiter = thread::spawn(move || {
+            waiter_tracker.wait_until(Instant::now() + Duration::from_secs(1))
+        });
+        wait_hook.entered.wait();
+
+        let done_tracker = Arc::clone(&tracker);
+        let done_started = Arc::new(Barrier::new(2));
+        let done_start = Arc::clone(&done_started);
+        let done = thread::spawn(move || {
+            done_start.wait();
+            done_tracker.done();
+        });
+        done_started.wait();
+        wait_hook.release.wait();
+
+        done.join().unwrap();
+        assert!(matches!(waiter.join().unwrap(), WorkerReap::Complete));
+    }
+
+    /// join 不能因第一个 panic 短路，否则后续 worker 的句柄会被丢弃且
+    /// session 可能错误地把未回收的线程标成可复用。
+    #[test]
+    fn wait_until_joins_all_handles_after_first_panic() {
+        let tracker = Arc::new(WorkerTracker::new(2));
+        let first_tracker = Arc::clone(&tracker);
+        tracker.register(thread::spawn(move || {
+            let _guard = WorkerGuard::new(first_tracker);
+            panic!("intentional worker panic");
+        }));
+        let second_tracker = Arc::clone(&tracker);
+        tracker.register(thread::spawn(move || {
+            let _guard = WorkerGuard::new(second_tracker);
+        }));
+
+        assert!(matches!(
+            tracker.wait_until(Instant::now() + Duration::from_secs(1)),
+            WorkerReap::JoinFailed
+        ));
+        assert_eq!(tracker.joined.load(Ordering::Acquire), 2);
         assert!(tracker.is_reaped());
     }
 }

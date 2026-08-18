@@ -247,13 +247,17 @@ fn real_conpty_repeated_open_close_thirty_rounds() {
     let root = test_root();
     fs::create_dir_all(&root).unwrap();
     let supervisor = TerminalSupervisor::new(TerminalPolicy::new(&root).unwrap());
-    for _round in 0..30 {
+    for round in 0..30 {
+        // Keep one bounded progress marker per cycle so a native PTY hang is
+        // diagnosable without adding a second timeout or changing the close path.
+        eprintln!("conpty round {round}: open");
         let session = supervisor
             .open(LaunchRequest {
                 profile: super::super::model::ShellProfile::Cmd,
                 ..LaunchRequest::default()
             })
             .unwrap();
+        eprintln!("conpty round {round}: resize");
         session
             .resize(TerminalSize {
                 rows: 30,
@@ -272,6 +276,10 @@ fn real_conpty_repeated_open_close_thirty_rounds() {
                 output.extend(data);
             }
         }
+        eprintln!(
+            "conpty round {round}: cursor query observed={}",
+            output.windows(4).any(|window| window == b"\x1b[6n")
+        );
         session
             .send_input(b"\x1b[1;1R", Duration::from_secs(2))
             .unwrap();
@@ -281,6 +289,7 @@ fn real_conpty_repeated_open_close_thirty_rounds() {
         session
             .send_input(b"exit\r", Duration::from_secs(2))
             .unwrap();
+        eprintln!("conpty round {round}: waiting exit");
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut exited = false;
         while Instant::now() < deadline {
@@ -296,7 +305,9 @@ fn real_conpty_repeated_open_close_thirty_rounds() {
             }
         }
         assert!(exited, "ConPTY round did not emit Exited");
+        eprintln!("conpty round {round}: close");
         session.close(CloseReason::User).unwrap();
+        eprintln!("conpty round {round}: closed");
     }
     fs::remove_dir_all(root).unwrap();
 }
