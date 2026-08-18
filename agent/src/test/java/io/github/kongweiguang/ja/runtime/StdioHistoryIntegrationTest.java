@@ -115,15 +115,15 @@ final class StdioHistoryIntegrationTest {
             session.send(initializedFrame());
             assertEquals("ready", session.read().path("params").path("status").textValue());
 
-            session.send(request("c:empty", "workspace/open", "{")
+            session.send(request("c:empty", "workspace/open", "{"
                     + "\"workspaceId\":\"ws_bounds\",\"rootPath\":\"\","
                     + "\"trust\":\"trusted\"}"));
             assertInvalidParams(session.read());
-            session.send(request("c:root-long", "workspace/open", "{")
+            session.send(request("c:root-long", "workspace/open", "{"
                     + "\"workspaceId\":\"ws_bounds\",\"rootPath\":\""
                     + "x".repeat(4_097) + "\",\"trust\":\"trusted\"}"));
             assertInvalidParams(session.read());
-            session.send(request("c:name-long", "workspace/open", "{")
+            session.send(request("c:name-long", "workspace/open", "{"
                     + "\"workspaceId\":\"ws_bounds\",\"rootPath\":\""
                     + escape(workspace) + "\",\"displayName\":\""
                     + "x".repeat(257) + "\",\"trust\":\"trusted\"}"));
@@ -146,7 +146,7 @@ final class StdioHistoryIntegrationTest {
             assertEquals("c:init", session.read().path("id").textValue());
             session.send(initializedFrame());
             assertEquals("ready", session.read().path("params").path("status").textValue());
-            session.send(request("c:workspace", "workspace/open", "{")
+            session.send(request("c:workspace", "workspace/open", "{"
                     + "\"workspaceId\":\"ws_failure\",\"rootPath\":\""
                     + escape(workspace) + "\",\"trust\":\"trusted\"}"));
             assertEquals("c:workspace", session.read().path("id").textValue());
