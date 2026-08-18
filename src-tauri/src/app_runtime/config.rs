@@ -11,7 +11,7 @@ use crate::settings::{
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
@@ -969,7 +969,7 @@ pub fn bundled_launch_config(
     if executable != expected || !executable.starts_with(&resource_root) || !executable.is_file() {
         return Err(RuntimeCommandError::configuration());
     }
-    let run_dir = run_dir.into();
+    let run_dir = selected_runtime_dir(run_dir.into())?;
     let mut sidecar = bounded_sidecar(executable, run_dir);
     sidecar.args = vec![
         OsString::from("--runtime=production"),
@@ -1054,15 +1054,117 @@ fn encode_data_dir(path: &Path) -> Result<String, RuntimeCommandError> {
 /// Creates the app-data runtime directory and applies the narrowest native
 /// permission available; Tauri's app-data root remains the Windows boundary.
 pub fn prepare_run_dir(run_dir: impl AsRef<Path>) -> Result<PathBuf, RuntimeCommandError> {
-    let run_dir = run_dir.as_ref();
-    fs::create_dir_all(run_dir).map_err(|_| RuntimeCommandError::configuration())?;
+    // Tauri's Windows Known Folder lookup can ignore the APPDATA/LOCALAPPDATA
+    // values supplied by a desktop smoke test.  Resolve the debug-only final
+    // runtime directory before creating anything so a test can never create
+    // state below the developer's real app-data directory by accident.
+    let run_dir = selected_runtime_dir(run_dir.as_ref().to_path_buf())?;
+    fs::create_dir_all(&run_dir).map_err(|_| RuntimeCommandError::configuration())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(run_dir, fs::Permissions::from_mode(0o700))
+        fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
             .map_err(|_| RuntimeCommandError::configuration())?;
     }
     fs::canonicalize(run_dir).map_err(|_| RuntimeCommandError::configuration())
+}
+
+/// Selects the runtime directory once at the trusted native composition
+/// boundary.  `JA_E2E_RUNTIME_ROOT` is the final directory passed to Java, not
+/// a parent/base directory; release builds compile the hook out completely.
+fn selected_runtime_dir(default_root: PathBuf) -> Result<PathBuf, RuntimeCommandError> {
+    resolve_runtime_root(default_root, debug_runtime_root_override().as_deref())
+}
+
+/// Resolves a host-controlled debug directory while preserving a small,
+/// explicit filesystem boundary: it must be absolute, must not contain path
+/// traversal components, must not traverse a symlink/reparse point, and must
+/// end as a canonical directory rather than a filesystem root or file.
+fn resolve_runtime_root(
+    default_root: PathBuf,
+    override_root: Option<&OsStr>,
+) -> Result<PathBuf, RuntimeCommandError> {
+    let Some(raw_override) = override_root else {
+        return Ok(default_root);
+    };
+    let requested = PathBuf::from(raw_override);
+    if !requested.is_absolute() || is_filesystem_root(&requested) {
+        return Err(RuntimeCommandError::configuration());
+    }
+    validate_runtime_path_components(&requested)?;
+    match fs::symlink_metadata(&requested) {
+        Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
+            return Err(RuntimeCommandError::configuration());
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(RuntimeCommandError::configuration());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(RuntimeCommandError::configuration()),
+    }
+    fs::create_dir_all(&requested).map_err(|_| RuntimeCommandError::configuration())?;
+    let canonical =
+        fs::canonicalize(&requested).map_err(|_| RuntimeCommandError::configuration())?;
+    if !canonical.is_absolute() || is_filesystem_root(&canonical) {
+        return Err(RuntimeCommandError::configuration());
+    }
+    let metadata =
+        fs::symlink_metadata(&canonical).map_err(|_| RuntimeCommandError::configuration())?;
+    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) || !metadata.is_dir() {
+        return Err(RuntimeCommandError::configuration());
+    }
+    Ok(canonical)
+}
+
+/// Checks every existing component before directory creation so an E2E root
+/// cannot escape through an existing symlink/junction or a `..` segment.
+fn validate_runtime_path_components(path: &Path) -> Result<(), RuntimeCommandError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        if matches!(component, Component::CurDir | Component::ParentDir) {
+            return Err(RuntimeCommandError::configuration());
+        }
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
+                return Err(RuntimeCommandError::configuration());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(RuntimeCommandError::configuration()),
+        }
+    }
+    Ok(())
+}
+
+/// Avoids accepting a drive/root directory as a mutable runtime state target.
+fn is_filesystem_root(path: &Path) -> bool {
+    path.parent().is_none() || path.parent() == Some(path)
+}
+
+/// Reads the E2E runtime hook only in debug builds; the generic lookup keeps
+/// the release-cfg guarantee directly unit-testable without mutating process
+/// environment variables in parallel tests.
+#[cfg(debug_assertions)]
+fn debug_runtime_root_override() -> Option<OsString> {
+    runtime_root_override_from(|name| std::env::var_os(name))
+}
+
+/// Release binaries intentionally have no environment-controlled runtime path.
+#[cfg(not(debug_assertions))]
+fn debug_runtime_root_override() -> Option<OsString> {
+    None
+}
+
+#[cfg(debug_assertions)]
+/// Keeps the debug seam's environment lookup injectable so cfg behavior can
+/// be tested without racing other Rust tests over the process environment.
+fn runtime_root_override_from<F>(lookup: F) -> Option<OsString>
+where
+    F: FnOnce(&str) -> Option<OsString>,
+{
+    lookup("JA_E2E_RUNTIME_ROOT")
 }
 
 #[cfg(debug_assertions)]
@@ -1077,6 +1179,7 @@ impl LaunchConfig {
         if !java.is_absolute() || !java.is_file() || !jar.is_absolute() || !jar.is_file() {
             return Err(RuntimeCommandError::configuration());
         }
+        let run_dir = selected_runtime_dir(run_dir)?;
         let mut sidecar = bounded_sidecar(java, run_dir);
         sidecar.args = vec![
             OsString::from("-jar"),
@@ -1548,6 +1651,91 @@ mod tests {
             result,
             Err(error) if error == RuntimeCommandError::configuration()
         ));
+    }
+
+    /// A debug E2E root is the final runtime directory and is created only
+    /// after absolute, traversal-free, canonical-directory validation.
+    #[test]
+    fn runtime_root_override_is_created_and_canonicalized() {
+        let parent = std::env::temp_dir().join(format!("ja-e2e-runtime-parent-{}", Uuid::new_v4()));
+        let requested = parent.join("runtime");
+        let default = parent.join("default-runtime");
+        let resolved = resolve_runtime_root(default, Some(requested.as_os_str()))
+            .expect("valid runtime override");
+        assert_eq!(
+            resolved,
+            fs::canonicalize(&requested).expect("canonical runtime root")
+        );
+        assert!(resolved.is_dir());
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    /// Relative, parent-traversing, and file-valued overrides fail closed
+    /// before they can create or redirect any runtime state.
+    #[test]
+    fn runtime_root_override_rejects_invalid_boundaries() {
+        let parent =
+            std::env::temp_dir().join(format!("ja-e2e-runtime-invalid-{}", Uuid::new_v4()));
+        let default = parent.join("default-runtime");
+        assert_eq!(
+            resolve_runtime_root(default.clone(), Some(OsStr::new("relative-runtime"))),
+            Err(RuntimeCommandError::configuration())
+        );
+        assert_eq!(
+            resolve_runtime_root(
+                default.clone(),
+                Some(parent.join("..").join("escape").as_os_str()),
+            ),
+            Err(RuntimeCommandError::configuration())
+        );
+        let file = parent.join("runtime-file");
+        fs::create_dir_all(&parent).expect("invalid test parent");
+        fs::write(&file, b"not a directory").expect("invalid runtime file");
+        assert_eq!(
+            resolve_runtime_root(default, Some(file.as_os_str())),
+            Err(RuntimeCommandError::configuration())
+        );
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    /// The sidecar argument carries the canonical final runtime directory,
+    /// proving Java receives the isolated E2E target rather than a base path.
+    #[test]
+    fn runtime_root_override_is_the_encoded_sidecar_directory() {
+        let parent = std::env::temp_dir().join(format!("ja-e2e-runtime-argv-{}", Uuid::new_v4()));
+        let requested = parent.join("runtime");
+        let resolved = resolve_runtime_root(parent.join("default"), Some(requested.as_os_str()))
+            .expect("runtime override");
+        let sidecar = bounded_sidecar(PathBuf::from("java"), resolved.clone());
+        let encoded = encode_data_dir(&sidecar.run_dir).expect("encoded runtime directory");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .expect("decoded runtime directory");
+        assert_eq!(
+            PathBuf::from(String::from_utf8(decoded).expect("utf8 runtime path")),
+            resolved
+        );
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    /// Debug builds read exactly the host-controlled E2E variable and no other
+    /// name, keeping the test seam explicit and reviewable.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_runtime_root_hook_reads_expected_name() {
+        assert_eq!(
+            runtime_root_override_from(|name| Some(OsString::from(name))),
+            Some(OsString::from("JA_E2E_RUNTIME_ROOT"))
+        );
+    }
+
+    /// Release builds must ignore even a supplied lookup closure, proving the
+    /// debug-only environment seam cannot be enabled by production packaging.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_runtime_root_hook_is_compile_time_disabled() {
+        let value = debug_runtime_root_override();
+        assert_eq!(value, None);
     }
 
     /// Native launch arguments carry only URL-safe ASCII for the data path;
