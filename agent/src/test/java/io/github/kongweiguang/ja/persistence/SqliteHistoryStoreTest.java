@@ -27,7 +27,14 @@ final class SqliteHistoryStoreTest extends PersistenceTestSupport {
             // workspace/open performs the real directory check before reaching this adapter.
             SqliteHistoryStore.ThreadSnapshot thread = history.createThread(
                     "thr_history", "ws_history", "History");
-            history.recordUserMessage("thr_history", "turn_history", "inspect source");
+            SqliteHistoryStore.UserMessageRecord user = history.recordUserMessage(
+                    "thr_history", "turn_history", "inspect source");
+            SqliteHistoryStore.UserMessageRecord replay = history.recordUserMessage(
+                    "thr_history", "turn_history", "inspect source");
+            assertEquals(1L, user.seq());
+            assertEquals(user.seq(), replay.seq());
+            assertEquals(1L, history.readThread(thread.threadId()).orElseThrow()
+                    .thread().lastSeq());
 
             ObjectNodeFactory events = new ObjectNodeFactory();
             TurnEvent started = history.appendEvent(events.turnStarted("thr_history", "turn_history"));
@@ -45,7 +52,36 @@ final class SqliteHistoryStoreTest extends PersistenceTestSupport {
             assertEquals(3L, restored.thread().lastSeq());
             assertEquals(2, restored.items().size());
             assertEquals("user_message", restored.items().get(0).path("kind").textValue());
+            assertEquals("item_user_history", restored.items().get(0).path("itemId").textValue());
             assertEquals("agent_message", restored.items().get(1).path("kind").textValue());
+        }
+    }
+
+    /** Keeps the maximum legal turn identity from creating an overlong persisted user item. */
+    @Test
+    void longTurnIdUsesBoundedStableUserItemIdentity() {
+        SqlitePersistenceConfig config = config("history-long-turn");
+        String turnId = "turn_" + "t".repeat(96);
+        try (SqlitePersistence persistence = SqlitePersistence.open(config)) {
+            SqliteHistoryStore history = persistence.history();
+            history.upsertWorkspace("ws_long_turn", temp.resolve("workspace"), "JA", "trusted");
+            history.createThread("thr_long_turn", "ws_long_turn", "Long turn");
+
+            SqliteHistoryStore.UserMessageRecord first = history.recordUserMessage(
+                    "thr_long_turn", turnId, "inspect source");
+            SqliteHistoryStore.UserMessageRecord replay = history.recordUserMessage(
+                    "thr_long_turn", turnId, "inspect source");
+            String itemId = first.item().path("itemId").textValue();
+            assertTrue(itemId.matches("^item_user_[0-9a-f]{32}$"));
+            assertTrue(itemId.length() <= 101);
+            assertEquals(itemId, replay.item().path("itemId").textValue());
+            assertEquals(first.seq(), replay.seq());
+
+            SqliteHistoryStore.ThreadReadSnapshot snapshot = history.readThread("thr_long_turn")
+                    .orElseThrow();
+            assertEquals(1, snapshot.items().size());
+            assertEquals(itemId, snapshot.items().get(0).path("itemId").textValue());
+            assertEquals(turnId, snapshot.items().get(0).path("turnId").textValue());
         }
     }
 

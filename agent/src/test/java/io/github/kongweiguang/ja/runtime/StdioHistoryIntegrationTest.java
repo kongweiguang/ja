@@ -75,6 +75,14 @@ final class StdioHistoryIntegrationTest {
             session.send(turnStart(threadId));
             JsonNode accepted = session.read();
             assertFalse(accepted.has("error"), accepted.toString());
+            String turnId = accepted.path("result").path("turnId").textValue();
+            JsonNode userEvent = session.read();
+            assertFrozenUserItemEvent(userEvent, threadId, turnId);
+            assertEquals("inspect source", userEvent.path("params").path("item")
+                    .path("text").textValue());
+            JsonNode started = session.read();
+            assertEquals("turn/started", started.path("method").textValue());
+            assertEquals(2L, started.path("params").path("seq").longValue());
             boolean completed = false;
             while (!completed) {
                 JsonNode frame = session.read();
@@ -83,6 +91,12 @@ final class StdioHistoryIntegrationTest {
                 }
                 completed = "turn/completed".equals(frame.path("method").textValue());
             }
+            // The connection-level request tombstone rejects a replay before it can start a
+            // second runtime turn or ask history to allocate another user-item sequence.
+            session.send(turnStart(threadId));
+            JsonNode replay = session.read();
+            assertEquals("DUPLICATE_REQUEST", replay.path("error").path("data")
+                    .path("jaCode").textValue());
             session.send(request("c:read", "thread/read", "{\"threadId\":\""
                     + threadId + "\"}"));
             JsonNode read = session.read();
@@ -166,6 +180,20 @@ final class StdioHistoryIntegrationTest {
     private static void assertInvalidParams(JsonNode frame) {
         assertEquals("INVALID_PARAMS", frame.path("error").path("data").path("jaCode").textValue(),
                 frame.toString());
+    }
+
+    /** Validates the complete frozen identity envelope before the timeline reducer can consume it. */
+    private static void assertFrozenUserItemEvent(JsonNode event, String threadId, String turnId) {
+        assertEquals("item/completed", event.path("method").textValue(), event.toString());
+        JsonNode params = event.path("params");
+        assertTrue(params.path("serverInstanceId").isTextual(), event.toString());
+        assertEquals(threadId, params.path("threadId").textValue());
+        assertEquals(turnId, params.path("turnId").textValue());
+        assertEquals(1L, params.path("seq").longValue());
+        assertTrue(params.path("eventId").asText().startsWith("evt_"), event.toString());
+        assertTrue(params.path("occurredAt").isTextual(), event.toString());
+        assertEquals("user_message", params.path("item").path("kind").textValue());
+        assertEquals("completed", params.path("item").path("status").textValue());
     }
 
     /** Keeps one pipe session isolated so stdout remains the only parsed protocol surface. */

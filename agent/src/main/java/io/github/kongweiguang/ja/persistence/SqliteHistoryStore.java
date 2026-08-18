@@ -9,6 +9,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.protocol.JsonNodes;
 import io.github.kongweiguang.ja.runtime.TurnEvent;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -29,9 +30,11 @@ import java.util.UUID;
  */
 public final class SqliteHistoryStore {
     private static final int MAX_TEXT_LENGTH = 1_048_576;
+    private static final int MAX_IDENTIFIER_LENGTH = 101;
     private static final int MAX_LIST_ROWS = 500;
     private static final int MAX_THREAD_ITEMS = 10_000;
     private static final int MAX_ROOT_PATH_LENGTH = 4_096;
+    private static final String USER_ITEM_ID_PREFIX = "item_user_";
     private static final ObjectMapper JSON = new ObjectMapper();
     private final SqlitePersistence persistence;
 
@@ -210,26 +213,58 @@ public final class SqliteHistoryStore {
         });
     }
 
-    /** Persists the user input as a completed item before provider work begins. */
-    public void recordUserMessage(String threadId, String turnId, String text) {
+    /**
+     * Persists the user input before provider work becomes visible and returns the exact durable
+     * sequence/item admitted by this transaction.  Returning the committed projection lets the
+     * stdio layer publish the same item without allocating a second sequence or writing a second
+     * event row, which keeps restart snapshots and live timelines on one source of truth.
+     */
+    public UserMessageRecord recordUserMessage(String threadId, String turnId, String text) {
         requireIdentifier(threadId, "thr_");
         requireIdentifier(turnId, "turn_");
         requireText(text, "text", MAX_TEXT_LENGTH);
-        persistence.commit(text.length(), "thread-user-item", connection -> {
+        return persistence.commit(text.length(), "thread-user-item", connection -> {
             ThreadSnapshot thread = requireThread(connection, threadId);
-            long seq = nextSequence(thread.lastSeq());
             ObjectNode item = JsonNodes.object();
-            String itemId = "item_user_" + turnId.substring("turn_".length());
+            String itemId = userMessageItemId(turnId);
             item.put("itemId", itemId);
             item.put("turnId", turnId);
             item.put("kind", "user_message");
             item.put("status", "completed");
             item.put("text", text);
             item.put("title", "User message");
+            Optional<StoredItem> existing = findItem(connection, threadId, itemId);
+            if (existing.isPresent()) {
+                StoredItem stored = existing.get();
+                if (!turnId.equals(stored.item().path("turnId").asText(null))
+                        || !text.equals(stored.item().path("text").asText(null))) {
+                    throw new PersistenceException(PersistenceException.Code.CAS_CONFLICT,
+                            "user message identity was already used with different content");
+                }
+                return new UserMessageRecord(threadId, turnId, stored.firstSeq(), stored.item());
+            }
+            long seq = nextSequence(thread.lastSeq());
             upsertItem(connection, threadId, item, seq);
             updateThread(connection, threadId, seq, thread.status(), turnId);
-            return null;
+            return new UserMessageRecord(threadId, turnId, seq, item);
         });
+    }
+
+    /**
+     * Keeps the historical user-item id for ordinary turns, but hashes only oversized turn ids
+     * into the frozen 101-character ASCII identity space.  The deterministic fallback preserves
+     * replay identity; the existing turn/text CAS check remains the collision fail-closed guard.
+     */
+    private static String userMessageItemId(String turnId) {
+        String compatible = USER_ITEM_ID_PREFIX + turnId.substring("turn_".length());
+        if (compatible.length() <= MAX_IDENTIFIER_LENGTH) {
+            return compatible;
+        }
+        String digest = UUID.nameUUIDFromBytes(("user-message|" + turnId)
+                .getBytes(StandardCharsets.UTF_8)).toString().replace("-", "");
+        String bounded = USER_ITEM_ID_PREFIX + digest;
+        requireIdentifier(bounded, USER_ITEM_ID_PREFIX);
+        return bounded;
     }
 
     /** Assigns the next durable sequence and returns a live event with that sequence. */
@@ -321,6 +356,21 @@ public final class SqliteHistoryStore {
             statement.setString(1, threadId);
             try (ResultSet result = statement.executeQuery()) {
                 return result.next() ? Optional.of(readThread(result)) : Optional.empty();
+            }
+        }
+    }
+
+    /** Reads one item inside the admission transaction so retries reuse its original sequence. */
+    private static Optional<StoredItem> findItem(Connection connection, String threadId,
+                                                 String itemId) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT first_seq, payload FROM thread_item_history "
+                        + "WHERE thread_id = ? AND item_id = ?")) {
+            statement.setString(1, threadId);
+            statement.setString(2, itemId);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() ? Optional.of(new StoredItem(result.getLong(1),
+                        parseItem(result.getString(2)))) : Optional.empty();
             }
         }
     }
@@ -513,7 +563,30 @@ public final class SqliteHistoryStore {
         }
     }
 
+    /** Immutable admission result shared by persistence and the one stdio live-event projection. */
+    public record UserMessageRecord(String threadId, String turnId, long seq, ObjectNode item) {
+        /** Copies the JSON item so a queued notification cannot mutate the durable projection. */
+        public UserMessageRecord {
+            requireIdentifier(threadId, "thr_");
+            requireIdentifier(turnId, "turn_");
+            if (seq < 1) {
+                throw new IllegalArgumentException("user message sequence must be positive");
+            }
+            item = Objects.requireNonNull(item, "item").deepCopy();
+        }
+
+        /** Returns a defensive copy because ObjectNode is mutable by design. */
+        @Override
+        public ObjectNode item() {
+            return item.deepCopy();
+        }
+    }
+
     /** Keeps event item extraction typed without adding a product-level model hierarchy. */
     private record JsonNodeItem(ObjectNode item) {
+    }
+
+    /** Couples the stored item payload to its first sequence without exposing SQL columns. */
+    private record StoredItem(long firstSeq, ObjectNode item) {
     }
 }

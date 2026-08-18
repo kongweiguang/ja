@@ -371,8 +371,15 @@ class StdioRuntimeChildIntegrationTest {
             assertEquals("c:turn", accepted.path("id").textValue());
             String turnId = accepted.path("result").path("turnId").textValue();
             assertTrue(turnId.startsWith("turn_fake_"));
+            JsonNode userMessage = readJson(output);
+            assertEquals("item/completed", userMessage.path("method").textValue());
+            assertEquals(1L, userMessage.path("params").path("seq").longValue());
+            assertEquals(turnId, userMessage.path("params").path("turnId").textValue());
+            assertEquals("user_message", userMessage.path("params").path("item")
+                    .path("kind").textValue());
             JsonNode started = readJson(output);
             assertEquals("turn/started", started.path("method").textValue());
+            assertEquals(2L, started.path("params").path("seq").longValue());
             send(input, turnCancelFrame(turnId));
 
             boolean cancelSeen = false;

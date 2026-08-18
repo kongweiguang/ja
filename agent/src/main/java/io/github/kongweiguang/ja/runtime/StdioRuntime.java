@@ -1758,6 +1758,7 @@ public final class StdioRuntime implements AutoCloseable {
         TurnEventAdmissionGate eventGate = new TurnEventAdmissionGate();
         TurnRuntime runtime = activeTurnRuntime.get();
         TurnHandle handle = null;
+        SqliteHistoryStore.UserMessageRecord userMessage = null;
         String threadId = null;
         boolean admitted = false;
         try {
@@ -1780,14 +1781,22 @@ public final class StdioRuntime implements AutoCloseable {
                 publishTurnEventAfterStartResponse(eventGate, event);
             });
             if (history != null && workspaceBinding != null) {
-                history.recordUserMessage(threadId, handle.turnId().value(), userText);
+                userMessage = history.recordUserMessage(threadId, handle.turnId().value(), userText);
             }
             ObjectNode result = JsonNodes.object();
             result.put("accepted", true);
             result.put("turnId", handle.turnId().value());
             result.put("queued", false);
             result.put("status", "queued");
-            sendResponse(RpcResponse.success(request, result));
+            // The success response is the first writer admission boundary.  The persisted user
+            // item follows it in the same queue, and only then may producer callbacks leave the
+            // gate, so clients cannot observe seq=2 before the already-committed seq=1 item.
+            if (!sendResponse(RpcResponse.success(request, result))) {
+                return;
+            }
+            if (userMessage != null && !sendResponse(userMessageEvent(userMessage))) {
+                return;
+            }
             eventGate.admit();
             admitted = true;
         } catch (RuntimeException exception) {
@@ -1982,6 +1991,29 @@ public final class StdioRuntime implements AutoCloseable {
                 }
             }
         }
+    }
+
+    /** Projects the committed user row without re-entering history or allocating another seq. */
+    private RpcNotification userMessageEvent(SqliteHistoryStore.UserMessageRecord userMessage) {
+        ObjectNode params = JsonNodes.object();
+        params.put("serverInstanceId", serverInstanceId.value());
+        params.put("threadId", userMessage.threadId());
+        params.put("turnId", userMessage.turnId());
+        params.put("seq", userMessage.seq());
+        params.put("eventId", userMessageEventId(userMessage));
+        params.put("occurredAt", clock.instant().toString());
+        params.set("item", userMessage.item());
+        return new RpcNotification("item/completed", params, RpcDirection.SERVER_TO_CLIENT);
+    }
+
+    /** Derives a bounded stable event id so replay cannot create a second identity for one item. */
+    private String userMessageEventId(SqliteHistoryStore.UserMessageRecord userMessage) {
+        String identity = serverInstanceId.value() + "|" + userMessage.threadId() + "|"
+                + userMessage.turnId();
+        String digest = java.util.UUID.nameUUIDFromBytes(
+                identity.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+                .toString().replace("-", "");
+        return "evt_user_" + digest;
     }
 
     /**
