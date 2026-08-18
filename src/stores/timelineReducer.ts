@@ -472,6 +472,35 @@ function applyItem(state: TimelineState, item: Item, threadId: string): Timeline
 }
 
 /**
+ * Allows the durable user item to lead a turn because Java commits and emits
+ * that item immediately after the start ACK, while AgentScope publishes the
+ * asynchronous `turn/started` event later.  The narrow kind/status check keeps
+ * every agent/tool item subject to the existing turn-before-item invariant.
+ */
+function canAdmitDurableUserItemBeforeTurn(method: string, item: Item): boolean {
+  return method === "item/completed" && item.kind === "user_message" && item.status === "completed";
+}
+
+/**
+ * Checks the early user-item projection before accepting its later turn.  The
+ * item may arrive before AgentScope knows the turn, but once the turn arrives
+ * every existing item with that turn identity must remain on its event thread.
+ */
+function turnItemsBelongToThread(state: TimelineState, turnId: string, threadId: string): boolean {
+  for (const [ownerThreadId, itemIds] of Object.entries(state.itemIdsByThread)) {
+    if (ownerThreadId === threadId) {
+      continue;
+    }
+    if (itemIds.some((itemId) => state.items[itemId]?.turnId === turnId)) {
+      return false;
+    }
+  }
+  return Object.entries(state.items)
+    .filter(([, item]) => item.turnId === turnId)
+    .every(([itemId]) => state.itemThreadById[itemId] === threadId);
+}
+
+/**
  * Upserts a request by approvalId so replayed requests cannot render a second
  * card; an existing terminal decision is deliberately retained as authority.
  */
@@ -578,12 +607,18 @@ function applyThreadEvent(state: TimelineState, event: Extract<JaEvent, { thread
         if (parsed.turn.threadId !== event.threadId) {
           return resync(state, key, "invalid_event");
         }
+        if (!turnItemsBelongToThread(next, parsed.turn.turnId, event.threadId)) {
+          return resync(state, key, "invalid_event");
+        }
         next = applyTurn(next, parsed.turn);
         break;
       }
       case "turn/completed": {
         const parsed = TurnCompletedParamsSchema.parse(event.params);
         if (parsed.turn.threadId !== event.threadId) {
+          return resync(state, key, "invalid_event");
+        }
+        if (!turnItemsBelongToThread(next, parsed.turn.turnId, event.threadId)) {
           return resync(state, key, "invalid_event");
         }
         next = applyTurn(next, parsed.turn);
@@ -602,8 +637,13 @@ function applyThreadEvent(state: TimelineState, event: Extract<JaEvent, { thread
         if (knownThreadId !== undefined && knownThreadId !== event.threadId) {
           return resync(state, key, "invalid_event");
         }
+        const durableUserItem = canAdmitDurableUserItemBeforeTurn(event.method, parsed.item);
+        if (durableUserItem && turn !== undefined && turn.threadId !== event.threadId) {
+          return resync(state, key, "invalid_event");
+        }
         if (
           knownThreadId === undefined &&
+          !durableUserItem &&
           (event.method !== "item/started" || turn === undefined || turn.threadId !== event.threadId)
         ) {
           return resync(state, key, "missing_item");

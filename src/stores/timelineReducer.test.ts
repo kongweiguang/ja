@@ -113,6 +113,84 @@ describe("runtime-owned timeline reducer", () => {
     expect(duplicate.lastOutcome).toBe("duplicate");
   });
 
+  it("accepts the durable user item before AgentScope publishes turn/started", () => {
+    const ready = applySnapshot(readyState(), {
+      ...snapshot,
+      thread: { ...snapshot.thread, lastSeq: 0 },
+      snapshotSeq: 0,
+    });
+    const userItem = {
+      itemId: "item_user_one",
+      turnId: "turn_one",
+      kind: "user_message" as const,
+      status: "completed" as const,
+      title: "User message",
+      text: "hello",
+    };
+    const user = applyLiveEvent(ready, event(1, "evt_user_one", { item: userItem }, "item/completed"));
+    expect(user.lastOutcome).toBe("applied");
+    expect(user.items["item_user_one"]).toEqual(userItem);
+    expect(user.itemIdsByThread["thr_one"]).toEqual(["item_user_one"]);
+
+    const started = applyLiveEvent(user, event(2, "evt_turn_one", { turn }));
+    expect(started.lastOutcome).toBe("applied");
+    expect(started.turns["turn_one"]).toEqual(turn);
+    expect(started.resyncRequired["thr_one"]).toBeUndefined();
+  });
+
+  it("rejects an early user item that targets a known turn from another thread", () => {
+    const ready = applySnapshot(readyState(), {
+      ...snapshot,
+      thread: { ...snapshot.thread, lastSeq: 0 },
+      snapshotSeq: 0,
+    });
+    const foreignTurn = { ...turn, turnId: "turn_other", threadId: "thr_two" };
+    const knownForeignTurn = applyLiveEvent(
+      ready,
+      event(1, "evt_foreign_turn", { turn: foreignTurn }, "turn/started", "thr_two"),
+    );
+    const userItem = {
+      itemId: "item_user_foreign",
+      turnId: "turn_other",
+      kind: "user_message" as const,
+      status: "completed" as const,
+      title: "User message",
+      text: "hello",
+    };
+    const rejected = applyLiveEvent(
+      knownForeignTurn,
+      event(1, "evt_user_foreign", { item: userItem }, "item/completed"),
+    );
+    expect(rejected.lastOutcome).toBe("resync_required");
+    expect(rejected.resyncRequired["thr_one"]).toBe("invalid_event");
+    expect(rejected.items["item_user_foreign"]).toBeUndefined();
+  });
+
+  it("rejects a later turn start on another thread for an early item", () => {
+    const ready = applySnapshot(readyState(), {
+      ...snapshot,
+      thread: { ...snapshot.thread, lastSeq: 0 },
+      snapshotSeq: 0,
+    });
+    const userItem = {
+      itemId: "item_user_one",
+      turnId: "turn_one",
+      kind: "user_message" as const,
+      status: "completed" as const,
+      title: "User message",
+      text: "hello",
+    };
+    const user = applyLiveEvent(ready, event(1, "evt_user_one", { item: userItem }, "item/completed"));
+    const wrongThreadTurn = { ...turn, threadId: "thr_two" };
+    const rejected = applyLiveEvent(
+      user,
+      event(1, "evt_wrong_thread_turn", { turn: wrongThreadTurn }, "turn/started", "thr_two"),
+    );
+    expect(rejected.lastOutcome).toBe("resync_required");
+    expect(rejected.resyncRequired["thr_two"]).toBe("invalid_event");
+    expect(rejected.turns["turn_one"]).toBeUndefined();
+  });
+
   it("requires resync for a sequence gap and never guesses missing work", () => {
     const ready = applySnapshot(readyState(), snapshot);
     const gap = applyLiveEvent(ready, event(4, "evt_four", { turn }));
