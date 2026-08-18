@@ -24,7 +24,9 @@ export const JA_RUNTIME_COMMANDS = {
   recoveryState: "ja_runtime_recovery_state",
   acknowledgeRecovery: "ja_runtime_acknowledge_recovery",
   approvalRespond: "ja_approval_respond",
+  configure: "ja_runtime_configure",
   turnStart: "ja_turn_start",
+  turnCancel: "ja_turn_cancel",
 } as const;
 
 export const JA_RUNTIME_EVENTS = {
@@ -83,6 +85,99 @@ const TurnStartInputSchema = z.object({
   input: z.array(InputPartSchema).min(1).max(128),
 }).strict();
 
+/**
+ * Mirrors Rust's `RuntimeConfigureInput` so the WebView can only submit the
+ * frozen workspace/settings snapshot that the native host understands.  The
+ * nested shape stays strict because an unknown settings field could otherwise
+ * silently diverge from the native validation path.
+ */
+const CredentialRefSchema = z.string().regex(/^cred_[A-Za-z0-9][A-Za-z0-9._-]{0,94}$/).max(100);
+const RuntimeConfigWorkspaceIdSchema = z.string().regex(/^ws_[A-Za-z0-9][A-Za-z0-9._-]{0,123}$/).max(128);
+const RuntimeConfigProfileRevisionSchema = z.string().regex(/^profile_[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/).max(128);
+const RuntimeConfigSkillRevisionSchema = z.string().regex(/^skill_[A-Za-z0-9][A-Za-z0-9._-]{0,121}$/).max(128);
+const RuntimeConfigMcpRevisionSchema = z.string().regex(/^mcp_[A-Za-z0-9][A-Za-z0-9._-]{0,123}$/).max(128);
+const ModelProfileSettingSchema = z.object({
+  profileRevision: RuntimeConfigProfileRevisionSchema,
+  name: z.string().min(1).max(512),
+  provider: z.string().min(1).max(512),
+  protocol: z.enum(["anthropic_messages", "openai_chat_completions"]),
+  model: z.string().min(1).max(512),
+  baseUrl: z.string().max(512).nullable().optional(),
+  credentialRef: CredentialRefSchema.nullable().optional(),
+  supportsVision: z.boolean().optional(),
+  accessMode: z.enum(["read_only", "workspace", "full_access"]).optional(),
+  skillRevisions: z.array(RuntimeConfigSkillRevisionSchema).max(128).optional(),
+  mcpRevisions: z.array(RuntimeConfigMcpRevisionSchema).max(128).nullable().optional(),
+}).strict();
+
+const McpAuthSettingSchema = z.object({
+  kind: z.enum(["none", "bearer", "header", "env"]),
+  name: z.string().max(128).nullable().optional(),
+  credentialRef: CredentialRefSchema.nullable().optional(),
+}).strict();
+
+const McpServerSettingSchema = z.object({
+  mcpRevision: RuntimeConfigMcpRevisionSchema,
+  name: z.string().min(1).max(512),
+  transport: z.enum(["stdio", "streamable_http"]),
+  endpoint: z.string().min(1).max(4096),
+  protocolVersion: z.enum(["2024-11-05", "2025-03-26", "2025-06-18"]),
+  args: z.array(z.string().max(4096)).max(64).optional(),
+  env: z.record(z.string().max(128), z.string().max(4096)).optional(),
+  headers: z.record(z.string().max(128), z.string().max(4096)).optional(),
+  queryParams: z.record(z.string().max(128), z.string().max(4096)).optional(),
+  auth: McpAuthSettingSchema.nullable().optional(),
+  credentialRef: CredentialRefSchema.nullable().optional(),
+  enabled: z.boolean().optional(),
+}).strict();
+
+const WindowSettingsSchema = z.object({
+  width: z.number().int().min(0).max(16_384).optional(),
+  height: z.number().int().min(0).max(16_384).optional(),
+  maximized: z.boolean().optional(),
+}).strict();
+
+const SettingsDocumentSchema = z.object({
+  schemaVersion: z.number().int().min(0).max(4_294_967_295),
+  revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+  theme: z.enum(["system", "light", "dark"]).optional(),
+  activeProfileRevision: RuntimeConfigProfileRevisionSchema.nullable().optional(),
+  profiles: z.array(ModelProfileSettingSchema).max(128).optional(),
+  mcpServers: z.array(McpServerSettingSchema).max(128).optional(),
+  window: WindowSettingsSchema,
+}).strict();
+
+const RuntimeConfigureInputSchema = z.object({
+  workspaceId: RuntimeConfigWorkspaceIdSchema,
+  rootPath: z.string().min(1).max(4096),
+  displayName: z.string().min(1).max(256).nullable().optional(),
+  trust: z.enum(["untrusted", "trusted"]),
+  settings: SettingsDocumentSchema,
+}).strict();
+
+const RuntimeConfigurationStatusSchema = z.object({
+  configured: z.boolean(),
+  profileRevision: RuntimeConfigProfileRevisionSchema,
+  mcpCount: z.number().int().min(0).max(128),
+}).strict();
+
+/**
+ * Mirrors Rust's cancel DTO.  A missing reason is intentional: cancellation
+ * is valid without a user-facing explanation and the native host bounds it
+ * again before forwarding to Java.
+ */
+const TurnCancelInputSchema = z.object({
+  threadId: z.string().regex(/^thr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(100),
+  turnId: z.string().regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(101),
+  reason: z.string().max(512).nullable().optional(),
+}).strict();
+
+const TurnCancelResultSchema = z.object({
+  accepted: z.literal(true),
+  turnId: z.string().regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(101),
+  status: z.enum(["interrupting", "interrupted"]),
+}).strict();
+
 const TurnAcceptedSchema = z.object({
   accepted: z.boolean(),
   turnId: z.string().regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).max(128),
@@ -128,6 +223,10 @@ export type RecoveryReason = z.infer<typeof RecoveryReasonSchema>;
 export type ManualRecoveryConfirmation = z.infer<typeof ManualRecoveryConfirmationSchema>;
 export type TurnStartInput = z.infer<typeof TurnStartInputSchema>;
 export type TurnAccepted = z.infer<typeof TurnAcceptedSchema>;
+export type RuntimeConfigureInput = z.input<typeof RuntimeConfigureInputSchema>;
+export type RuntimeConfigurationStatus = z.infer<typeof RuntimeConfigurationStatusSchema>;
+export type TurnCancelInput = z.infer<typeof TurnCancelInputSchema>;
+export type TurnCancelResult = z.infer<typeof TurnCancelResultSchema>;
 export type ApprovalResponseInput = z.infer<typeof ApprovalResponseInputSchema>;
 
 const SAFE_RUNTIME_REASONS = new Set([
@@ -172,7 +271,7 @@ export interface RuntimeNativeBridge {
   listen<T>(event: string, handler: (payload: T) => void): Promise<UnlistenFn>;
 }
 
-const defaultNativeBridge: RuntimeNativeBridge = {
+export const defaultNativeBridge: RuntimeNativeBridge = {
   invoke: tauriInvoke,
   listen: async <T>(event: string, handler: (payload: T) => void) => {
     const unlisten = await tauriListen(event, (eventPayload) => {
@@ -187,6 +286,7 @@ const SAFE_RUNTIME_ERRORS: Record<string, { message: string; retryable: boolean 
   RUNTIME_CONFIG_INVALID: { message: "运行时配置不可用", retryable: false },
   INVALID_PARAMS: { message: "运行时请求参数无效", retryable: false },
   RUNTIME_UNAVAILABLE: { message: "运行时暂不可用", retryable: true },
+  PROFILE_UNAVAILABLE: { message: "未配置可用模型", retryable: false },
   RUNTIME_QUEUE_FULL: { message: "运行时队列已满，请稍后重试", retryable: true },
   RUNTIME_COMMAND_DEADLINE: { message: "运行时请求超时", retryable: true },
   RUNTIME_SHUTDOWN_TIMEOUT: { message: "运行时未能在期限内停止", retryable: true },
@@ -194,6 +294,37 @@ const SAFE_RUNTIME_ERRORS: Record<string, { message: string; retryable: boolean 
   RECOVERY_REQUIRED: { message: "需要先完成运行时恢复", retryable: false },
   RECOVERY_STALE: { message: "恢复状态已变化，请重新读取", retryable: true },
   SENSITIVE_EVENT_BLOCKED: { message: "运行时事件包含受保护数据", retryable: false },
+  PROTOCOL_INCOMPATIBLE: { message: "运行时协议不兼容", retryable: false },
+  RUNTIME_FAULTED: { message: "运行时已故障", retryable: false },
+  RUNTIME_BACKOFF: { message: "运行时正在退避", retryable: true },
+  SHUTTING_DOWN: { message: "运行时正在关闭", retryable: true },
+  RUNTIME_NOT_READY: { message: "运行时未就绪", retryable: true },
+  RUNTIME_TIMEOUT: { message: "运行时超时", retryable: true },
+  SIDECAR_CRASHED: { message: "运行时进程已退出", retryable: true },
+  RUNTIME_PROTOCOL_ERROR: { message: "运行时协议错误", retryable: false },
+  APPROVAL_ALREADY_RESOLVED: { message: "审批已处理", retryable: false },
+  APPROVAL_NOT_FOUND: { message: "审批不存在", retryable: false },
+  THREAD_BUSY: { message: "对话正在执行", retryable: true },
+  NOT_CONFIGURED: { message: "工作区尚未配置", retryable: true },
+  UNKNOWN_WORKSPACE: { message: "工作区不存在", retryable: false },
+  INVALID_INPUT: { message: "请求参数无效", retryable: false },
+  INVALID_PATH: { message: "路径无效", retryable: false },
+  PATH_REJECTED: { message: "路径不在工作区内", retryable: false },
+  NOT_FOUND: { message: "文件或目录不存在", retryable: false },
+  NOT_DIRECTORY: { message: "目标不是目录", retryable: false },
+  NOT_FILE: { message: "目标不是文件", retryable: false },
+  STALE_CURSOR: { message: "文件树游标已失效", retryable: true },
+  LIMIT_EXCEEDED: { message: "请求超出限制", retryable: false },
+  CHANGED_DURING_READ: { message: "文件读取期间发生变化", retryable: true },
+  IO: { message: "读取失败", retryable: true },
+  EXTERNAL_WORKTREE: { message: "Git 工作树不受支持", retryable: false },
+  GIT_UNAVAILABLE: { message: "Git 不可用", retryable: true },
+  COMMAND_FAILED: { message: "Git 命令执行失败", retryable: true },
+  TIMED_OUT: { message: "Git 命令超时", retryable: true },
+  CANCELLED: { message: "Git 命令已取消", retryable: true },
+  OUTPUT_LIMIT_EXCEEDED: { message: "Git 输出超出限制", retryable: false },
+  CLEANUP_TIMED_OUT: { message: "Git 进程清理超时", retryable: true },
+  PARSE: { message: "Git 输出解析失败", retryable: false },
 };
 
 export class RuntimeHostError extends Error {
@@ -205,6 +336,19 @@ export class RuntimeHostError extends Error {
     this.name = "RuntimeHostError";
     this.code = code;
     this.retryable = retryable;
+  }
+}
+
+/**
+ * Converts typed command input failures to a stable local error.  Returning a
+ * raw ZodError would expose user-supplied path fragments through its issue
+ * list, which is not useful to the runtime UI.
+ */
+function parseRuntimeInput<T>(schema: z.ZodType<T>, input: unknown): T {
+  try {
+    return schema.parse(input);
+  } catch {
+    throw new RuntimeHostError("INVALID_INPUT", "请求参数无效", false);
   }
 }
 
@@ -302,12 +446,16 @@ export interface RuntimeHostAdapter {
   acknowledgeRecovery(confirmation: ManualRecoveryConfirmation): Promise<RuntimeRecoveryState>;
   /** Optional for existing host test doubles until the approval UI consumes it. */
   approvalRespond?(input: ApprovalResponseInput): Promise<void>;
+  /** Optional during the transition so existing host test doubles stay valid. */
+  configure?(input: RuntimeConfigureInput): Promise<RuntimeConfigurationStatus>;
   turnStart(input: TurnStartInput): Promise<TurnAccepted>;
+  /** Optional during the transition so existing host test doubles stay valid. */
+  turnCancel?(input: TurnCancelInput): Promise<TurnCancelResult>;
   subscribe(listener: RuntimeHostListener): Promise<RuntimeHostUnsubscribe>;
 }
 
 /**
- * Typed adapter for the six native commands and one native event. No caller
+ * Typed adapter for the fixed native commands and one native event. No caller
  * can select an executable, path, environment, request id, or handshake token.
  */
 export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
@@ -330,7 +478,7 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
   }
 
   async acknowledgeRecovery(confirmation: ManualRecoveryConfirmation): Promise<RuntimeRecoveryState> {
-    const parsed = ManualRecoveryConfirmationSchema.parse(confirmation);
+    const parsed = parseRuntimeInput(ManualRecoveryConfirmationSchema, confirmation);
     return this.invoke(
       JA_RUNTIME_COMMANDS.acknowledgeRecovery,
       { confirmation: parsed },
@@ -344,7 +492,7 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
    * protocol envelope or receives an internal server-request identifier.
    */
   async approvalRespond(input: ApprovalResponseInput): Promise<void> {
-    const parsed = ApprovalResponseInputSchema.parse(input);
+    const parsed = parseRuntimeInput(ApprovalResponseInputSchema, input);
     try {
       const result = await this.bridge.invoke<unknown>(JA_RUNTIME_COMMANDS.approvalRespond, { input: parsed });
       assertHostPayloadSafe(result);
@@ -356,9 +504,32 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
     }
   }
 
+  /**
+   * Sends the complete typed workspace/settings snapshot to Rust.  Keeping
+   * configuration behind one command prevents React from choosing an
+   * executable, environment, or sidecar lifecycle detail independently.
+   */
+  async configure(input: RuntimeConfigureInput): Promise<RuntimeConfigurationStatus> {
+    const parsed = parseRuntimeInput(RuntimeConfigureInputSchema, input);
+    return this.invoke(JA_RUNTIME_COMMANDS.configure, { input: parsed }, RuntimeConfigurationStatusSchema);
+  }
+
   async turnStart(input: TurnStartInput): Promise<TurnAccepted> {
-    const parsed = TurnStartInputSchema.parse(input);
+    const parsed = parseRuntimeInput(TurnStartInputSchema, input);
     return this.invoke(JA_RUNTIME_COMMANDS.turnStart, { input: parsed }, TurnAcceptedSchema);
+  }
+
+  /**
+   * Requests cancellation through Rust's bounded bridge so the sidecar can
+   * emit the authoritative terminal event instead of the UI guessing state.
+   */
+  async turnCancel(input: TurnCancelInput): Promise<TurnCancelResult> {
+    const parsed = parseRuntimeInput(TurnCancelInputSchema, input);
+    const result = await this.invoke(JA_RUNTIME_COMMANDS.turnCancel, { input: parsed }, TurnCancelResultSchema);
+    if (result.turnId !== parsed.turnId) {
+      throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true);
+    }
+    return result;
   }
 
   async subscribe(listener: RuntimeHostListener): Promise<RuntimeHostUnsubscribe> {

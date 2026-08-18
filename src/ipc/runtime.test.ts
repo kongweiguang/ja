@@ -2,6 +2,7 @@
 // @author kongweiguang
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as ipcEntry from "./index";
 import {
   JA_RUNTIME_COMMANDS,
   JA_RUNTIME_EVENTS,
@@ -11,6 +12,34 @@ import {
   parseRuntimeHostEvent,
   type RuntimeNativeBridge,
 } from "./runtime";
+
+const configureFixture = {
+  workspaceId: "ws_fixture",
+  rootPath: "workspace-root",
+  displayName: "Fixture",
+  trust: "trusted" as const,
+  settings: {
+    schemaVersion: 1,
+    revision: 0,
+    theme: "system" as const,
+    activeProfileRevision: "profile_fixture",
+    profiles: [{
+      profileRevision: "profile_fixture",
+      name: "Fixture",
+      provider: "openai",
+      protocol: "openai_chat_completions" as const,
+      model: "fixture-model",
+      baseUrl: null,
+      credentialRef: null,
+      supportsVision: false,
+      accessMode: "workspace" as const,
+      skillRevisions: [],
+      mcpRevisions: null,
+    }],
+    mcpServers: [],
+    window: { width: 1280, height: 820, maximized: false },
+  },
+};
 
 const readyStatus = {
   status: "ready" as const,
@@ -64,6 +93,11 @@ function statusFrame(status: string, generation: number): Record<string, unknown
 describe("RuntimeHost typed adapter", () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it("keeps the generic native invoke bridge out of the public IPC entrypoint", () => {
+    expect("defaultNativeBridge" in ipcEntry).toBe(false);
+    expect("RuntimeNativeBridge" in ipcEntry).toBe(false);
+  });
+
   it("uses only typed Rust command envelopes and the fixed event name", async () => {
     const listenHandler = vi.fn<(payload: unknown) => void>();
     const invoke = vi.fn(async (command: string) => {
@@ -72,6 +106,12 @@ describe("RuntimeHost typed adapter", () => {
       }
       if (command === JA_RUNTIME_COMMANDS.turnStart) {
         return { accepted: true, turnId: "turn_fixture", queued: false, status: "running" };
+      }
+      if (command === JA_RUNTIME_COMMANDS.configure) {
+        return { configured: true, profileRevision: "profile_fixture", mcpCount: 0 };
+      }
+      if (command === JA_RUNTIME_COMMANDS.turnCancel) {
+        return { accepted: true, turnId: "turn_fixture", status: "interrupted" };
       }
       return readyStatus;
     });
@@ -95,6 +135,16 @@ describe("RuntimeHost typed adapter", () => {
       profileRevision: "profile_fixture",
       input: [{ type: "text", text: "hello" }],
     })).resolves.toMatchObject({ accepted: true });
+    await expect(adapter.configure(configureFixture)).resolves.toEqual({
+      configured: true,
+      profileRevision: "profile_fixture",
+      mcpCount: 0,
+    });
+    await expect(adapter.turnCancel({
+      threadId: "thr_fixture",
+      turnId: "turn_fixture",
+      reason: "用户取消",
+    })).resolves.toEqual({ accepted: true, turnId: "turn_fixture", status: "interrupted" });
     await adapter.subscribe(() => undefined);
 
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.start, {});
@@ -104,6 +154,79 @@ describe("RuntimeHost typed adapter", () => {
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnStart, {
       input: expect.objectContaining({ threadId: "thr_fixture" }),
     });
+    expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.configure, { input: configureFixture });
+    expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnCancel, {
+      input: { threadId: "thr_fixture", turnId: "turn_fixture", reason: "用户取消" },
+    });
+  });
+
+  it("rejects unknown configure fields and malformed native cancel results", async () => {
+    const invoke = vi.fn(async (command: string) => {
+      if (command === JA_RUNTIME_COMMANDS.turnCancel) {
+        return { accepted: true, turnId: "turn_fixture", status: "done" };
+      }
+      return { configured: true, profileRevision: "profile_fixture", mcpCount: 0 };
+    });
+    const bridge: RuntimeNativeBridge = {
+      invoke: invoke as RuntimeNativeBridge["invoke"],
+      listen: vi.fn(async () => () => undefined),
+    };
+    const adapter = new TauriRuntimeHostAdapter(bridge);
+    await expect(adapter.configure({ ...configureFixture, executable: "java" } as never)).rejects.toMatchObject({
+      code: "INVALID_INPUT",
+      message: "请求参数无效",
+    });
+    await expect(adapter.turnCancel({ threadId: "thr_fixture", turnId: "turn_fixture" })).rejects.toMatchObject({
+      code: "RUNTIME_UNAVAILABLE",
+      message: "运行时暂不可用",
+    });
+    await expect(adapter.turnCancel({ threadId: "thr_fixture", turnId: "turn_fixture", reason: "C:\\private" })).rejects.toMatchObject({
+      code: "RUNTIME_UNAVAILABLE",
+      message: "运行时暂不可用",
+    });
+
+    const responses = [
+      { accepted: false, turnId: "turn_fixture", status: "interrupted" },
+      { accepted: true, turnId: "turn_other", status: "interrupted" },
+    ];
+    for (const response of responses) {
+      const cancelBridge: RuntimeNativeBridge = {
+        invoke: vi.fn(async () => response) as RuntimeNativeBridge["invoke"],
+        listen: vi.fn(async () => () => undefined),
+      };
+      await expect(new TauriRuntimeHostAdapter(cancelBridge).turnCancel({
+        threadId: "thr_fixture",
+        turnId: "turn_fixture",
+      })).rejects.toMatchObject({ code: "RUNTIME_UNAVAILABLE", message: "运行时暂不可用" });
+    }
+
+    await expect(adapter.configure({
+      ...configureFixture,
+      settings: {
+        ...configureFixture.settings,
+        profiles: [{ ...configureFixture.settings.profiles[0], protocol: "openai_responses" }],
+      },
+    } as never)).rejects.toMatchObject({ code: "INVALID_INPUT", message: "请求参数无效" });
+  });
+
+  it("normalizes malformed lifecycle inputs without exposing Zod paths", async () => {
+    const invoke = vi.fn(async () => readyStatus);
+    const bridge: RuntimeNativeBridge = {
+      invoke: invoke as RuntimeNativeBridge["invoke"],
+      listen: vi.fn(async () => () => undefined),
+    };
+    const adapter = new TauriRuntimeHostAdapter(bridge);
+    const invalidInputs: Promise<unknown>[] = [
+      adapter.acknowledgeRecovery({ recoveryId: "C:\\private", revision: 1, reason: "SystemRestarted", cause: "C:\\private" } as never),
+      adapter.approvalRespond({ approvalId: "C:\\private", decision: "allow_once", resolvedAt: "bad" } as never),
+      adapter.turnStart({ threadId: "thr_fixture", accessMode: "workspace", profileRevision: "profile_fixture", input: [{ type: "text", text: "hello" }], executable: "java" } as never),
+    ];
+    for (const pending of invalidInputs) {
+      const error = await pending.catch((value: unknown) => value);
+      expect(error).toMatchObject({ code: "INVALID_INPUT", message: "请求参数无效" });
+      expect(JSON.stringify(error)).not.toContain("private");
+    }
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("accepts Rust's token-free ready projection and validates a timeline event", () => {

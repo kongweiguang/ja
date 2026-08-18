@@ -19,9 +19,46 @@ export type {
   RuntimeHostEvent,
   RuntimeHostListener,
   RuntimeHostUnsubscribe,
-  RuntimeNativeBridge,
   RuntimeRecoveryState,
   RuntimeStatusKind,
+  RuntimeConfigureInput,
+  RuntimeConfigurationStatus,
+  TurnCancelInput,
+  TurnCancelResult,
   TurnAccepted,
   TurnStartInput,
 } from "./runtime";
+
+export {
+  JA_WORKSPACE_COMMANDS,
+  TauriWorkspaceHostAdapter,
+  createWorkspaceHostAdapter,
+  WorkspaceRelativePathSchema,
+  WorkspaceNonEmptyRelativePathSchema,
+} from "./workspace";
+export type {
+  WorkspaceFileContent,
+  WorkspaceFileMetadata,
+  WorkspaceFileRevision,
+  WorkspaceHostAdapter,
+  WorkspaceReadFileInput,
+  WorkspaceSearchHit,
+  WorkspaceSearchInput,
+  WorkspaceSearchResult,
+  WorkspaceTreeEntry,
+  WorkspaceTreeInput,
+  WorkspaceTreePage,
+} from "./workspace";
+
+export {
+  JA_GIT_COMMANDS,
+  TauriGitHostAdapter,
+  createGitHostAdapter,
+} from "./git";
+export type {
+  GitDiff,
+  GitDiffInput,
+  GitHostAdapter,
+  GitStatusEntry,
+  GitStatusInput,
+} from "./git";
