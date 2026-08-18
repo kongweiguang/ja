@@ -46,6 +46,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Path;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -963,9 +965,14 @@ public final class StdioRuntime implements AutoCloseable {
     /**
      * Starts activation without waiting on provider construction in the control lane. A pending
      * secret request is registered before it is written, and its callback only schedules the
-     * bounded activation lane so reader/control processing remains responsive.
+     * bounded activation lane so reader/control processing remains responsive. The explicit fake
+     * fixture path is handled first so it never constructs a provider or claims an MCP connection.
      */
     private void handleProfileActivate(RpcRequest request) {
+        if (fakeRuntime) {
+            handleFakeProfileActivate(request);
+            return;
+        }
         final SavedProfile profile;
         boolean activationStarted = false;
         try {
@@ -1024,6 +1031,84 @@ public final class StdioRuntime implements AutoCloseable {
         } catch (RuntimeException exception) {
             activationInProgress.set(false);
             sendFailure(request, new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE));
+        }
+    }
+
+    /**
+     * Binds a fake profile without constructing a provider or MCP client.  The fake mode exists as
+     * a deterministic stdio contract fixture, so it must exercise the same workspace/profile/data
+     * preconditions while refusing to claim that credentials or external tools were connected.
+     */
+    private void handleFakeProfileActivate(RpcRequest request) {
+        boolean activationStarted = false;
+        try {
+            if (workspaceBinding == null) {
+                throw new ProtocolException(JaErrorCode.INVALID_STATE);
+            }
+            requireFakeDataDirectory();
+            String revision = requiredProfileRevision(request.params());
+            SavedProfile profile = savedProfile;
+            if (profile == null || !revision.equals(profile.wireRevision())) {
+                throw new ProtocolException(JaErrorCode.CONFLICT);
+            }
+            if (profile.model().secretRef() != null) {
+                // A fixture must never turn a credential reference into a fake provider success.
+                throw new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE);
+            }
+            if (!profile.mcpRevisions().isEmpty()) {
+                // MCP selection is valid wire data, but fake activation deliberately does not
+                // connect external processes or report their tools as available.
+                throw new ProtocolException(JaErrorCode.MCP_SERVER_UNAVAILABLE);
+            }
+            String active = activeProfileRevision;
+            if (active != null) {
+                if (active.equals(revision)) {
+                    sendResponse(RpcResponse.success(request, activationResult(revision)));
+                } else {
+                    throw new ProtocolException(JaErrorCode.CONFLICT);
+                }
+                return;
+            }
+            if (!activationInProgress.compareAndSet(false, true)) {
+                throw new ProtocolException(JaErrorCode.CONFLICT);
+            }
+            activationStarted = true;
+            // The control lane serializes activation requests, so this single binding is atomic
+            // with the revision checks above and cannot publish a second active revision.
+            activeProfileRevision = revision;
+            sendResponse(RpcResponse.success(request, activationResult(revision)));
+        } catch (ProtocolException exception) {
+            sendFailure(request, exception);
+        } catch (RuntimeException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.INTERNAL_ERROR));
+        } finally {
+            if (activationStarted) {
+                activationInProgress.set(false);
+            }
+        }
+    }
+
+    /**
+     * Applies the same explicit data-root boundary as the production graph before fake activation.
+     * The fixture must create only the host-selected directory and reject a file or final symlink,
+     * otherwise a successful fake activation would hide a launch that production cannot open.
+     */
+    private void requireFakeDataDirectory() {
+        Path value = configuration.dataDirectory();
+        if (value == null) {
+            throw new ProtocolException(JaErrorCode.INVALID_STATE);
+        }
+        try {
+            Path normalized = value.toAbsolutePath().normalize();
+            Files.createDirectories(normalized);
+            if (!Files.isDirectory(normalized, LinkOption.NOFOLLOW_LINKS)
+                    || Files.isSymbolicLink(normalized)) {
+                throw new ProtocolException(JaErrorCode.INVALID_STATE);
+            }
+        } catch (ProtocolException exception) {
+            throw exception;
+        } catch (IOException | RuntimeException exception) {
+            throw new ProtocolException(JaErrorCode.INVALID_STATE, null, exception);
         }
     }
 
@@ -1360,14 +1445,7 @@ public final class StdioRuntime implements AutoCloseable {
             }
             CountDownLatch responseSent = new CountDownLatch(1);
             TurnHandle handle = runtime.start(request, event -> {
-                try {
-                    if (!responseSent.await(2, TimeUnit.SECONDS)) {
-                        throw new ProtocolException(JaErrorCode.REQUEST_DEADLINE_EXCEEDED);
-                    }
-                    publishTurnEvent(event);
-                } catch (InterruptedException exception) {
-                    Thread.currentThread().interrupt();
-                }
+                publishTurnEventAfterStartResponse(responseSent, event);
             });
             ObjectNode result = JsonNodes.object();
             result.put("accepted", true);
@@ -1382,6 +1460,40 @@ public final class StdioRuntime implements AutoCloseable {
         } catch (RuntimeException exception) {
             sendFailure(request, exception instanceof ProtocolException value
                     ? value : new ProtocolException(JaErrorCode.INTERNAL_ERROR));
+        }
+    }
+
+    /**
+     * Waits for the start ACK with a finite deadline while tolerating a worker interrupt. A
+     * cancelled AgentScope/fake worker can arrive here with its interrupt flag already set; the
+     * ordinary await would then discard its terminal event. Clearing only the transient wait
+     * interrupt, publishing through the existing writer, and restoring it afterwards preserves
+     * both strict ACK-before-event ordering and the worker's cancellation signal.
+     */
+    private void publishTurnEventAfterStartResponse(CountDownLatch responseSent, TurnEvent event) {
+        boolean interrupted = false;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        try {
+            while (true) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0L) {
+                    throw new ProtocolException(JaErrorCode.REQUEST_DEADLINE_EXCEEDED);
+                }
+                try {
+                    if (responseSent.await(remaining, TimeUnit.NANOSECONDS)) {
+                        publishTurnEvent(event);
+                        return;
+                    }
+                    throw new ProtocolException(JaErrorCode.REQUEST_DEADLINE_EXCEEDED);
+                } catch (InterruptedException exception) {
+                    // await clears the flag; continue until the ACK or deadline, then restore it.
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 

@@ -448,7 +448,15 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
      * publish into a stream that a later approval resume has already replaced.
      */
     private void subscribeStream(Run run, Flux<AgentEvent> stream) {
-        subscribeStream(run, stream, run.subscriptionEpoch.incrementAndGet());
+        Objects.requireNonNull(stream, "stream");
+        // Reserve the epoch under the run gate. Otherwise a late callback can pass the epoch check
+        // while the approval thread is switching to its resume stream, which is exactly the window
+        // that can publish an old terminal event.
+        long epoch;
+        synchronized (run) {
+            epoch = run.subscriptionEpoch.incrementAndGet();
+        }
+        subscribeStream(run, stream, epoch);
     }
 
     /**
@@ -457,12 +465,20 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
      */
     private void subscribeStream(Run run, Flux<AgentEvent> stream, long epoch) {
         Objects.requireNonNull(stream, "stream");
+        synchronized (run) {
+            if (run.subscriptionEpoch.get() != epoch || run.cancelled.get() || run.finished.get()) {
+                return;
+            }
+        }
+        // Do not hold the run gate while subscribing: a provider may synchronously block while it
+        // establishes a child process or network stream. Callback handlers still take the gate,
+        // so a synchronous event is serialized with a concurrent epoch switch.
         Disposable subscription = stream.subscribe(
                 event -> publishNormalized(run, epoch, event),
                 error -> streamFailed(run, epoch, error),
                 () -> streamCompleted(run, epoch));
         synchronized (run) {
-            if (run.subscriptionEpoch.get() != epoch) {
+            if (run.subscriptionEpoch.get() != epoch || run.cancelled.get() || run.finished.get()) {
                 subscription.dispose();
                 return;
             }
@@ -477,39 +493,46 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
         }
     }
 
-    /** Publishes only the current stream generation while suppressing callbacks after cancellation. */
+    /**
+     * Publishes only the current stream generation while suppressing callbacks after cancellation.
+     * The run gate covers normalization and publication so an epoch switch cannot occur between
+     * accepting an event and applying its terminal effect.
+     */
     private void publishNormalized(Run run, long epoch, AgentEvent event) {
-        if (!isCurrentStream(run, epoch) || run.finished.get() || run.cancelled.get()) {
-            return;
-        }
-        if (deadlineExpired(run)) {
-            cancelInternal(run.turnId, "deadline_exceeded");
-            return;
-        }
-        if (run.waitingApproval.get() && isPermissionPauseTerminal(event)) {
-            // AgentScope closes the asking Flux with REQUEST_STOP after emitting the HITL event;
-            // some versions also emit AgentEnd before completion. Neither is a real JA terminal
-            // while the host still owns the approval decision.
-            return;
-        }
-        try {
-            List<TurnEvent> normalized = normalizer.normalize(event, run.normalized);
-            boolean terminalBatch = normalizer.isTerminal(run.normalized);
-            for (TurnEvent output : normalized) {
-                if (!run.finished.get() && !run.cancelled.get()) {
-                    if (!terminalBatch && !admitOutput(run, output)) {
-                        run.resourceOverflow.set(true);
-                        streamFailed(run, epoch, new IllegalStateException("event budget exceeded"));
-                        return;
+        synchronized (run) {
+            if (!isCurrentStream(run, epoch) || run.finished.get() || run.cancelled.get()) {
+                return;
+            }
+            if (deadlineExpired(run)) {
+                cancelInternal(run.turnId, "deadline_exceeded");
+                return;
+            }
+            if (run.waitingApproval.get() && isPermissionPauseTerminal(event)) {
+                // AgentScope closes the asking Flux with REQUEST_STOP after emitting the HITL event;
+                // some versions also emit AgentEnd before completion. Neither is a real JA terminal
+                // while the host still owns the approval decision.
+                return;
+            }
+            try {
+                List<TurnEvent> normalized = normalizer.normalize(event, run.normalized);
+                boolean terminalBatch = normalizer.isTerminal(run.normalized);
+                for (TurnEvent output : normalized) {
+                    if (!run.finished.get() && !run.cancelled.get()) {
+                        if (!terminalBatch && !admitOutput(run, output)) {
+                            run.resourceOverflow.set(true);
+                            streamFailed(run, epoch,
+                                    new IllegalStateException("event budget exceeded"));
+                            return;
+                        }
+                        run.publisher.accept(output);
                     }
-                    run.publisher.accept(output);
                 }
+                if (event instanceof RequireUserConfirmEvent confirmation) {
+                    registerApproval(run, confirmation);
+                }
+            } catch (RuntimeException exception) {
+                streamFailed(run, epoch, exception);
             }
-            if (event instanceof RequireUserConfirmEvent confirmation) {
-                registerApproval(run, confirmation);
-            }
-        } catch (RuntimeException exception) {
-            streamFailed(run, epoch, exception);
         }
     }
 
@@ -631,6 +654,8 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
     private void resumeAfterApproval(Run run, PendingApproval pending,
                                      TurnRuntime.ApprovalDecision decision) {
         try {
+            Flux<AgentEvent> resumed;
+            long resumeEpoch;
             synchronized (run) {
                 // Cancellation and approval resume share this gate. If cancellation wins the
                 // gate, no session rule, AgentScope resume, or tool execution may be admitted.
@@ -657,12 +682,15 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                 // Reserve the replacement generation before changing waitingApproval. A late
                 // callback from the asking Flux can then never observe a resumable run as a fresh
                 // terminal. Holding run's gate also makes cancellation wait for this winner.
-                long resumeEpoch = run.subscriptionEpoch.incrementAndGet();
+                resumeEpoch = run.subscriptionEpoch.incrementAndGet();
                 approvals.remove(pending.prompt.approvalId(), run);
                 run.pendingApproval = null;
                 run.waitingApproval.set(false);
-                subscribeStream(run, engine.resume(resume, run.context), resumeEpoch);
+                resumed = engine.resume(resume, run.context);
             }
+            // The epoch is already authoritative before the replacement subscription is created;
+            // subscribing outside the gate keeps provider startup from blocking cancellation.
+            subscribeStream(run, resumed, resumeEpoch);
         } catch (RuntimeException exception) {
             streamFailed(run, exception);
         }
@@ -715,27 +743,24 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
 
     /** Completes the current event stream while ignoring stale asking-stream callbacks. */
     private void streamCompleted(Run run, long epoch) {
-        if (!isCurrentStream(run, epoch)) {
-            return;
-        }
-        if (run.waitingApproval.get()) {
-            // AgentScope intentionally completes the asking Flux with PERMISSION_ASKING. Marking
-            // that boundary lets a response which arrived first resume only after state persistence
-            // has drained; the session lane remains occupied until that resume becomes terminal.
-            PendingApproval pending;
-            synchronized (run) {
-                pending = run.waitingApproval.get() ? run.pendingApproval : null;
+        synchronized (run) {
+            if (!isCurrentStream(run, epoch)) {
+                return;
+            }
+            if (run.waitingApproval.get()) {
+                // AgentScope intentionally completes the asking Flux with PERMISSION_ASKING. Marking
+                // that boundary lets a response which arrived first resume only after state persistence
+                // has drained; the session lane remains occupied until that resume becomes terminal.
+                PendingApproval pending = run.pendingApproval;
                 if (pending != null) {
                     pending.askingCompleted.set(true);
+                    tryScheduleApprovalResume(run, pending);
                 }
+                return;
             }
-            if (pending != null) {
-                tryScheduleApprovalResume(run, pending);
-            }
-            return;
         }
         finish(run, run.cancelled.get() ? "interrupted" : "completed",
-                run.cancelled.get() ? "cancelled" : null);
+                run.cancelled.get() ? "cancelled" : null, epoch);
     }
 
     /** Reduces current-provider exceptions while ignoring only callbacks from stale epochs. */
@@ -748,7 +773,8 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                 ? "event_budget_exceeded"
                 : deadlineExpired(run) ? "deadline_exceeded" : "provider_error";
         finish(run, run.cancelled.get() ? "interrupted" : "failed",
-                run.cancelled.get() ? (deadlineExpired(run) ? "deadline_exceeded" : "cancelled") : reason);
+                run.cancelled.get() ? (deadlineExpired(run) ? "deadline_exceeded" : "cancelled") : reason,
+                epoch);
     }
 
     /** Routes control-lane failures to the currently reserved generation. */
@@ -827,8 +853,20 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
      * waiters; all three operations are guarded against duplicate callbacks.
      */
     private void finish(Run run, String status, String reason) {
+        finish(run, status, reason, null);
+    }
+
+    /**
+     * Emits a terminal only when the callback still belongs to the reserved stream epoch.  The
+     * epoch check must happen in the same critical section as the terminal claim; a check followed
+     * by a separate finish call would still let a resume switch in between and close the new stream.
+     */
+    private void finish(Run run, String status, String reason, Long expectedEpoch) {
         PendingApproval pending;
         synchronized (run) {
+            if (expectedEpoch != null && run.subscriptionEpoch.get() != expectedEpoch) {
+                return;
+            }
             if (!run.finished.compareAndSet(false, true)) {
                 return;
             }
