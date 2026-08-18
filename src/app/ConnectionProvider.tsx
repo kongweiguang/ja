@@ -21,8 +21,12 @@ import {
   type RecoveryReason,
   type RuntimeHostAdapter,
   type RuntimeHostEvent,
+  type RuntimeConfigureInput,
   type RuntimeRecoveryState,
   type RuntimeStatus,
+  type ApprovalResponseInput,
+  type TurnCancelInput,
+  type TurnCancelResult,
   type TurnAccepted,
   type TurnStartInput,
 } from "@/ipc/runtime";
@@ -30,14 +34,15 @@ import { useTimelineStore } from "@/stores/timelineStore";
 import type { BootState } from "./bootState";
 
 export interface JaConnectionContextValue {
-  runtime: RuntimeHostAdapter;
   boot: BootState;
   runtimeState: RuntimeStatus | undefined;
   recovery: RuntimeRecoveryState | undefined;
   lastEvent: RuntimeHostEvent | undefined;
-  start: () => Promise<RuntimeStatus>;
+  configureAndStart: (input: RuntimeConfigureInput) => Promise<RuntimeStatus>;
   stop: () => Promise<RuntimeStatus>;
-  startTurn: (input: TurnStartInput) => Promise<TurnAccepted>;
+  submitTurn: (input: TurnStartInput) => Promise<TurnAccepted>;
+  cancelTurn: (input: TurnCancelInput) => Promise<TurnCancelResult>;
+  approvalRespond: (input: ApprovalResponseInput) => Promise<void>;
   acknowledgeRecovery: (reason: RecoveryReason) => Promise<RuntimeRecoveryState>;
 }
 
@@ -51,6 +56,12 @@ export interface ConnectionProviderProps extends PropsWithChildren {
 interface PendingOperation<T> {
   epoch: number;
   promise: Promise<T>;
+}
+
+interface TurnAdmissionGate {
+  lifecycleEpoch: number;
+  generation: number;
+  runtime: RuntimeHostAdapter;
 }
 
 /** Maps native states to UI states without exposing process diagnostics. */
@@ -112,6 +123,23 @@ function safeError(error: unknown): RuntimeHostError {
 }
 
 /**
+ * Builds a dedupe identity from revision metadata only, keeping credential,
+ * endpoint and environment values out of the in-flight operation map.
+ */
+function configureOperationKey(input: RuntimeConfigureInput): string {
+  const profileRevisions = input.settings.profiles?.map((profile) => profile.profileRevision).join(",") ?? "";
+  const mcpRevisions = input.settings.mcpServers?.map((server) => server.mcpRevision).join(",") ?? "";
+  return [
+    input.workspaceId,
+    input.trust,
+    input.settings.revision ?? 0,
+    input.settings.activeProfileRevision ?? "",
+    profileRevisions,
+    mcpRevisions,
+  ].join("|");
+}
+
+/**
  * Owns one typed RuntimeHost lifecycle and serializes every native operation.
  * The operation epoch is the linearization point: a late result can complete
  * its promise for its caller, but cannot overwrite state after a newer intent.
@@ -132,6 +160,8 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
   const inFlightRef = useRef<Map<string, PendingOperation<unknown>>>(new Map());
   const cleanupRef = useRef<Promise<void>>(Promise.resolve());
   const startedRef = useRef(false);
+  const turnGateRef = useRef<TurnAdmissionGate | undefined>(undefined);
+  const configurationIntentRef = useRef(0);
 
   /** Keeps React state and synchronous guards on the same lifecycle value. */
   const updateBoot = useCallback((next: BootState): void => {
@@ -150,6 +180,34 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
     recoveryRef.current = next;
     setRecovery(next);
   }, []);
+
+  /**
+   * Revokes turn admission at every lifecycle boundary; a successful prior
+   * generation must never authorize work after configure/stop/recovery.
+   */
+  const revokeTurnGate = useCallback((): void => {
+    turnGateRef.current = undefined;
+  }, []);
+
+  /**
+   * Checks the narrow admission contract for coding work. Keeping this gate
+   * beside the typed context prevents callers from bypassing configuration by
+   * reaching a generic runtime or a legacy startTurn method.
+   */
+  const isTurnGenerationCurrent = useCallback((lifecycleEpoch: number, generation: number): boolean => {
+    const gate = turnGateRef.current;
+    return gate !== undefined
+      && gate.runtime === runtime
+      && gate.lifecycleEpoch === lifecycleEpoch
+      && gate.generation === generation
+      && lifecycleEpochRef.current === lifecycleEpoch
+      && runtimeStateRef.current?.generation === generation;
+  }, [runtime]);
+
+  /** Admission additionally requires ready; a running turn may project busy. */
+  const isTurnGateCurrent = useCallback((lifecycleEpoch: number, generation: number): boolean => (
+    isTurnGenerationCurrent(lifecycleEpoch, generation) && bootRef.current.status === "ready"
+  ), [isTurnGenerationCurrent]);
 
   /** Enqueues one native call and deduplicates identical in-flight intents. */
   const enqueueOperation = useCallback(<T,>(key: string, operation: () => Promise<T>): PendingOperation<T> => {
@@ -175,6 +233,22 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
     return pending;
   }, []);
 
+  /**
+   * Stops a sidecar that completed startup after its React owner disappeared.
+   * This closes the only window where an explicit configure/start intent can
+   * outlive unmount without making the setup effect start processes itself.
+   */
+  const stopLateStartedRuntime = useCallback(async (status: RuntimeStatus, lifecycleEpoch: number): Promise<void> => {
+    const started = status.status !== "stopped" && status.status !== "recovery_required";
+    startedRef.current = started;
+    if (!started || lifecycleEpochRef.current === lifecycleEpoch) {
+      return;
+    }
+    const pendingStop = enqueueOperation("stop", () => runtime.stop());
+    await pendingStop.promise.catch(() => undefined);
+    startedRef.current = false;
+  }, [enqueueOperation, runtime]);
+
   /** Makes a result current only while its lifecycle and operation epochs match. */
   const isCurrentOperation = useCallback((operationEpoch: number, lifecycleEpoch: number): boolean => (
     operationEpochRef.current === operationEpoch && lifecycleEpochRef.current === lifecycleEpoch
@@ -192,11 +266,18 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
     if (!isCurrentOperation(operationEpoch, lifecycleEpoch)) {
       return false;
     }
+    const gate = turnGateRef.current;
+    if (gate !== undefined && (gate.lifecycleEpoch !== lifecycleEpoch
+      || gate.runtime !== runtime
+      || gate.generation !== status.generation
+      || !["ready", "busy"].includes(status.status))) {
+      revokeTurnGate();
+    }
     updateRuntimeState(status);
     stateProjection(status, eventId, occurredAt, reason);
     updateBoot(bootForStatus(status));
     return true;
-  }, [isCurrentOperation, updateBoot, updateRuntimeState]);
+  }, [isCurrentOperation, revokeTurnGate, runtime, updateBoot, updateRuntimeState]);
 
   /** Reads authoritative host state through the same serial lane as commands. */
   const refreshState = useCallback((lifecycleEpoch: number): Promise<RuntimeStatus> => {
@@ -206,6 +287,14 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
       return status;
     }).catch((error: unknown) => {
       const normalized = safeError(error);
+      if (normalized.code === "NOT_CONFIGURED" && isCurrentOperation(pending.epoch, lifecycleEpoch)) {
+        // A refresh can race a settings reset; keep the shell usable for
+        // configuration instead of turning an expected unconfigured state
+        // into a misleading runtime failure.
+        const stopped: RuntimeStatus = { status: "stopped", generation: 0, serverInstanceId: null };
+        commitStatus(stopped, pending.epoch, lifecycleEpoch);
+        return stopped;
+      }
       if (isCurrentOperation(pending.epoch, lifecycleEpoch)) {
         updateBoot({ status: "failed", message: normalized.message });
       }
@@ -213,17 +302,56 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
     });
   }, [commitStatus, enqueueOperation, isCurrentOperation, runtime, updateBoot]);
 
-  /** Starts the sidecar once and makes a superseded result harmless. */
-  const start = useCallback((): Promise<RuntimeStatus> => {
+  /**
+   * Applies one complete workspace/settings snapshot before startup. Rust
+   * owns the bounded restart when a live configuration changes; keeping the
+   * two commands in one queued intent prevents an unconfigured start or a
+   * late previous generation from becoming visible to React.
+   */
+  const configureAndStart = useCallback((input: RuntimeConfigureInput): Promise<RuntimeStatus> => {
     const lifecycleEpoch = lifecycleEpochRef.current;
+    // A new snapshot invalidates the previous generation before any async
+    // validation begins, so queued turns cannot cross the restart boundary.
+    revokeTurnGate();
     if (recoveryRef.current?.required === true || bootRef.current.status === "recovery_required") {
       return Promise.reject(new RuntimeHostError("RECOVERY_REQUIRED", "需要先完成运行时恢复", false));
     }
+    const configure = runtime.configure;
+    if (configure === undefined) {
+      const error = new RuntimeHostError("RUNTIME_CONFIG_INVALID", "运行时配置不可用", false);
+      updateBoot({ status: "failed", message: error.message });
+      return Promise.reject(error);
+    }
     updateBoot({ status: "connecting" });
-    const pending = enqueueOperation("start", () => runtime.start());
-    return pending.promise.then((status) => {
-      startedRef.current = status.status !== "stopped" && status.status !== "recovery_required";
-      commitStatus(status, pending.epoch, lifecycleEpoch);
+    const operationKey = `configureAndStart:${configureOperationKey(input)}`;
+    const duplicate = inFlightRef.current.has(operationKey);
+    const configurationIntent = duplicate
+      ? configurationIntentRef.current
+      : configurationIntentRef.current + 1;
+    if (!duplicate) {
+      configurationIntentRef.current = configurationIntent;
+    }
+    const pending = enqueueOperation(operationKey, async () => {
+      await configure.call(runtime, input);
+      // The setup state read is an internal observation, not a newer user
+      // intent; only a stop click or unmount may cancel this startup.
+      if (lifecycleEpochRef.current !== lifecycleEpoch
+        || configurationIntentRef.current !== configurationIntent
+        || inFlightRef.current.has("stop")) {
+        throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时启动已取消", true);
+      }
+      // Configure owns replacement of any previous bridge, so cleanup tracks
+      // only the generation created by the following explicit start.
+      startedRef.current = false;
+      return runtime.start();
+    });
+    return pending.promise.then(async (status) => {
+      await stopLateStartedRuntime(status, lifecycleEpoch);
+      const committed = configurationIntentRef.current === configurationIntent
+        && commitStatus(status, pending.epoch, lifecycleEpoch);
+      if (committed && status.status === "ready" && status.generation > 0) {
+        turnGateRef.current = { lifecycleEpoch, generation: status.generation, runtime };
+      }
       return status;
     }).catch((error: unknown) => {
       const normalized = safeError(error);
@@ -234,11 +362,12 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
       }
       throw normalized;
     });
-  }, [commitStatus, enqueueOperation, isCurrentOperation, runtime, updateBoot]);
+  }, [commitStatus, enqueueOperation, isCurrentOperation, revokeTurnGate, runtime, stopLateStartedRuntime, updateBoot]);
 
   /** Stops the current sidecar through the same lane used by start. */
   const stop = useCallback((): Promise<RuntimeStatus> => {
     const lifecycleEpoch = lifecycleEpochRef.current;
+    revokeTurnGate();
     updateBoot({ status: "connecting" });
     const pending = enqueueOperation("stop", () => runtime.stop());
     return pending.promise.then((status) => {
@@ -252,34 +381,92 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
       }
       throw normalized;
     });
-  }, [commitStatus, enqueueOperation, isCurrentOperation, runtime, updateBoot]);
+  }, [commitStatus, enqueueOperation, isCurrentOperation, revokeTurnGate, runtime, updateBoot]);
 
-  /** Submits one turn per thread and refreshes rejected admissions authoritatively. */
-  const startTurn = useCallback((input: TurnStartInput): Promise<TurnAccepted> => {
+  /**
+   * Submits a coding turn only through the currently configured ready
+   * generation. The check is repeated inside the serialized operation because
+   * stop/reconfigure may occur while this intent waits behind another call.
+   */
+  const submitTurn = useCallback((input: TurnStartInput): Promise<TurnAccepted> => {
+    const lifecycleEpoch = lifecycleEpochRef.current;
+    const gate = turnGateRef.current;
+    if (gate === undefined || !isTurnGateCurrent(lifecycleEpoch, gate.generation)) {
+      return Promise.reject(new RuntimeHostError("RUNTIME_NOT_READY", "运行时尚未完成配置", true));
+    }
+    const key = `turnStart:${input.threadId}`;
+    const pending = enqueueOperation(key, () => {
+      if (!isTurnGateCurrent(lifecycleEpoch, gate.generation)) {
+        throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
+      }
+      return runtime.turnStart(input);
+    });
+    return pending.promise.then((accepted) => {
+      if (!isTurnGenerationCurrent(lifecycleEpoch, gate.generation)) {
+        throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
+      }
+      return accepted;
+    }).catch((error: unknown) => {
+      throw safeError(error);
+    });
+  }, [enqueueOperation, isTurnGateCurrent, isTurnGenerationCurrent, runtime]);
+
+  /**
+   * Requests cancellation but leaves the terminal state to the event stream.
+   * The business turn identity is the only UI input; Rust keeps generation
+   * ownership and Java emits the authoritative completed/cancelled event.
+   */
+  const cancelTurn = useCallback((input: TurnCancelInput): Promise<TurnCancelResult> => {
     const lifecycleEpoch = lifecycleEpochRef.current;
     if (recoveryRef.current?.required === true || bootRef.current.status === "recovery_required") {
       return Promise.reject(new RuntimeHostError("RECOVERY_REQUIRED", "需要先完成运行时恢复", false));
     }
-    updateBoot({ status: "busy" });
-    const key = `turnStart:${input.threadId}`;
-    const pending = enqueueOperation(key, () => runtime.turnStart(input));
-    return pending.promise.then(async (accepted) => {
-      if (!accepted.accepted) {
-        await refreshState(lifecycleEpoch).catch(() => undefined);
+    const cancel = runtime.turnCancel;
+    if (cancel === undefined) {
+      return Promise.reject(new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true));
+    }
+    const expectedGeneration = runtimeStateRef.current?.generation;
+    const key = `turnCancel:${input.threadId}:${input.turnId}`;
+    const pending = enqueueOperation(key, () => {
+      const currentGeneration = runtimeStateRef.current?.generation;
+      if (expectedGeneration !== undefined && currentGeneration !== undefined && currentGeneration !== expectedGeneration) {
+        throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
       }
-      return accepted;
-    }).catch((error: unknown) => {
-      const normalized = safeError(error);
-      if (isCurrentOperation(pending.epoch, lifecycleEpoch)) {
-        updateBoot({ status: "failed", message: normalized.message });
-      }
-      throw normalized;
+      return cancel.call(runtime, input);
     });
-  }, [enqueueOperation, isCurrentOperation, refreshState, runtime, updateBoot]);
+    return pending.promise.then((result) => {
+      // Do not mark the turn finished from the command response: a newer
+      // generation or an event terminal is the sole source of truth.
+      if (lifecycleEpochRef.current !== lifecycleEpoch) {
+        return result;
+      }
+      return result;
+    }).catch((error: unknown) => {
+      throw safeError(error);
+    });
+  }, [enqueueOperation, runtime]);
+
+  /**
+   * Sends a business approval decision through the typed adapter. The private
+   * JSON-RPC request id never enters this context, and duplicate clicks share
+   * one in-flight response for the same approval identity.
+   */
+  const approvalRespond = useCallback((input: ApprovalResponseInput): Promise<void> => {
+    const respond = runtime.approvalRespond;
+    if (respond === undefined) {
+      return Promise.reject(new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true));
+    }
+    const key = `approvalRespond:${input.approvalId}`;
+    const pending = enqueueOperation(key, () => respond.call(runtime, input));
+    return pending.promise.then(() => undefined).catch((error: unknown) => {
+      throw safeError(error);
+    });
+  }, [enqueueOperation, runtime]);
 
   /** Acknowledges exactly the recovery revision that the user saw. */
   const acknowledgeRecovery = useCallback((reason: RecoveryReason): Promise<RuntimeRecoveryState> => {
     const lifecycleEpoch = lifecycleEpochRef.current;
+    revokeTurnGate();
     const current = recoveryRef.current;
     if (current?.required !== true || current.recoveryId === null || current.recoveryId === undefined || current.revision === null || current.revision === undefined) {
       return Promise.reject(new RuntimeHostError("RECOVERY_REQUIRED", "需要先读取运行时恢复状态", false));
@@ -304,7 +491,7 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
       }
       throw normalized;
     });
-  }, [enqueueOperation, isCurrentOperation, runtime, updateBoot, updateRecovery]);
+  }, [enqueueOperation, isCurrentOperation, revokeTurnGate, runtime, updateBoot, updateRecovery]);
 
   useEffect(() => {
     const lifecycleEpoch = lifecycleEpochRef.current + 1;
@@ -318,6 +505,15 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
         return;
       }
       if (event.kind === "status") {
+        // Revoke before generation filtering: stop/recovery projections may
+        // intentionally use generation zero and still invalidate old turns.
+        const gate = turnGateRef.current;
+        if (gate !== undefined && (gate.runtime !== runtime
+          || gate.lifecycleEpoch !== lifecycleEpoch
+          || gate.generation !== event.status.generation
+          || !["ready", "busy"].includes(event.status.status))) {
+          revokeTurnGate();
+        }
         const current = runtimeStateRef.current;
         const stopPending = inFlightRef.current.has("stop");
         const startPending = inFlightRef.current.has("start");
@@ -358,7 +554,8 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
       if (!active || lifecycleEpochRef.current !== lifecycleEpoch) {
         return;
       }
-      updateBoot({ status: "connecting" });
+      revokeTurnGate();
+      updateBoot({ status: "idle" });
       try {
         const currentRecovery = await runtime.recoveryState();
         if (!active || lifecycleEpochRef.current !== lifecycleEpoch) {
@@ -374,17 +571,22 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
           return;
         }
 
-        const pending = enqueueOperation("start", () => runtime.start());
-        const started = await pending.promise;
-        startedRef.current = started.status !== "stopped" && started.status !== "recovery_required";
+        const pending = enqueueOperation("state", () => runtime.state());
+        const current = await pending.promise;
         if (!active || lifecycleEpochRef.current !== lifecycleEpoch || !isCurrentOperation(pending.epoch, lifecycleEpoch)) {
           return;
         }
-        commitStatus(started, pending.epoch, lifecycleEpoch);
-        await refreshState(lifecycleEpoch);
+        commitStatus(current, pending.epoch, lifecycleEpoch);
       } catch (error: unknown) {
         const normalized = safeError(error);
         if (!active || lifecycleEpochRef.current !== lifecycleEpoch) {
+          return;
+        }
+        // Rust exposes an unconfigured host as a token-free stopped state. A
+        // legacy adapter may instead reject with NOT_CONFIGURED; that is an
+        // expected settings gate, not a failed sidecar.
+        if (normalized.code === "NOT_CONFIGURED") {
+          updateBoot({ status: "stopped" });
           return;
         }
         updateBoot(normalized.code === "RECOVERY_REQUIRED"
@@ -415,6 +617,8 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
         active = false;
         lifecycleEpochRef.current += 1;
         operationEpochRef.current += 1;
+        configurationIntentRef.current += 1;
+        revokeTurnGate();
         await setup.catch(() => undefined);
         if (unsubscribe !== undefined) {
           try {
@@ -436,19 +640,20 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
     return () => {
       void cleanup();
     };
-  }, [commitStatus, enqueueOperation, isCurrentOperation, refreshState, runtime, updateBoot, updateRecovery, updateRuntimeState]);
+  }, [commitStatus, enqueueOperation, isCurrentOperation, refreshState, revokeTurnGate, runtime, updateBoot, updateRecovery, updateRuntimeState]);
 
   const value = useMemo<JaConnectionContextValue>(() => ({
-    runtime,
     boot,
     runtimeState,
     recovery,
     lastEvent,
-    start,
+    configureAndStart,
     stop,
-    startTurn,
+    submitTurn,
+    cancelTurn,
+    approvalRespond,
     acknowledgeRecovery,
-  }), [acknowledgeRecovery, boot, lastEvent, recovery, runtime, runtimeState, start, startTurn, stop]);
+  }), [acknowledgeRecovery, approvalRespond, boot, cancelTurn, configureAndStart, lastEvent, recovery, runtimeState, stop, submitTurn]);
   return <JaConnectionContext.Provider value={value}>{children}</JaConnectionContext.Provider>;
 }
 

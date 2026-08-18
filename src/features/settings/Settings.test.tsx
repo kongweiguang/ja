@@ -44,7 +44,7 @@ const fixture: SettingsSnapshot = {
     probe: { status: "unknown" },
   }],
   skills: [{ id: "skill_user_review", name: "Review checklist", source: "user", description: "用户复核规则。", enabled: true, status: "ready" }],
-  mcpServers: [{ id: "mcp_local_docs", mcpRevision: "mcp_local_docs", name: "Local docs", transport: "stdio", endpoint: "local-docs", protocolVersion: "2025-06-18", enabled: true, status: "disabled", tools: [] }],
+  mcpServers: [{ id: "mcp_local_docs", mcpRevision: "mcp_local_docs", name: "Local docs", transport: "stdio", endpoint: "local-docs", protocolVersion: "2025-06-18", enabled: true, status: "unknown", tools: [] }],
 };
 
 /** Radix portals are rendered in body, so the test follows the real select path. */
@@ -167,5 +167,29 @@ describe("JA Settings feature", () => {
     await user.click(screen.getByRole("button", { name: "保存 Server" }));
     expect(onSaveMcp).not.toHaveBeenCalled();
     expect(screen.getByLabelText("URL")).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("renders native image packaging as a truthful three-state value", () => {
+    const { rerender } = render(<Settings snapshot={defaultSettingsSnapshot} />);
+    expect(screen.getByText("未知")).toBeInTheDocument();
+
+    rerender(<Settings snapshot={{ ...defaultSettingsSnapshot, runtime: { ...defaultSettingsSnapshot.runtime, nativeImage: true } }} />);
+    expect(screen.getByText("Native Image")).toBeInTheDocument();
+
+    rerender(<Settings snapshot={{ ...defaultSettingsSnapshot, runtime: { ...defaultSettingsSnapshot.runtime, nativeImage: false } }} />);
+    expect(screen.getByText("JVM")).toBeInTheDocument();
+  });
+
+  it("shows enabled MCP as unchecked until the sidecar reports health", async () => {
+    const user = userEvent.setup();
+    const server = fixture.mcpServers[0]!;
+    render(<Settings snapshot={{ ...fixture, mcpServers: [
+      { ...server, id: "mcp_enabled", mcpRevision: "mcp_enabled", enabled: true, status: "unknown", lastError: undefined },
+      { ...server, id: "mcp_disabled", mcpRevision: "mcp_disabled", enabled: false, status: "disabled" },
+    ] }} />);
+    await user.click(screen.getByRole("tab", { name: "MCP Tools" }));
+    expect(screen.getByText("未检查")).toBeInTheDocument();
+    expect(screen.getByText("已停用")).toBeInTheDocument();
+    expect(screen.queryByText("等待 sidecar 返回 MCP 状态。")).not.toBeInTheDocument();
   });
 });

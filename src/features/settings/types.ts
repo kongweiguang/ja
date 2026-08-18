@@ -16,7 +16,7 @@ export type ThemeMode = "system" | "light" | "dark";
 export type McpTransport = "stdio" | "streamable_http";
 export type SkillSource = "builtin" | "user" | "workspace";
 export type SkillStatus = "ready" | "disabled" | "reloading" | "error";
-export type McpStatus = "connected" | "disabled" | "testing" | "error";
+export type McpStatus = "unknown" | "connected" | "disabled" | "testing" | "error";
 export type McpToolPolicy = "allow" | "ask" | "deny";
 
 /** Capability probes are read-only runtime evidence, not settings fields. */
@@ -111,7 +111,8 @@ export interface AppearanceSettings {
 
 export interface RuntimeSettings {
   sidecarVersion: string;
-  nativeImage: boolean;
+  /** Native packaging is unknown until the sidecar reports its actual runtime. */
+  nativeImage: boolean | "unknown";
   dataPath: string;
   logPath: string;
   cachePath: string;
@@ -159,5 +160,5 @@ export const defaultSettingsSnapshot: SettingsSnapshot = {
   mcpServers: [],
   permissionMode: "workspace",
   appearance: { theme: "system", palette: "developer_blue", reducedMotion: false, highContrast: false },
-  runtime: { sidecarVersion: "unknown", nativeImage: false, dataPath: "unknown", logPath: "unknown", cachePath: "unknown" },
+  runtime: { sidecarVersion: "unknown", nativeImage: "unknown", dataPath: "unknown", logPath: "unknown", cachePath: "unknown" },
 };
