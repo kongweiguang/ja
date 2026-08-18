@@ -12,6 +12,10 @@ pub mod workspace_read;
 use app_runtime::{
     EventEmitError, EventSink, RPC_FRAME_EVENT, RuntimeHost, cleanup_on_exit, prepare_run_dir,
 };
+use std::ffi::{OsStr, OsString};
+use std::fmt;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, RunEvent};
@@ -24,7 +28,13 @@ pub fn run() {
         let resource_dir = app.path().resource_dir()?;
         let run_dir = prepare_run_dir(app.path().app_data_dir()?.join("runtime"))?;
         let config = debug_or_bundled_launch_config(resource_dir, run_dir)?;
-        let settings_root = app.path().app_data_dir()?.join("settings");
+        let settings_root = resolve_settings_root(
+            app.path().app_data_dir()?,
+            debug_settings_root_override().as_deref(),
+        )
+        .map_err(|error| {
+            tauri::Error::Setup((Box::new(error) as Box<dyn std::error::Error>).into())
+        })?;
         let settings = settings::SettingsCommandHost::new(settings_root).map_err(|error| {
             tauri::Error::Setup((Box::new(error) as Box<dyn std::error::Error>).into())
         })?;
@@ -145,6 +155,72 @@ fn close_preview_windows<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
     }
 }
 
+/// Chooses the settings directory without letting a test-only host override
+/// alter release behavior; the default remains Tauri's app-data child.
+fn resolve_settings_root(
+    app_data_dir: PathBuf,
+    override_root: Option<&OsStr>,
+) -> Result<PathBuf, SettingsRootError> {
+    let Some(raw_override) = override_root else {
+        return Ok(app_data_dir.join("settings"));
+    };
+
+    let override_root = PathBuf::from(raw_override);
+    if !override_root.is_absolute() {
+        return Err(SettingsRootError::InvalidConfiguration);
+    }
+
+    match fs::metadata(&override_root) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(SettingsRootError::InvalidConfiguration);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(SettingsRootError::SetupFailed),
+    }
+
+    fs::create_dir_all(&override_root).map_err(|_| SettingsRootError::SetupFailed)?;
+    let canonical_root =
+        fs::canonicalize(&override_root).map_err(|_| SettingsRootError::SetupFailed)?;
+    let metadata = fs::metadata(&canonical_root).map_err(|_| SettingsRootError::SetupFailed)?;
+    if !metadata.is_dir() {
+        return Err(SettingsRootError::InvalidConfiguration);
+    }
+    Ok(canonical_root)
+}
+
+/// Reads the debug-only settings root hook; release has no environment read.
+#[cfg(debug_assertions)]
+fn debug_settings_root_override() -> Option<OsString> {
+    std::env::var_os("JA_E2E_SETTINGS_ROOT")
+}
+
+/// Keeps release builds independent from the host's test environment.
+#[cfg(not(debug_assertions))]
+fn debug_settings_root_override() -> Option<OsString> {
+    None
+}
+
+/// Keeps setup failures stable and prevents filesystem details from reaching
+/// the UI or test logs through an error's display text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsRootError {
+    InvalidConfiguration,
+    SetupFailed,
+}
+
+impl fmt::Display for SettingsRootError {
+    /// Emits only a stable category so setup diagnostics cannot disclose paths.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidConfiguration => "invalid settings configuration",
+            Self::SetupFailed => "settings setup failed",
+        })
+    }
+}
+
+impl std::error::Error for SettingsRootError {}
+
 /// Applies the same cleanup/prevent policy in production and MockRuntime
 /// tests; a failed first attempt leaves the managed owner alive for retry.
 pub fn handle_exit_requested(host: &RuntimeHost, api: &tauri::ExitRequestApi) {
@@ -171,4 +247,94 @@ fn debug_or_bundled_launch_config(
         return app_runtime::LaunchConfig::debug_java(java.into(), jar.into(), run_dir);
     }
     app_runtime::bundled_launch_config(resource_dir, run_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SettingsRootError, resolve_settings_root};
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Creates an isolated path so tests can verify directory creation without
+    /// changing process-global environment variables or touching app data.
+    fn test_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ja-settings-root-{}-{}-{}",
+            std::process::id(),
+            label,
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    /// Removes only the test-owned temporary tree after each root-selection
+    /// assertion, leaving real settings directories untouched.
+    fn cleanup(path: &PathBuf) {
+        let _ = fs::remove_dir_all(path);
+        let _ = fs::remove_file(path);
+    }
+
+    /// Confirms the absence of the debug hook preserves the original app-data
+    /// child path and does not eagerly create it.
+    #[test]
+    fn default_root_is_app_data_settings_child() {
+        let app_data = test_root("default");
+        let expected = app_data.join("settings");
+        let resolved = resolve_settings_root(app_data.clone(), None).expect("default root");
+        assert_eq!(resolved, expected);
+        assert!(!app_data.exists());
+        cleanup(&app_data);
+    }
+
+    /// Confirms a debug override creates and canonicalizes a valid absolute
+    /// directory without relying on a mutable environment variable.
+    #[test]
+    fn absolute_override_is_created_and_canonicalized() {
+        let app_data = test_root("absolute-app-data");
+        let override_root = test_root("absolute-override");
+        let resolved = resolve_settings_root(app_data.clone(), Some(override_root.as_os_str()))
+            .expect("absolute override");
+        let expected = fs::canonicalize(&override_root).expect("canonical override");
+        assert_eq!(resolved, expected);
+        assert!(resolved.is_dir());
+        cleanup(&app_data);
+        cleanup(&override_root);
+    }
+
+    /// Confirms relative paths are rejected before any directory mutation.
+    #[test]
+    fn relative_override_is_rejected() {
+        let app_data = test_root("relative-app-data");
+        let result = resolve_settings_root(app_data.clone(), Some(OsStr::new("settings-test")));
+        assert_eq!(result, Err(SettingsRootError::InvalidConfiguration));
+        assert!(!app_data.exists());
+        cleanup(&app_data);
+    }
+
+    /// Confirms an existing file cannot be promoted to a settings directory.
+    #[test]
+    fn file_override_is_rejected() {
+        let app_data = test_root("file-app-data");
+        let file_path = test_root("file-override");
+        fs::write(&file_path, b"not a directory").expect("test file");
+        let result = resolve_settings_root(app_data.clone(), Some(file_path.as_os_str()));
+        assert_eq!(result, Err(SettingsRootError::InvalidConfiguration));
+        cleanup(&app_data);
+        cleanup(&file_path);
+    }
+
+    /// Confirms malformed host paths map to a stable setup category without
+    /// echoing the invalid path in the returned error.
+    #[test]
+    fn malformed_override_is_stable_and_path_free() {
+        let app_data = test_root("invalid-app-data");
+        let invalid_path = test_root("invalid").join("bad\0root");
+        let result = resolve_settings_root(app_data.clone(), Some(invalid_path.as_os_str()));
+        assert_eq!(result, Err(SettingsRootError::SetupFailed));
+        let error = result.expect_err("invalid path must fail");
+        assert_eq!(error.to_string(), "settings setup failed");
+        assert!(!error.to_string().contains("bad"));
+        cleanup(&app_data);
+        cleanup(&invalid_path);
+    }
 }

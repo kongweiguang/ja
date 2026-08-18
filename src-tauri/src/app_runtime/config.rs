@@ -11,7 +11,6 @@ use crate::settings::{
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-#[cfg(any(test, feature = "test-support", debug_assertions))]
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
