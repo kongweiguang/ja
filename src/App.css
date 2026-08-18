@@ -31,7 +31,12 @@ button, textarea { font: inherit; }
 .ja-sidebar-label, .ja-sidebar-muted, .ja-sidebar-thread { margin: 0; font-size: 0.75rem; }
 .ja-sidebar-label { color: var(--ja-foreground-muted); font-weight: 700; }
 .ja-sidebar-muted { color: var(--ja-foreground-muted); line-height: 1.45; }
-.ja-sidebar-thread { overflow: hidden; color: var(--ja-foreground-muted); text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.68rem; }
+.ja-sidebar-thread-list { display: grid; gap: 0.2rem; min-width: 0; }
+.ja-sidebar-thread { display: grid; gap: 0.15rem; width: 100%; overflow: hidden; padding: 0.45rem 0.5rem; border: 0; border-radius: var(--ja-radius-md); color: var(--ja-foreground-muted); background: transparent; cursor: pointer; text-align: left; }
+.ja-sidebar-thread span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ja-foreground); }
+.ja-sidebar-thread small { color: var(--ja-foreground-muted); font-size: 0.68rem; }
+.ja-sidebar-thread:hover, .ja-sidebar-thread[aria-current="page"] { background: var(--ja-surface-muted); }
+.ja-sidebar-thread:disabled { cursor: wait; opacity: 0.65; }
 .ja-settings-entry { display: inline-flex; align-items: center; gap: 0.45rem; width: 100%; margin-top: auto; padding: 0.55rem 0.65rem; border: 0; border-radius: var(--ja-radius-md); color: var(--ja-foreground); background: transparent; cursor: pointer; text-align: left; }
 .ja-settings-entry:hover, .ja-settings-entry[aria-current="page"] { background: var(--ja-surface-muted); }
 

@@ -7,6 +7,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RuntimeHostAdapter, RuntimeStatus, TurnCancelInput } from "./ipc/runtime";
 import type { LoadedSettings, SettingsDocument } from "./ipc/settings";
+import type { HistoryAdapter } from "./ipc/history";
 import App from "./App";
 
 /** jsdom lacks the media-query API used by ThemeProvider, so tests install the narrow browser boundary. */
@@ -67,6 +68,17 @@ function createSettingsAdapter(withProfile: boolean) {
   };
 }
 
+/** Keeps App tests on the same fixed history boundary without invoking Tauri. */
+function createHistoryAdapter(): HistoryAdapter {
+  let workspaceId = "";
+  return {
+    workspaceList: vi.fn(async () => ({ workspaces: [] })),
+    threadList: vi.fn(async ({ workspaceId: selectedWorkspace }) => { workspaceId = selectedWorkspace; return { threads: [] as Array<{ threadId: string; workspaceId: string; title: string; status: "idle"; lastSeq: number }>, nextCursor: undefined }; }),
+    threadCreate: vi.fn(async ({ workspaceId: selectedWorkspace }) => { workspaceId = selectedWorkspace; return { thread: { threadId: "thr_created", workspaceId: selectedWorkspace, title: "新对话", status: "idle" as const, lastSeq: 0 } }; }),
+    threadRead: vi.fn(async ({ threadId }) => ({ serverInstanceId: "srv_fixture", thread: { threadId, workspaceId, title: "历史对话", status: "idle" as const, lastSeq: 0 }, items: [], snapshotSeq: 0 })),
+  };
+}
+
 describe("JA application shell", () => {
   beforeEach(() => installMatchMedia());
   afterEach(() => cleanup());
@@ -94,7 +106,7 @@ describe("JA application shell", () => {
   it("exposes only the active model and starts turns with its profile revision", async () => {
     const native = createRuntime();
     const picker = vi.fn(async () => "C:\\dev\\demo");
-    render(<App runtime={native.runtime} settingsAdapter={createSettingsAdapter(true)} projectPicker={{ pick: picker }} />);
+    render(<App runtime={native.runtime} settingsAdapter={createSettingsAdapter(true)} projectPicker={{ pick: picker }} historyAdapter={createHistoryAdapter()} />);
     await waitFor(() => expect(screen.getByRole("button", { name: "选择项目目录" })).toBeInTheDocument());
     await userEvent.click(screen.getByRole("button", { name: "选择项目目录" }));
     await waitFor(() => expect(screen.getByRole("heading", { name: "开始 coding" })).toBeInTheDocument());
@@ -132,7 +144,7 @@ describe("JA application shell", () => {
 
   it("routes cancel through the active turn and does not create a second turn", async () => {
     const native = createRuntime();
-    render(<App runtime={native.runtime} settingsAdapter={createSettingsAdapter(true)} projectPicker={{ pick: vi.fn(async () => "C:\\dev\\demo") }} />);
+    render(<App runtime={native.runtime} settingsAdapter={createSettingsAdapter(true)} projectPicker={{ pick: vi.fn(async () => "C:\\dev\\demo") }} historyAdapter={createHistoryAdapter()} />);
     await waitFor(() => expect(screen.getByRole("button", { name: "选择项目目录" })).toBeInTheDocument());
     await userEvent.click(screen.getByRole("button", { name: "选择项目目录" }));
     await waitFor(() => expect(screen.getByRole("heading", { name: "开始 coding" })).toBeInTheDocument());

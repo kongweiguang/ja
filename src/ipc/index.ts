@@ -62,3 +62,22 @@ export type {
   GitStatusEntry,
   GitStatusInput,
 } from "./git";
+
+export {
+  JA_HISTORY_COMMANDS,
+  TauriHistoryAdapter,
+  createHistoryAdapter,
+} from "./history";
+export type {
+  HistoryAdapter,
+  HistoryNativeBridge,
+  HistoryThread,
+  HistoryThreadCreateInput,
+  HistoryThreadListInput,
+  HistoryThreadListResult,
+  HistoryThreadReadInput,
+  HistoryThreadReadResult,
+  HistoryWorkspace,
+  HistoryWorkspaceListInput,
+  HistoryWorkspaceListResult,
+} from "./history";

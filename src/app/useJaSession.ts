@@ -5,9 +5,11 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useJaConnection } from "./ConnectionProvider";
 import { TauriSettingsAdapter, type LoadedSettings, type SettingsDocument, type SettingsProfile } from "@/ipc/settings";
+import { createHistoryAdapter, type HistoryAdapter, type HistoryThread } from "@/ipc/history";
 import type { RuntimeStatus } from "@/ipc/runtime";
 import type { AppearanceSettings, ModelProfileSave, PermissionMode, SettingsPorts, SettingsSnapshot } from "@/features/settings/types";
 import { useUiPreferencesStore } from "@/stores/uiPreferences";
+import { useTimelineStore } from "@/stores/timelineStore";
 
 /** A testable boundary keeps Tauri's native picker out of React component code. */
 export interface ProjectPicker {
@@ -34,6 +36,7 @@ export function createTauriProjectPicker(): ProjectPicker {
 
 const defaultSettingsAdapter: SettingsAdapter = new TauriSettingsAdapter();
 const defaultProjectPicker = createTauriProjectPicker();
+const defaultHistoryAdapter: HistoryAdapter = createHistoryAdapter();
 
 export interface JaProject {
   workspaceId: string;
@@ -57,17 +60,32 @@ export interface JaSession {
   view: JaSessionView;
   setView: (view: JaSessionView) => void;
   chooseProject: () => Promise<void>;
-  newConversation: () => void;
+  newConversation: () => Promise<void>;
+  selectConversation: (threadId: string) => Promise<void>;
+  threads: HistoryThread[];
   currentThreadId: string | undefined;
+  historyBusy: boolean;
+  historyError: string | undefined;
   settingsPorts: SettingsPorts;
   reloadSettings: () => Promise<void>;
 }
 
-/** Generates protocol identities once per explicit user intent, not per render. */
-function stableId(prefix: "ws_" | "thr_"): string {
-  const uuid = globalThis.crypto?.randomUUID?.();
-  const suffix = uuid ?? `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
-  return `${prefix}${suffix.replaceAll("-", "")}`;
+/**
+ * Derives the workspace identity from the exact picker result so reopening the
+ * same path addresses the same persisted history without inventing another
+ * client-side identity or silently normalizing a user-selected path.
+ */
+export async function stableWorkspaceId(rootPath: string): Promise<string> {
+  const cryptoApi = globalThis.crypto;
+  if (cryptoApi?.subtle === undefined) {
+    throw new Error("workspace identity crypto unavailable");
+  }
+  const digest = await cryptoApi.subtle.digest("SHA-256", new TextEncoder().encode(rootPath));
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  if (hex.length !== 64) {
+    throw new Error("workspace identity digest invalid");
+  }
+  return `ws_${hex}`;
 }
 
 /** Uses the last path segment for a readable project label without normalizing the path in WebView. */
@@ -157,7 +175,8 @@ function runtimeInput(project: JaProject, document: SettingsDocument): Parameter
 export function useJaSession({
   settingsAdapter = defaultSettingsAdapter,
   projectPicker = defaultProjectPicker,
-}: { settingsAdapter?: SettingsAdapter; projectPicker?: ProjectPicker } = {}): JaSession {
+  historyAdapter = defaultHistoryAdapter,
+}: { settingsAdapter?: SettingsAdapter; projectPicker?: ProjectPicker; historyAdapter?: HistoryAdapter } = {}): JaSession {
   const { configureAndStart } = useJaConnection();
   const setThemeMode = useUiPreferencesStore((state) => state.setThemeMode);
   const [loadedSettings, setLoadedSettings] = useState<LoadedSettings>();
@@ -169,8 +188,170 @@ export function useJaSession({
   const [configuredStatus, setConfiguredStatus] = useState<RuntimeStatus>();
   const [view, setView] = useState<JaSessionView>("workspace");
   const [currentThreadId, setCurrentThreadId] = useState<string>();
+  const [threads, setThreads] = useState<HistoryThread[]>([]);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [historyError, setHistoryError] = useState<string>();
   const settingsRef = useRef<LoadedSettings | undefined>(undefined);
   const loadStartedRef = useRef(false);
+  const projectRef = useRef<JaProject | undefined>(undefined);
+  const projectIntentRef = useRef(0);
+  const historyRequestRef = useRef(0);
+  const mountedRef = useRef(false);
+
+  /**
+   * Removes every UI projection of a workspace after a failed runtime
+   * replacement, so the shell cannot present an old thread against a newer or
+   * unavailable sidecar generation.
+   */
+  const failClosedProject = useCallback((message: string): void => {
+    projectRef.current = undefined;
+    setProject(undefined);
+    setConfiguredStatus(undefined);
+    setCurrentThreadId(undefined);
+    setThreads([]);
+    setView("workspace");
+    setHistoryBusy(false);
+    setHistoryError(undefined);
+    setProjectError(message);
+    useTimelineStore.getState().reset();
+  }, []);
+
+  /**
+   * Accepts a snapshot only when the reducer still belongs to the ready
+   * runtime that produced it.  This prevents a late read from replacing a
+  * newer project's timeline or a restarted sidecar's event stream.
+   */
+  const applyHistorySnapshot = useCallback((snapshot: unknown, workspaceId: string): boolean => {
+    if (!mountedRef.current) {
+      return false;
+    }
+    const state = useTimelineStore.getState();
+    const runtime = state.runtime;
+    if (state.handshake.phase !== "ready"
+      || state.handshake.generation <= 0
+      || state.serverInstanceId === undefined
+      || runtime === undefined
+      || !["ready", "busy"].includes(runtime.status)) {
+      return false;
+    }
+    if (typeof snapshot !== "object" || snapshot === null) {
+      return false;
+    }
+    const candidate = snapshot as { serverInstanceId?: unknown; thread?: { workspaceId?: unknown } };
+    if (candidate.serverInstanceId !== state.serverInstanceId || candidate.thread?.workspaceId !== workspaceId) {
+      return false;
+    }
+    return useTimelineStore.getState().applySnapshot(snapshot) === "applied";
+  }, []);
+
+  /** Returns whether an asynchronous history result still belongs to the UI intent that issued it. */
+  const isCurrentHistoryRequest = useCallback((intent: number, request: number, workspaceId: string): boolean => (
+    mountedRef.current
+      && projectIntentRef.current === intent
+      && historyRequestRef.current === request
+      && projectRef.current?.workspaceId === workspaceId
+  ), []);
+
+  /**
+   * Applies the same lifecycle fence to configure continuations that do not
+   * yet have a history request token, preventing an unmounted hook from
+   * writing React state after a native startup promise resolves.
+   */
+  const isCurrentProjectIntent = useCallback((intent: number): boolean => (
+    mountedRef.current && projectIntentRef.current === intent
+  ), []);
+
+  /**
+   * Completes a newly created thread through the same snapshot baseline as an
+   * existing thread; selection is withheld until reducer validation succeeds.
+   */
+  const createAndRestoreThread = useCallback(async (
+    selected: JaProject,
+    profileRevision: string | undefined,
+    canContinue: () => boolean,
+  ): Promise<HistoryThread | undefined> => {
+    const created = await historyAdapter.threadCreate({
+      workspaceId: selected.workspaceId,
+      ...(profileRevision === undefined ? {} : { profileRevision }),
+    });
+    if (!canContinue()) {
+      return undefined;
+    }
+    if (created.thread.workspaceId !== selected.workspaceId) {
+      throw new Error("created thread belongs to another workspace");
+    }
+    const snapshot = await historyAdapter.threadRead({ threadId: created.thread.threadId, view: "snapshot" });
+    if (!canContinue()) {
+      return undefined;
+    }
+    if (snapshot.thread.threadId !== created.thread.threadId
+      || snapshot.thread.workspaceId !== selected.workspaceId
+      || !applyHistorySnapshot(snapshot, selected.workspaceId)) {
+      throw new Error("created thread snapshot was not applied");
+    }
+    return snapshot.thread;
+  }, [applyHistorySnapshot, historyAdapter]);
+
+  /**
+   * Loads the server-ordered thread list and restores its first snapshot. A
+   * single request token covers list/read/create so quick project switches
+   * cannot let an old promise overwrite the current sidebar.
+   */
+  const loadProjectHistory = useCallback(async (
+    selected: JaProject,
+    intent: number,
+    profileRevision: string | undefined,
+  ): Promise<void> => {
+    const request = historyRequestRef.current + 1;
+    historyRequestRef.current = request;
+    setHistoryBusy(true);
+    setHistoryError(undefined);
+    const current = (): boolean => isCurrentHistoryRequest(intent, request, selected.workspaceId);
+    try {
+      const listed = await historyAdapter.threadList({
+        workspaceId: selected.workspaceId,
+        includeArchived: false,
+        // v1 is one bounded page; thread/read deliberately has no paging args.
+        limit: 500,
+      });
+      if (!current()) {
+        return;
+      }
+      if (listed.threads.some((thread) => thread.workspaceId !== selected.workspaceId)) {
+        setHistoryError("历史会话数据无法恢复，请重新选择项目。 ");
+        return;
+      }
+      const first = listed.threads[0];
+      if (first !== undefined) {
+        const snapshot = await historyAdapter.threadRead({ threadId: first.threadId, view: "snapshot" });
+        if (!current()) {
+          return;
+        }
+        if (snapshot.thread.threadId !== first.threadId || !applyHistorySnapshot(snapshot, selected.workspaceId)) {
+          setHistoryError("最近的会话无法恢复，请重新选择项目。 ");
+          return;
+        }
+        setThreads(listed.threads.map((thread) => thread.threadId === first.threadId ? snapshot.thread : thread));
+        setCurrentThreadId(first.threadId);
+        return;
+      }
+
+      const restored = await createAndRestoreThread(selected, profileRevision, current);
+      if (!current() || restored === undefined) {
+        return;
+      }
+      setThreads([restored]);
+      setCurrentThreadId(restored.threadId);
+    } catch {
+      if (current()) {
+        setHistoryError("历史会话暂时不可用，请重试。 ");
+      }
+    } finally {
+      if (current()) {
+        setHistoryBusy(false);
+      }
+    }
+  }, [applyHistorySnapshot, createAndRestoreThread, historyAdapter, isCurrentHistoryRequest]);
 
   /** Loads once on mount; the sidecar must not be configured by this effect. */
   const reloadSettings = useCallback(async (): Promise<void> => {
@@ -192,6 +373,17 @@ export function useJaSession({
       setSettingsLoading(false);
     }
   }, [setThemeMode, settingsAdapter]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      // Invalidate before any promise continuation can run. StrictMode may
+      // setup/cleanup this effect twice; the next setup re-arms the fence.
+      mountedRef.current = false;
+      projectIntentRef.current += 1;
+      historyRequestRef.current += 1;
+    };
+  }, []);
 
   useEffect(() => {
     if (loadStartedRef.current) {
@@ -230,14 +422,43 @@ export function useJaSession({
 
   /** Rebinds an already selected workspace after a persisted profile change. */
   const reconfigureProject = useCallback(async (document: SettingsDocument): Promise<void> => {
-    const selected = project;
-    if (selected === undefined || activeProfile(document) === undefined) {
+    const selected = projectRef.current ?? project;
+    const nextProfile = activeProfile(document);
+    if (selected === undefined || nextProfile === undefined) {
       return;
     }
+    // A settings change replaces the sidecar generation. Invalidate an older
+    // history read before the restart so it cannot restore the old timeline.
+    const intent = projectIntentRef.current + 1;
+    projectIntentRef.current = intent;
+    historyRequestRef.current += 1;
+    setProjectBusy(true);
+    setHistoryBusy(false);
+    setCurrentThreadId(undefined);
+    setThreads([]);
     setProjectError(undefined);
-    const status = await configureAndStart(runtimeInput(selected, document));
-    setConfiguredStatus(status);
-  }, [configureAndStart, project]);
+    try {
+      const status = await configureAndStart(runtimeInput(selected, document));
+      if (!isCurrentProjectIntent(intent) || projectRef.current?.workspaceId !== selected.workspaceId) {
+        return;
+      }
+      if (status.status !== "ready" && status.status !== "busy") {
+        failClosedProject("项目运行时未就绪，请重试。 ");
+        return;
+      }
+      setConfiguredStatus(status);
+      await loadProjectHistory(selected, intent, nextProfile.profileRevision);
+    } catch (error) {
+      if (isCurrentProjectIntent(intent)) {
+        failClosedProject("项目运行时启动失败，请重试。 ");
+      }
+      throw error;
+    } finally {
+      if (isCurrentProjectIntent(intent)) {
+        setProjectBusy(false);
+      }
+    }
+  }, [configureAndStart, failClosedProject, isCurrentProjectIntent, loadProjectHistory, project]);
 
   /** Merges a UI profile DTO into the native document without losing native-only policy arrays. */
   const saveProfile = useCallback(async (profile: ModelProfileSave): Promise<void> => {
@@ -306,6 +527,13 @@ export function useJaSession({
     }
     setProjectBusy(true);
     setProjectError(undefined);
+    const intent = projectIntentRef.current + 1;
+    projectIntentRef.current = intent;
+    historyRequestRef.current += 1;
+    // Picker cancellation is a new intent, so any previous history request
+    // must stop showing busy while its late result is discarded.
+    setHistoryBusy(false);
+    let switching = false;
     try {
       const rootPath = await projectPicker.pick();
       if (rootPath === null) {
@@ -315,26 +543,116 @@ export function useJaSession({
         setProjectError("请选择一个项目目录。 ");
         return;
       }
-      const selected: JaProject = { workspaceId: stableId("ws_"), rootPath, displayName: projectName(rootPath), trust: "trusted" };
+      switching = true;
+      setHistoryError(undefined);
+      const workspaceId = await stableWorkspaceId(rootPath);
+      if (!isCurrentProjectIntent(intent)) {
+        return;
+      }
+      const selected: JaProject = { workspaceId, rootPath, displayName: projectName(rootPath), trust: "trusted" };
+      // Do not expose the old project while a new sidecar is being configured.
+      // The old project remains untouched until the picker returns a real path.
+      projectRef.current = undefined;
+      setProject(undefined);
+      setConfiguredStatus(undefined);
+      setCurrentThreadId(undefined);
+      setThreads([]);
+      useTimelineStore.getState().reset();
       const status = await configureAndStart(runtimeInput(selected, current.document));
+      if (!isCurrentProjectIntent(intent)) {
+        return;
+      }
+      if (status.status !== "ready" && status.status !== "busy") {
+        failClosedProject("项目运行时未就绪，请重试。 ");
+        return;
+      }
+      projectRef.current = selected;
       setProject(selected);
       setConfiguredStatus(status);
-      setCurrentThreadId(stableId("thr_"));
       setView("workspace");
+      await loadProjectHistory(selected, intent, activeProfile(current.document)?.profileRevision);
     } catch {
-      setProjectError("项目未能打开，请检查目录和运行时状态后重试。 ");
+      if (isCurrentProjectIntent(intent)) {
+        if (switching) {
+          failClosedProject("项目未能打开，请检查目录和运行时状态后重试。 ");
+        } else {
+          setProjectError("项目未能打开，请检查目录和运行时状态后重试。 ");
+        }
+      }
     } finally {
-      setProjectBusy(false);
+      if (isCurrentProjectIntent(intent)) {
+        setProjectBusy(false);
+      }
     }
-  }, [configureAndStart, projectPicker]);
+  }, [configureAndStart, failClosedProject, isCurrentProjectIntent, loadProjectHistory, projectPicker]);
 
-  /** Starts a fresh current conversation without inventing persisted history. */
-  const newConversation = useCallback((): void => {
-    if (project === undefined) {
+  /** Creates a real durable thread so a new conversation survives reload. */
+  const newConversation = useCallback(async (): Promise<void> => {
+    const selected = projectRef.current ?? project;
+    const profile = activeProfile(settingsRef.current?.document);
+    if (selected === undefined || profile === undefined) {
       return;
     }
-    setCurrentThreadId(stableId("thr_"));
-  }, [project]);
+    const intent = projectIntentRef.current;
+    const request = historyRequestRef.current + 1;
+    historyRequestRef.current = request;
+    setHistoryBusy(true);
+    setHistoryError(undefined);
+    try {
+      const restored = await createAndRestoreThread(
+        selected,
+        profile.profileRevision,
+        () => isCurrentHistoryRequest(intent, request, selected.workspaceId),
+      );
+      if (!isCurrentHistoryRequest(intent, request, selected.workspaceId) || restored === undefined) {
+        return;
+      }
+      setThreads((current) => current.some((thread) => thread.threadId === restored.threadId)
+        ? current.map((thread) => thread.threadId === restored.threadId ? restored : thread)
+        : [...current, restored]);
+      setCurrentThreadId(restored.threadId);
+    } catch {
+      if (isCurrentHistoryRequest(intent, request, selected.workspaceId)) {
+        setHistoryError("新会话暂时无法创建，请重试。 ");
+      }
+    } finally {
+      if (isCurrentHistoryRequest(intent, request, selected.workspaceId)) {
+        setHistoryBusy(false);
+      }
+    }
+  }, [createAndRestoreThread, isCurrentHistoryRequest, project]);
+
+  /** Restores one selected thread only after its snapshot passes the runtime gate. */
+  const selectConversation = useCallback(async (threadId: string): Promise<void> => {
+    const selected = projectRef.current ?? project;
+    if (selected === undefined || !threads.some((thread) => thread.threadId === threadId)) {
+      return;
+    }
+    const intent = projectIntentRef.current;
+    const request = historyRequestRef.current + 1;
+    historyRequestRef.current = request;
+    setHistoryBusy(true);
+    setHistoryError(undefined);
+    try {
+      const snapshot = await historyAdapter.threadRead({ threadId, view: "snapshot" });
+      if (!isCurrentHistoryRequest(intent, request, selected.workspaceId)) {
+        return;
+      }
+      if (snapshot.thread.threadId !== threadId || !applyHistorySnapshot(snapshot, selected.workspaceId)) {
+        setHistoryError("会话无法恢复，请重新选择项目。 ");
+        return;
+      }
+      setCurrentThreadId(threadId);
+    } catch {
+      if (isCurrentHistoryRequest(intent, request, selected.workspaceId)) {
+        setHistoryError("会话暂时无法读取，请重试。 ");
+      }
+    } finally {
+      if (isCurrentHistoryRequest(intent, request, selected.workspaceId)) {
+        setHistoryBusy(false);
+      }
+    }
+  }, [applyHistorySnapshot, historyAdapter, isCurrentHistoryRequest, project, threads]);
 
   const settingsPorts = useMemo<SettingsPorts>(() => ({
     onSaveProfile: saveProfile,
@@ -356,7 +674,11 @@ export function useJaSession({
     setView,
     chooseProject,
     newConversation,
+    selectConversation,
+    threads,
     currentThreadId,
+    historyBusy,
+    historyError,
     settingsPorts,
     reloadSettings,
   };

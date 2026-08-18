@@ -13,6 +13,7 @@ import { Composer, type ComposerSubmit } from "./features/composer";
 import { ChatTimeline } from "./features/timeline";
 import { Workbench } from "./features/workspace";
 import type { ApprovalSummary, Turn } from "./ipc/runtimeEvents";
+import type { HistoryAdapter, HistoryThread } from "./ipc/history";
 import { selectApprovalDecisions, selectApprovals, selectItemsForThread, useTimelineStore } from "./stores/timelineStore";
 import { useShallow } from "zustand/react/shallow";
 import "./App.css";
@@ -75,29 +76,58 @@ function RecoveryPanel(): ReactElement {
 interface SidebarProps {
   hasProfile: boolean;
   projectName?: string;
-  threadId?: string;
+  currentThreadId?: string;
+  threads: HistoryThread[];
+  historyBusy: boolean;
+  historyError?: string;
   projectBusy: boolean;
-  onNewConversation: () => void;
+  onNewConversation: () => void | Promise<void>;
+  onSelectConversation: (threadId: string) => void | Promise<void>;
   onChooseProject: () => void;
   onOpenSettings: () => void;
   onOpenWorkspace: () => void;
   settingsOnly: boolean;
 }
 
-/** Keeps navigation deliberately small because persistent thread CRUD is not wired yet. */
-function Sidebar({ hasProfile, projectName, threadId, projectBusy, onNewConversation, onChooseProject, onOpenSettings, onOpenWorkspace, settingsOnly }: SidebarProps): ReactElement {
+/** Keeps navigation small while exposing only server-owned history titles/status. */
+function Sidebar({ hasProfile, projectName, currentThreadId, threads, historyBusy, historyError, projectBusy, onNewConversation, onSelectConversation, onChooseProject, onOpenSettings, onOpenWorkspace, settingsOnly }: SidebarProps): ReactElement {
+  /** Maps server status to a short user-facing label without exposing IDs. */
+  const threadStatus = (status: HistoryThread["status"]): string => {
+    switch (status) {
+      case "running": return "工作中";
+      case "waiting_approval": return "等待确认";
+      case "archived": return "已归档";
+      case "idle": return "就绪";
+    }
+  };
   return (
     <aside className="ja-sidebar" aria-label="项目导航">
       <div className="ja-sidebar-brand"><span className="ja-brand-mark" aria-hidden="true">JA</span><span><strong>JA</strong><small>Coding harness</small></span></div>
       <nav className="ja-navigation" aria-label="主要导航">
-        <Button type="button" variant="secondary" className="ja-nav-button" disabled={!hasProfile || projectName === undefined} onClick={onNewConversation}><Plus data-icon="inline-start" />新对话</Button>
+        <Button type="button" variant="secondary" className="ja-nav-button" disabled={!hasProfile || projectName === undefined || historyBusy} onClick={() => void onNewConversation()}><Plus data-icon="inline-start" />新对话</Button>
         <Button type="button" variant={settingsOnly ? "secondary" : "ghost"} className="ja-nav-button" disabled={!hasProfile || projectBusy} onClick={onChooseProject}><FolderOpen data-icon="inline-start" />{projectName ?? "选择项目"}</Button>
         <Button type="button" variant={!settingsOnly ? "secondary" : "ghost"} className="ja-nav-button" disabled={projectName === undefined} onClick={onOpenWorkspace}><PanelRight data-icon="inline-start" />对话</Button>
       </nav>
       <div className="ja-sidebar-history">
-        <p className="ja-sidebar-label">当前对话</p>
-        {threadId === undefined ? <p className="ja-sidebar-muted">选择项目后开始。</p> : <p className="ja-sidebar-thread">{threadId}</p>}
-        <p className="ja-sidebar-muted">历史将在持久 thread 接入后提供。</p>
+        <p className="ja-sidebar-label">历史对话</p>
+        {historyBusy ? <p className="ja-sidebar-muted" role="status">正在读取会话…</p> : null}
+        {historyError === undefined ? null : <p className="ja-inline-error" role="alert">{historyError}</p>}
+        {!historyBusy && threads.length === 0 && historyError === undefined ? <p className="ja-sidebar-muted">选择项目后开始。</p> : null}
+        <div className="ja-sidebar-thread-list" role="list" aria-label="历史对话列表">
+          {threads.map((thread) => (
+            <div key={thread.threadId} role="listitem">
+              <button
+                type="button"
+                className="ja-sidebar-thread"
+                aria-current={currentThreadId === thread.threadId ? "page" : undefined}
+                onClick={() => void onSelectConversation(thread.threadId)}
+              >
+                <span>{thread.title || "未命名对话"}</span>
+                <small>{threadStatus(thread.status)}</small>
+              </button>
+            </div>
+          ))}
+        </div>
       </div>
       <button type="button" className="ja-settings-entry" onClick={onOpenSettings} aria-current={settingsOnly ? "page" : undefined}><Settings2 data-icon="inline-start" />设置</button>
     </aside>
@@ -215,11 +245,13 @@ function Workspace({ session }: WorkspaceProps): ReactElement {
   }
 
   const ready = boot.status === "ready" || boot.status === "busy";
-  const composerDisabled = !ready || profile === undefined || threadId === "" || session.projectBusy;
+  const composerDisabled = !ready || profile === undefined || threadId === "" || session.projectBusy || session.historyBusy;
   return (
     <section className="ja-conversation" aria-label="coding 对话">
       <header className="ja-conversation-header"><div><p className="ja-kicker">{session.project.displayName}</p><h1>开始 coding</h1></div><span className="ja-conversation-mode">{profile?.name ?? "未配置模型"}</span></header>
       {boot.status === "recovery_required" ? <RecoveryPanel /> : null}
+      {session.projectError === undefined ? null : <p className="ja-inline-error" role="alert">{session.projectError}</p>}
+      {session.historyError === undefined ? null : <p className="ja-inline-error" role="alert">{session.historyError}</p>}
       <ChatTimeline items={items} turns={turns as Turn[]} approvals={approvals} approvalDecisions={approvalDecisions} onApprovalDecision={(approval, decision) => void approve(approval, decision)} />
       <Composer accessMode={profile?.accessMode ?? "workspace"} model={profile?.profileRevision} models={models} activeTurn={activeTurn !== undefined || pendingTurnId !== undefined} disabled={composerDisabled} onSend={send} onCancel={cancel} />
     </section>
@@ -230,12 +262,13 @@ interface AppProps {
   runtime?: Parameters<typeof AppProviders>[0]["runtime"];
   settingsAdapter?: SettingsAdapter;
   projectPicker?: ProjectPicker;
+  historyAdapter?: HistoryAdapter;
   workbenchAdapters?: JaWorkbenchAdapters;
 }
 
 /** Keeps native dependency injection at the composition boundary for real and jsdom runtimes. */
-function JaApplication({ settingsAdapter, projectPicker, workbenchAdapters }: Pick<AppProps, "settingsAdapter" | "projectPicker" | "workbenchAdapters">): ReactElement {
-  const session = useJaSession({ settingsAdapter, projectPicker });
+function JaApplication({ settingsAdapter, projectPicker, historyAdapter, workbenchAdapters }: Pick<AppProps, "settingsAdapter" | "projectPicker" | "historyAdapter" | "workbenchAdapters">): ReactElement {
+  const session = useJaSession({ settingsAdapter, projectPicker, historyAdapter });
   const { boot } = useJaConnection();
   const required = session.activeProfile === undefined;
   const settingsOnly = session.view === "settings" || required;
@@ -243,7 +276,7 @@ function JaApplication({ settingsAdapter, projectPicker, workbenchAdapters }: Pi
     <div className="ja-shell">
       <header className="ja-topbar"><div className="ja-topbar-brand"><span className="ja-brand-mark" aria-hidden="true">JA</span><div><strong>JA</strong><span>coding harness</span></div></div><div className="ja-runtime-status" role="status" aria-live="polite"><span className={`ja-status-dot is-${boot.status}`} aria-hidden="true" />{runtimeLabel(boot.status)}</div></header>
       <div className="ja-layout">
-        <Sidebar hasProfile={!required} projectName={session.project?.displayName} threadId={session.currentThreadId} projectBusy={session.projectBusy} onNewConversation={session.newConversation} onChooseProject={() => void session.chooseProject()} onOpenSettings={() => session.setView("settings")} onOpenWorkspace={() => session.setView("workspace")} settingsOnly={settingsOnly} />
+        <Sidebar hasProfile={!required} projectName={session.project?.displayName} currentThreadId={session.currentThreadId} threads={session.threads} historyBusy={session.historyBusy} historyError={session.historyError} projectBusy={session.projectBusy} onNewConversation={session.newConversation} onSelectConversation={session.selectConversation} onChooseProject={() => void session.chooseProject()} onOpenSettings={() => session.setView("settings")} onOpenWorkspace={() => session.setView("workspace")} settingsOnly={settingsOnly} />
         <main className="ja-main">{session.settingsLoading ? <section className="ja-loading-state" role="status">正在读取本地设置…</section> : session.settingsError !== undefined ? <section className="ja-error-state" role="alert"><h1>设置暂时不可用</h1><p>{session.settingsError}</p><Button type="button" variant="secondary" onClick={() => void session.reloadSettings()}>重新读取</Button></section> : settingsOnly ? <SettingsView session={session} required={required} /> : <Workspace session={session} />}</main>
         {settingsOnly || session.project === undefined ? null : <WorkbenchHost key={session.project.workspaceId} project={session.project} adapters={workbenchAdapters} />}
       </div>
@@ -252,8 +285,8 @@ function JaApplication({ settingsAdapter, projectPicker, workbenchAdapters }: Pi
 }
 
 /** Tauri's generated entrypoint supplies the default native adapters; tests can inject typed ports. */
-function App({ runtime, settingsAdapter, projectPicker }: AppProps): ReactElement {
-  return <AppProviders runtime={runtime}><JaApplication settingsAdapter={settingsAdapter} projectPicker={projectPicker} /></AppProviders>;
+function App({ runtime, settingsAdapter, projectPicker, historyAdapter, workbenchAdapters }: AppProps): ReactElement {
+  return <AppProviders runtime={runtime}><JaApplication settingsAdapter={settingsAdapter} projectPicker={projectPicker} historyAdapter={historyAdapter} workbenchAdapters={workbenchAdapters} /></AppProviders>;
 }
 
 export default App;
