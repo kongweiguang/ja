@@ -560,6 +560,55 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
     .expect("runtime start response");
     assert_eq!(started.status, RuntimeStatusKind::Ready);
     assert_process_marker_visible(&marker, total_deadline);
+    let workspaces = invoke(
+        "ja_workspace_list",
+        serde_json::json!({"input": {"includeArchived": false}}),
+    )
+    .expect("typed workspace history command");
+    assert!(
+        workspaces["workspaces"]
+            .as_array()
+            .expect("workspace history rows")
+            .iter()
+            .any(|workspace| workspace["workspaceId"] == "ws_mock")
+    );
+    let created_thread = invoke(
+        "ja_thread_create",
+        serde_json::json!({
+            "input": {"workspaceId": "ws_mock", "title": "Tauri history"}
+        }),
+    )
+    .expect("typed thread create command");
+    let history_thread_id = created_thread["thread"]["threadId"]
+        .as_str()
+        .expect("created thread id")
+        .to_owned();
+    let listed_threads = invoke(
+        "ja_thread_list",
+        serde_json::json!({
+            "input": {"workspaceId": "ws_mock", "limit": 10, "cursor": ""}
+        }),
+    )
+    .expect("typed thread list command");
+    assert!(
+        listed_threads["threads"]
+            .as_array()
+            .expect("thread history rows")
+            .iter()
+            .any(|thread| thread["threadId"] == history_thread_id)
+    );
+    let initial_read = invoke(
+        "ja_thread_read",
+        serde_json::json!({"input": {"threadId": history_thread_id.clone()}}),
+    )
+    .expect("typed initial thread read command");
+    assert_eq!(
+        initial_read["items"]
+            .as_array()
+            .expect("initial items")
+            .len(),
+        0
+    );
     let tree = invoke(
         "ja_workspace_tree",
         serde_json::json!({
@@ -617,7 +666,7 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
             "ja_turn_start",
             serde_json::json!({
                 "input": {
-                    "threadId": "thr_host",
+                    "threadId": history_thread_id.clone(),
                     "accessMode": "workspace",
                     "profileRevision": "profile_host",
                     "input": [{"type": "text", "text": "hello from Tauri mock command"}]
@@ -640,6 +689,22 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
         }
     }
     assert!(completed, "mock turn must complete through Tauri emitter");
+    let completed_read = invoke(
+        "ja_thread_read",
+        serde_json::json!({"input": {
+            "threadId": history_thread_id.clone(),
+            "view": "snapshot"
+        }}),
+    )
+    .expect("typed completed thread read command");
+    assert!(
+        completed_read["items"]
+            .as_array()
+            .expect("completed items")
+            .len()
+            >= 2
+    );
+    assert!(completed_read["snapshotSeq"].as_u64().unwrap_or(0) >= 2);
     assert!(
         Instant::now() < total_deadline,
         "mock turn exceeded total deadline"

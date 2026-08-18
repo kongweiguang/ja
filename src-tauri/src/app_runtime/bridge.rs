@@ -13,6 +13,7 @@ use super::config::{
     TurnStartInput, clear_recovery_record, ensure_recovery_clear, persist_recovery_record,
     recovery_marker_path, valid_frozen_turn_id,
 };
+use super::history::HistoryMethod;
 use super::projection::{emit_frame, emit_status, frame_to_value, project_approval_request};
 use crate::agent_process::codec::RpcFrame;
 use crate::agent_process::{AgentClient, EventPump, Session, SessionEvent, SidecarSupervisor};
@@ -401,6 +402,11 @@ enum BridgeCommand {
     ApprovalRespond {
         input: ApprovalResponseInput,
         reply: Reply<()>,
+    },
+    History {
+        method: HistoryMethod,
+        params: Value,
+        reply: Reply<Value>,
     },
     #[cfg(feature = "test-support")]
     QueueProbe,
@@ -1214,6 +1220,20 @@ impl RuntimeBridge {
         self.call(|reply| BridgeCommand::ApprovalRespond { input, reply })
     }
 
+    /// Sends one of the four fixed history methods through the same Ready
+    /// supervisor and timeout path as turns; no generic WebView RPC is added.
+    pub(crate) fn history_request(
+        &self,
+        method: HistoryMethod,
+        params: Value,
+    ) -> Result<Value, RuntimeCommandError> {
+        self.call(|reply| BridgeCommand::History {
+            method,
+            params,
+            reply,
+        })
+    }
+
     /// Enqueues a no-I/O probe through the production bounded command lane;
     /// its test-only shape cannot block on an unconsumed reply while proving
     /// the exact capacity boundary.
@@ -1727,6 +1747,19 @@ fn actor_loop(
             }
             Ok(BridgeCommand::ApprovalRespond { input, reply }) => {
                 let _ = reply.send(respond_approval(&mut runtime, input, &context.exit_control));
+            }
+            Ok(BridgeCommand::History {
+                method,
+                params,
+                reply,
+            }) => {
+                let _ = reply.send(history_request_runtime(
+                    &context.config,
+                    &mut runtime,
+                    method,
+                    params,
+                    &context.exit_control,
+                ));
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -2388,6 +2421,39 @@ fn cleanup_deadline(exit_control: &ExitControl, fallback: Duration) -> Instant {
     exit_control
         .deadline()
         .unwrap_or_else(|| shutdown_deadline(fallback))
+}
+
+/// Sends one fixed history query/mutation while reusing the bridge's existing
+/// session deadline and RPC error projection; history never gets a second
+/// transport, database, or request registry in Rust.
+fn history_request_runtime(
+    config: &LaunchConfig,
+    runtime: &mut Option<RunningRuntime>,
+    method: HistoryMethod,
+    params: Value,
+    exit_control: &ExitControl,
+) -> Result<Value, RuntimeCommandError> {
+    let current = runtime
+        .as_mut()
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    if let Some(session) = current.supervisor.session_for_cancellation() {
+        exit_control.attach_session(session);
+    }
+    let _session_cancellation_guard = SessionCancellationGuard::new(exit_control);
+    let timeout = operation_timeout(config.request_timeout, exit_control)?;
+    let response = current
+        .supervisor
+        .request(method.wire_name(), params, timeout)
+        .map_err(|error| RuntimeCommandError::from_process(&error))?;
+    let value = frame_to_value(&response).map_err(|_| RuntimeCommandError::unavailable())?;
+    if let Some(error) = value.get("error") {
+        return Err(command_error_from_rpc(error));
+    }
+    value
+        .get("result")
+        .cloned()
+        .filter(Value::is_object)
+        .ok_or_else(RuntimeCommandError::unavailable)
 }
 
 /// Sends one typed turn request; timeline facts remain EventPump events.
@@ -3442,11 +3508,32 @@ fn command_error_from_rpc(value: &Value) -> RuntimeCommandError {
         .and_then(|data| data.get("jaCode"))
         .and_then(Value::as_str)
     {
+        Some("WORKSPACE_NOT_FOUND") => RuntimeCommandError {
+            code: "WORKSPACE_NOT_FOUND",
+            message: "workspace was not found",
+            retryable: false,
+        },
+        Some("THREAD_NOT_FOUND") => RuntimeCommandError {
+            code: "THREAD_NOT_FOUND",
+            message: "thread was not found",
+            retryable: false,
+        },
+        Some("THREAD_READ_ONLY") => RuntimeCommandError {
+            code: "THREAD_READ_ONLY",
+            message: "thread is read-only",
+            retryable: false,
+        },
+        Some("CONFLICT") => RuntimeCommandError {
+            code: "CONFLICT",
+            message: "runtime state conflict",
+            retryable: true,
+        },
         Some("THREAD_BUSY") => RuntimeCommandError {
             code: "THREAD_BUSY",
             message: "thread is busy",
             retryable: true,
         },
+        Some("REQUEST_DEADLINE_EXCEEDED") => RuntimeCommandError::deadline(),
         Some("INVALID_PARAMS") => RuntimeCommandError::invalid_params(),
         _ => RuntimeCommandError::unavailable(),
     }

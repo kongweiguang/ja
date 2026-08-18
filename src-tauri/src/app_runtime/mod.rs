@@ -5,6 +5,7 @@
 
 mod bridge;
 mod config;
+pub(crate) mod history;
 mod host;
 mod projection;
 
@@ -33,6 +34,10 @@ pub fn register_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
         ja_approval_respond,
         ja_turn_start,
         ja_turn_cancel,
+        history::ja_workspace_list,
+        history::ja_thread_create,
+        history::ja_thread_list,
+        history::ja_thread_read,
         crate::workspace_read::command::ja_workspace_tree,
         crate::workspace_read::command::ja_workspace_read_file,
         crate::workspace_read::command::ja_workspace_search,

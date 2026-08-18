@@ -10,7 +10,9 @@ use super::config::{
     RuntimeReplayConfig, RuntimeStatus, RuntimeStatusKind, TurnAccepted, TurnCancelInput,
     TurnCancelResult, TurnStartInput, recovery_state,
 };
+use super::history::HistoryMethod;
 use crate::workspace_read::{WorkspaceHandle, WorkspaceRegistry};
+use serde_json::Value;
 #[cfg(feature = "tauri-smoke")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
@@ -194,6 +196,40 @@ impl RuntimeHost {
         input: TurnCancelInput,
     ) -> Result<TurnCancelResult, RuntimeCommandError> {
         self.ensure_bridge()?.turn_cancel(input)
+    }
+
+    /// Routes one allow-listed history request only through a configured
+    /// Ready generation, so queries cannot start or reconfigure a sidecar.
+    pub(crate) fn history_request(
+        &self,
+        method: HistoryMethod,
+        params: Value,
+    ) -> Result<Value, RuntimeCommandError> {
+        if self.config_snapshot().replay.is_none() {
+            return Err(RuntimeCommandError::configuration());
+        }
+        // History is a query surface, not a lifecycle trigger: requiring an
+        // existing bridge prevents a pre-start command from constructing a
+        // fresh actor that has not yet been admitted by `ja_runtime_start`.
+        let bridge = self
+            .bridge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(RuntimeCommandError {
+                code: "RUNTIME_NOT_READY",
+                message: "runtime is not ready",
+                retryable: true,
+            })?;
+        let status = bridge.state()?;
+        if status.status != RuntimeStatusKind::Ready {
+            return Err(RuntimeCommandError {
+                code: "RUNTIME_NOT_READY",
+                message: "runtime is not ready",
+                retryable: true,
+            });
+        }
+        bridge.history_request(method, params)
     }
 
     /// Freezes a validated workspace/profile snapshot and cleanly replaces a
