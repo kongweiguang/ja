@@ -80,7 +80,7 @@ class SqlitePersistenceLifecycleTest extends PersistenceTestSupport {
         }
         byte[] backup = Files.readAllBytes(config.backupPath());
         List<SchemaMigration> migrations = new ArrayList<>(MigrationCatalog.production().migrations());
-        migrations.add(SchemaMigration.fixed(2, "broken", "CREATE TABLE broken ("));
+        migrations.add(SchemaMigration.fixed(3, "broken", "CREATE TABLE broken ("));
         MigrationCatalog broken = new MigrationCatalog(migrations);
         PersistenceException failure = assertThrows(PersistenceException.class,
                 () -> SqlitePersistence.open(config, broken));

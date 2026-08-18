@@ -27,6 +27,10 @@ import io.github.kongweiguang.ja.profiles.ModelProfile;
 import io.github.kongweiguang.ja.profiles.SecretAccessException;
 import io.github.kongweiguang.ja.profiles.SecretRef;
 import io.github.kongweiguang.ja.profiles.SecretValue;
+import io.github.kongweiguang.ja.persistence.SqliteHistoryStore;
+import io.github.kongweiguang.ja.persistence.PersistenceException;
+import io.github.kongweiguang.ja.persistence.SqlitePersistence;
+import io.github.kongweiguang.ja.persistence.SqlitePersistenceConfig;
 import io.github.kongweiguang.ja.protocol.HandshakeJsonlCodec;
 import io.github.kongweiguang.ja.protocol.JaErrorCode;
 import io.github.kongweiguang.ja.protocol.JsonNodes;
@@ -82,6 +86,10 @@ public final class StdioRuntime implements AutoCloseable {
     private static final Duration SHUTDOWN_TIMEOUT = Duration.ofSeconds(2);
     private static final Duration SECRET_RESOLVE_TIMEOUT = Duration.ofSeconds(5);
     private static final String PROBE_TOKEN = "0123456789abcdef0123456789abcdef";
+    private static final int MAX_HISTORY_LIST_ROWS = 500;
+    private static final int MAX_HISTORY_ITEMS = 10_000;
+    private static final int MAX_WORKSPACE_ROOT_LENGTH = 4_096;
+    private static final int MAX_WORKSPACE_DISPLAY_NAME_LENGTH = 256;
 
     private final ProtocolLimits limits;
     private final Clock clock;
@@ -95,6 +103,8 @@ public final class StdioRuntime implements AutoCloseable {
     private final PendingRequestRegistry pendingRequests;
     private final TurnRuntime initialTurnRuntime;
     private final AtomicReference<TurnRuntime> activeTurnRuntime;
+    private final SqlitePersistence bootstrapPersistence;
+    private final SqliteHistoryStore historyStore;
     private final AgentScopeModelFactory modelFactory = new AgentScopeModelFactory();
     private final ModelBuilder modelBuilder;
     private final ExecutorService activationLane;
@@ -155,11 +165,35 @@ public final class StdioRuntime implements AutoCloseable {
     public StdioRuntime(InputStream input, java.io.OutputStream output,
                         SidecarConfiguration configuration, Clock clock,
                         TurnRuntime injectedTurnRuntime, ModelBuilder modelBuilder) {
+        this(input, output, configuration, clock, injectedTurnRuntime, modelBuilder, null);
+    }
+
+    /**
+     * Allows focused integration tests to provide the same history adapter while production opens
+     * one explicit owner from the host data directory before workspace/thread requests arrive.
+     */
+    public StdioRuntime(InputStream input, java.io.OutputStream output,
+                        SidecarConfiguration configuration, Clock clock,
+                        TurnRuntime injectedTurnRuntime, ModelBuilder modelBuilder,
+                        SqliteHistoryStore injectedHistoryStore) {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.configuration = Objects.requireNonNull(configuration, "configuration");
         this.fakeRuntime = configuration.fakeRuntime();
         this.modelBuilder = modelBuilder == null ? this::buildModel : modelBuilder;
         this.capturedInput = new FrameCaptureInputStream(Objects.requireNonNull(input, "input"));
+        SqlitePersistence openedPersistence = null;
+        // A fake sidecar may persist history only when the host explicitly supplies its data root;
+        // keeping the null-root path unbound preserves the no-hidden-database test/runtime mode.
+        if (!(injectedTurnRuntime instanceof AgentScopeRuntimeGraph)
+                && configuration.dataDirectory() != null
+                && bootstrapDataPathCanOpen(configuration.dataDirectory())) {
+            Path data = configuration.dataDirectory().toAbsolutePath().normalize();
+            openedPersistence = SqlitePersistence.open(SqlitePersistenceConfig.of(
+                    data.resolve("ja.sqlite"), data.resolve("ja.sqlite.bak")));
+        }
+        this.bootstrapPersistence = openedPersistence;
+        this.historyStore = injectedHistoryStore != null ? injectedHistoryStore
+                : openedPersistence == null ? null : openedPersistence.history();
         this.limits = ProtocolLimits.defaults();
         this.serverInstanceId = injectedTurnRuntime instanceof AgentScopeRuntimeGraph graph
                 ? graph.serverInstanceId()
@@ -397,6 +431,22 @@ public final class StdioRuntime implements AutoCloseable {
             handleWorkspaceOpen(request);
             return;
         }
+        if ("workspace/list".equals(request.method())) {
+            handleWorkspaceList(request);
+            return;
+        }
+        if ("thread/create".equals(request.method())) {
+            handleThreadCreate(request);
+            return;
+        }
+        if ("thread/list".equals(request.method())) {
+            handleThreadList(request);
+            return;
+        }
+        if ("thread/read".equals(request.method())) {
+            handleThreadRead(request);
+            return;
+        }
         if ("profile/save".equals(request.method())) {
             handleProfileSave(request);
             return;
@@ -477,23 +527,33 @@ public final class StdioRuntime implements AutoCloseable {
         try {
             ObjectNode params = request.params();
             String workspaceId = requiredIdentifier(params, "workspaceId", "ws_");
-            String rootPath = requiredText(params, "rootPath");
+            String rootPath = requiredBoundedText(params, "rootPath", MAX_WORKSPACE_ROOT_LENGTH);
             String trust = requiredEnum(params, "trust", "untrusted", "trusted");
+            String displayName = optionalText(params, "displayName");
+            if (displayName != null) {
+                displayName = boundedText(displayName, "displayName",
+                        MAX_WORKSPACE_DISPLAY_NAME_LENGTH);
+            }
             Path root = Path.of(rootPath).toAbsolutePath().normalize();
             if (!java.nio.file.Files.isDirectory(root, java.nio.file.LinkOption.NOFOLLOW_LINKS)
                     || java.nio.file.Files.isSymbolicLink(root)) {
                 throw new ProtocolException(JaErrorCode.WORKSPACE_NOT_FOUND);
             }
             root = root.toRealPath();
-            String displayName = optionalText(params, "displayName");
             if (displayName == null) {
                 Path fileName = root.getFileName();
                 displayName = fileName == null ? root.toString() : fileName.toString();
             }
+            displayName = boundedText(displayName, "displayName", MAX_WORKSPACE_DISPLAY_NAME_LENGTH);
             WorkspaceBinding candidate = new WorkspaceBinding(workspaceId, root, displayName, trust);
             WorkspaceBinding existing = workspaceBinding;
             if (existing != null && !existing.equals(candidate)) {
                 throw new ProtocolException(JaErrorCode.CONFLICT);
+            }
+            SqliteHistoryStore history = historyStore();
+            if (history != null) {
+                history.upsertWorkspace(candidate.workspaceId(), candidate.rootPath(),
+                        candidate.displayName(), candidate.trust());
             }
             workspaceBinding = candidate;
             ObjectNode workspace = JsonNodes.object();
@@ -508,9 +568,136 @@ public final class StdioRuntime implements AutoCloseable {
             sendFailure(request, exception);
         } catch (IOException exception) {
             sendFailure(request, new ProtocolException(JaErrorCode.WORKSPACE_NOT_FOUND));
+        } catch (PersistenceException exception) {
+            sendFailure(request, historyProtocolFailure(exception, JaErrorCode.CONFLICT));
         } catch (RuntimeException exception) {
             sendFailure(request, new ProtocolException(JaErrorCode.WORKSPACE_NOT_FOUND));
         }
+    }
+
+    /** Lists the durable workspace projection used by the compact project sidebar. */
+    private void handleWorkspaceList(RpcRequest request) {
+        try {
+            SqliteHistoryStore history = requireHistory();
+            boolean includeArchived = optionalBoolean(request.params(), "includeArchived", false);
+            ObjectNode result = JsonNodes.object();
+            var rows = JsonNodes.array();
+            for (SqliteHistoryStore.WorkspaceSnapshot workspace
+                    : history.listWorkspaces(includeArchived, MAX_HISTORY_LIST_ROWS)) {
+                rows.add(workspaceJson(workspace));
+            }
+            result.set("workspaces", rows);
+            sendResponse(RpcResponse.success(request, result));
+        } catch (ProtocolException exception) {
+            sendFailure(request, exception);
+        } catch (PersistenceException exception) {
+            sendFailure(request, historyProtocolFailure(exception, JaErrorCode.INVALID_STATE));
+        } catch (RuntimeException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.INVALID_STATE));
+        }
+    }
+
+    /** Creates one durable thread and returns its current idle snapshot. */
+    private void handleThreadCreate(RpcRequest request) {
+        try {
+            ObjectNode params = request.params();
+            String workspaceId = requiredIdentifier(params, "workspaceId", "ws_");
+            String title = optionalText(params, "title");
+            if (title == null) {
+                title = "New thread";
+            }
+            // The frozen protocol allocates the thread identity server-side; explicit identities
+            // remain an adapter-level test/recovery concern and are not a new wire contract.
+            SqliteHistoryStore.ThreadSnapshot thread = requireHistory().createThread(workspaceId, title);
+            ObjectNode result = JsonNodes.object();
+            result.set("thread", threadJson(thread));
+            sendResponse(RpcResponse.success(request, result));
+        } catch (ProtocolException exception) {
+            sendFailure(request, exception);
+        } catch (PersistenceException exception) {
+            sendFailure(request, historyProtocolFailure(exception, JaErrorCode.WORKSPACE_NOT_FOUND));
+        } catch (RuntimeException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.INVALID_PARAMS));
+        }
+    }
+
+    /** Lists durable threads for one workspace without adding archive/delete behavior. */
+    private void handleThreadList(RpcRequest request) {
+        try {
+            ObjectNode params = request.params();
+            String workspaceId = requiredIdentifier(params, "workspaceId", "ws_");
+            boolean includeArchived = optionalBoolean(params, "includeArchived", false);
+            rejectNonEmptyCursor(params);
+            int limit = optionalHistoryListLimit(params);
+            ObjectNode result = JsonNodes.object();
+            var rows = JsonNodes.array();
+            for (SqliteHistoryStore.ThreadSnapshot thread
+                    : requireHistory().listThreads(workspaceId, includeArchived, limit)) {
+                rows.add(threadJson(thread));
+            }
+            result.set("threads", rows);
+            sendResponse(RpcResponse.success(request, result));
+        } catch (ProtocolException exception) {
+            sendFailure(request, exception);
+        } catch (PersistenceException exception) {
+            sendFailure(request, historyProtocolFailure(exception, JaErrorCode.WORKSPACE_NOT_FOUND));
+        } catch (RuntimeException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.INVALID_PARAMS));
+        }
+    }
+
+    /** Returns only a current snapshot so an old server instance cannot be replayed into a reducer. */
+    private void handleThreadRead(RpcRequest request) {
+        try {
+            validateSnapshotOnly(request.params());
+            String threadId = requiredIdentifier(request.params(), "threadId", "thr_");
+            SqliteHistoryStore.ThreadReadSnapshot snapshot = requireHistory().readThread(threadId)
+                    .orElseThrow(() -> new ProtocolException(JaErrorCode.THREAD_NOT_FOUND));
+            if (snapshot.items().size() > MAX_HISTORY_ITEMS) {
+                throw new ProtocolException(JaErrorCode.INVALID_STATE);
+            }
+            ObjectNode result = JsonNodes.object();
+            result.put("serverInstanceId", serverInstanceId.value());
+            result.set("thread", threadJson(snapshot.thread()));
+            var items = JsonNodes.array();
+            snapshot.items().forEach(items::add);
+            result.set("items", items);
+            result.put("snapshotSeq", snapshot.thread().lastSeq());
+            sendResponse(RpcResponse.success(request, result));
+        } catch (ProtocolException exception) {
+            sendFailure(request, exception);
+        } catch (PersistenceException exception) {
+            sendFailure(request, historyProtocolFailure(exception, JaErrorCode.THREAD_NOT_FOUND));
+        } catch (RuntimeException exception) {
+            sendFailure(request, new ProtocolException(JaErrorCode.INVALID_PARAMS));
+        }
+    }
+
+    /** Converts the persisted workspace row into the frozen wire result shape. */
+    private static ObjectNode workspaceJson(SqliteHistoryStore.WorkspaceSnapshot workspace) {
+        ObjectNode node = JsonNodes.object();
+        node.put("workspaceId", workspace.workspaceId());
+        node.put("displayName", workspace.displayName());
+        node.put("rootPath", workspace.rootPath());
+        node.put("trust", workspace.trust());
+        if (workspace.archived()) {
+            node.put("archived", true);
+        }
+        return node;
+    }
+
+    /** Converts a persisted thread row into the compact list/read projection. */
+    private static ObjectNode threadJson(SqliteHistoryStore.ThreadSnapshot thread) {
+        ObjectNode node = JsonNodes.object();
+        node.put("threadId", thread.threadId());
+        node.put("workspaceId", thread.workspaceId());
+        node.put("title", thread.title());
+        node.put("status", thread.status());
+        node.put("lastSeq", thread.lastSeq());
+        if (thread.activeTurnId() != null) {
+            node.put("activeTurnId", thread.activeTurnId());
+        }
+        return node;
     }
 
     /**
@@ -1231,7 +1418,7 @@ public final class StdioRuntime implements AutoCloseable {
             graph = AgentScopeRuntimeGraph.open(attempt.workspace().rootPath(), attempt.dataDirectory(),
                     serverInstanceId, attempt.profile().wireRevision(), attempt.workspace().trust(),
                     attempt.profile().accessMode(), handle.model(), attempt.profile().skillRevisions(),
-                    mcpActivations);
+                    mcpActivations, bootstrapPersistence);
             graph.setApprovalSink(approvalSink());
             if (stopping.get() || !activeTurnRuntime.compareAndSet(null, graph)) {
                 graph.close();
@@ -1378,6 +1565,20 @@ public final class StdioRuntime implements AutoCloseable {
         return value.textValue();
     }
 
+    /** Validates a required frozen-wire string before filesystem or persistence work begins. */
+    private static String requiredBoundedText(JsonNode parent, String field, int maxLength) {
+        return boundedText(requiredText(parent, field), field, maxLength);
+    }
+
+    /** Keeps user-provided workspace text bounded and free of values unsafe for local storage. */
+    private static String boundedText(String value, String field, int maxLength) {
+        if (value == null || value.isBlank() || value.length() > maxLength
+                || value.indexOf('\0') >= 0) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        return value;
+    }
+
     /** Reads an optional text property while distinguishing omitted from malformed values. */
     private static String optionalText(JsonNode parent, String field) {
         JsonNode value = parent == null ? null : parent.get(field);
@@ -1411,6 +1612,121 @@ public final class StdioRuntime implements AutoCloseable {
         return value;
     }
 
+    /** Returns the one history adapter owned by this sidecar or its active AgentScope graph. */
+    private SqliteHistoryStore historyStore() {
+        if (historyStore != null) {
+            return historyStore;
+        }
+        TurnRuntime runtime = activeTurnRuntime.get();
+        return runtime instanceof AgentScopeRuntimeGraph graph ? graph.historyStore() : null;
+    }
+
+    /** Requires a configured host data directory instead of silently falling back to memory. */
+    private SqliteHistoryStore requireHistory() {
+        SqliteHistoryStore history = historyStore();
+        if (history == null) {
+            throw new ProtocolException(JaErrorCode.INVALID_STATE);
+        }
+        return history;
+    }
+
+    /** Extracts the bounded text input so the restart snapshot has the exact user message. */
+    private static String inputText(ObjectNode params) {
+        JsonNode input = params.get("input");
+        if (input == null || !input.isArray() || input.isEmpty()) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        StringBuilder text = new StringBuilder();
+        for (JsonNode part : input) {
+            if (part == null || !part.isObject() || !part.path("type").asText().equals("text")
+                    || !part.path("text").isTextual()) {
+                throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+            }
+            if (text.length() > 0) {
+                text.append('\n');
+            }
+            text.append(part.path("text").textValue());
+        }
+        if (text.toString().isBlank() || text.length() > 1_048_576) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        return text.toString();
+    }
+
+    /** Defers invalid fake/production data-root errors to the protocol boundary instead of dying during construction. */
+    private static boolean bootstrapDataPathCanOpen(Path value) {
+        try {
+            return !Files.exists(value, LinkOption.NOFOLLOW_LINKS)
+                    || (Files.isDirectory(value, LinkOption.NOFOLLOW_LINKS)
+                    && !Files.isSymbolicLink(value));
+        } catch (RuntimeException exception) {
+            return false;
+        }
+    }
+
+    /** Parses optional list filters without letting malformed values reach SQL. */
+    private static boolean optionalBoolean(ObjectNode params, String field, boolean fallback) {
+        JsonNode value = params.get(field);
+        if (value == null || value.isNull()) {
+            return fallback;
+        }
+        if (!value.isBoolean()) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        return value.booleanValue();
+    }
+
+    /** Rejects cursors because the first history list implementation is snapshot-only. */
+    private static void rejectNonEmptyCursor(ObjectNode params) {
+        JsonNode value = params.get("cursor");
+        if (value == null) {
+            return;
+        }
+        if (!value.isTextual() || !value.textValue().isEmpty()) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+    }
+
+    /** Parses the bounded thread-list limit without silently accepting an unsupported page. */
+    private static int optionalHistoryListLimit(ObjectNode params) {
+        JsonNode value = params.get("limit");
+        if (value == null) {
+            return MAX_HISTORY_LIST_ROWS;
+        }
+        if (!value.isIntegralNumber()) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        long limit = value.longValue();
+        if (limit < 1L || limit > MAX_HISTORY_LIST_ROWS) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        return (int) limit;
+    }
+
+    /** Enforces the frozen snapshot-only read contract before any database work is scheduled. */
+    private static void validateSnapshotOnly(ObjectNode params) {
+        JsonNode view = params.get("view");
+        if (view != null && (!view.isTextual() || !"snapshot".equals(view.textValue()))) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+        if (params.has("afterSeq") || params.has("limit")) {
+            throw new ProtocolException(JaErrorCode.INVALID_PARAMS);
+        }
+    }
+
+    /** Maps storage categories to the frozen wire errors without exposing JDBC details. */
+    private static ProtocolException historyProtocolFailure(PersistenceException failure,
+                                                             JaErrorCode fallback) {
+        return switch (failure.code()) {
+            case NOT_FOUND -> new ProtocolException(fallback == JaErrorCode.WORKSPACE_NOT_FOUND
+                    || fallback == JaErrorCode.THREAD_NOT_FOUND ? fallback : JaErrorCode.INVALID_STATE);
+            case CAS_CONFLICT -> new ProtocolException(JaErrorCode.CONFLICT);
+            case DATABASE_CORRUPT, MIGRATION, MIGRATION_CHECKSUM, SCHEMA_TOO_NEW ->
+                    new ProtocolException(JaErrorCode.INVALID_STATE);
+            default -> new ProtocolException(fallback);
+        };
+    }
+
     /** Publishes ready on the same control lane so shutdown cannot overtake it. */
     private void handleInitialized(RpcNotification initialized) {
         if (stopping.get() || !initializedSeen.compareAndSet(false, true)) {
@@ -1433,44 +1749,85 @@ public final class StdioRuntime implements AutoCloseable {
         }
     }
 
-    /** Starts accepted fake/production work and acknowledges it before its events. */
+    /**
+     * Starts one turn only after its user item is durable and gates producer events until the
+     * successful start response has been written. A failed history write therefore cannot leak
+     * a live turn event to a client that received only an error.
+     */
     private void handleTurnStart(RpcRequest request) {
+        TurnEventAdmissionGate eventGate = new TurnEventAdmissionGate();
+        TurnRuntime runtime = activeTurnRuntime.get();
+        TurnHandle handle = null;
+        String threadId = null;
+        boolean admitted = false;
         try {
-            TurnRuntime runtime = activeTurnRuntime.get();
             if (runtime == null) {
                 // The protocol advertises turn/start before profile activation so the desktop can
                 // render one stable capability set; execution remains explicitly unavailable.
                 sendFailure(request, new ProtocolException(JaErrorCode.MODEL_UNAVAILABLE));
                 return;
             }
-            CountDownLatch responseSent = new CountDownLatch(1);
-            TurnHandle handle = runtime.start(request, event -> {
-                publishTurnEventAfterStartResponse(responseSent, event);
+            SqliteHistoryStore history = historyStore();
+            threadId = requiredIdentifier(request.params(), "threadId", "thr_");
+            // Validate the bounded text before admitting AgentScope work; otherwise malformed
+            // input could start a turn whose response is later rejected by persistence.
+            String userText = inputText(request.params());
+            if (history != null && workspaceBinding != null) {
+                WorkspaceBinding workspace = workspaceBinding;
+                history.ensureThread(threadId, workspace.workspaceId(), "New thread");
+            }
+            handle = runtime.start(request, event -> {
+                publishTurnEventAfterStartResponse(eventGate, event);
             });
+            if (history != null && workspaceBinding != null) {
+                history.recordUserMessage(threadId, handle.turnId().value(), userText);
+            }
             ObjectNode result = JsonNodes.object();
             result.put("accepted", true);
             result.put("turnId", handle.turnId().value());
             result.put("queued", false);
             result.put("status", "queued");
-            try {
-                sendResponse(RpcResponse.success(request, result));
-            } finally {
-                responseSent.countDown();
-            }
+            sendResponse(RpcResponse.success(request, result));
+            eventGate.admit();
+            admitted = true;
         } catch (RuntimeException exception) {
+            eventGate.reject();
+            bestEffortCancelAfterAdmissionFailure(runtime, threadId, handle);
             sendFailure(request, exception instanceof ProtocolException value
                     ? value : new ProtocolException(JaErrorCode.INTERNAL_ERROR));
+        } finally {
+            if (!admitted) {
+                eventGate.reject();
+            }
+            eventGate.release();
         }
     }
 
     /**
-     * Waits for the start ACK with a finite deadline while tolerating a worker interrupt. A
-     * cancelled AgentScope/fake worker can arrive here with its interrupt flag already set; the
-     * ordinary await would then discard its terminal event. Clearing only the transient wait
-     * interrupt, publishing through the existing writer, and restoring it afterwards preserves
-     * both strict ACK-before-event ordering and the worker's cancellation signal.
+     * Stops a producer whose user history admission failed, without changing the public runtime
+     * port or exposing cleanup diagnostics to the JSONL client.
      */
-    private void publishTurnEventAfterStartResponse(CountDownLatch responseSent, TurnEvent event) {
+    private static void bestEffortCancelAfterAdmissionFailure(TurnRuntime runtime,
+                                                               String threadId,
+                                                               TurnHandle handle) {
+        if (runtime == null || threadId == null || handle == null || !runtime.supportsCancellation()) {
+            return;
+        }
+        try {
+            runtime.cancel(threadId, handle.turnId(), "history_admission_failed");
+        } catch (RuntimeException cleanupFailure) {
+            LOGGER.warn("turn admission cleanup failed ({})",
+                    cleanupFailure.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Waits for the admission decision and successful start response with a finite deadline. A
+     * cancelled worker may already carry its interrupt flag, so the transient wait interrupt is
+     * restored after the gate decision instead of leaking it into the writer path.
+     */
+    private void publishTurnEventAfterStartResponse(TurnEventAdmissionGate eventGate,
+                                                     TurnEvent event) {
         boolean interrupted = false;
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
         try {
@@ -1480,8 +1837,10 @@ public final class StdioRuntime implements AutoCloseable {
                     throw new ProtocolException(JaErrorCode.REQUEST_DEADLINE_EXCEEDED);
                 }
                 try {
-                    if (responseSent.await(remaining, TimeUnit.NANOSECONDS)) {
-                        publishTurnEvent(event);
+                    if (eventGate.await(remaining, TimeUnit.NANOSECONDS)) {
+                        if (eventGate.isAdmitted()) {
+                            publishTurnEvent(event);
+                        }
                         return;
                     }
                     throw new ProtocolException(JaErrorCode.REQUEST_DEADLINE_EXCEEDED);
@@ -1494,6 +1853,40 @@ public final class StdioRuntime implements AutoCloseable {
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    /**
+     * Holds each turn's producer behind its durable user-item and response admission decision.
+     * The state is deliberately per start, bounded to one latch, and not a new runtime manager.
+     */
+    private static final class TurnEventAdmissionGate {
+        private final CountDownLatch released = new CountDownLatch(1);
+        private volatile boolean admitted;
+
+        /** Marks the gate publishable only after persistence and the success response complete. */
+        private void admit() {
+            admitted = true;
+        }
+
+        /** Marks all callbacks as discardable after any start-path failure. */
+        private void reject() {
+            admitted = false;
+        }
+
+        /** Releases the worker waiters on both success and failure paths. */
+        private void release() {
+            released.countDown();
+        }
+
+        /** Waits for the one start decision without adding a second global event queue. */
+        private boolean await(long timeout, TimeUnit unit) throws InterruptedException {
+            return released.await(timeout, unit);
+        }
+
+        /** Reads the publication decision after the release happens-before edge. */
+        private boolean isAdmitted() {
+            return admitted;
         }
     }
 
@@ -1553,10 +1946,41 @@ public final class StdioRuntime implements AutoCloseable {
         beginShutdown(request);
     }
 
-    /** Converts one adapter event into a guarded notification while producers drain. */
+    /**
+     * Converts one adapter event into a guarded notification while producers drain. Cancellation
+     * may interrupt the producer immediately before its terminal event; SQLite's synchronous
+     * writer cannot safely use that inherited flag, so it is cleared only for this append and
+     * restored afterwards to preserve the runtime's cancellation semantics.
+     */
     private void publishTurnEvent(TurnEvent event) {
         if (!shutdownFinished.get()) {
-            sendResponse(new RpcNotification(event.method(), event.params(), RpcDirection.SERVER_TO_CLIENT));
+            boolean restoreInterrupt = Thread.interrupted();
+            try {
+                TurnEvent durable = event;
+                SqliteHistoryStore history = historyStore();
+                if (history != null && workspaceBinding != null) {
+                    try {
+                        durable = history.appendEvent(event);
+                    } catch (PersistenceException exception) {
+                        // SingleWriter may finish the queued JDBC task after the producer's
+                        // Future wait was interrupted. Keep the event stream alive and let the
+                        // already-queued write settle instead of failing the whole sidecar.
+                        boolean interruptedDuringAppend = Thread.interrupted();
+                        if (exception.code() != PersistenceException.Code.TRANSACTION
+                                || !interruptedDuringAppend) {
+                            failClosed("durable thread history failed", exception);
+                            return;
+                        }
+                        restoreInterrupt = true;
+                    }
+                }
+                sendResponse(new RpcNotification(durable.method(), durable.params(),
+                        RpcDirection.SERVER_TO_CLIENT));
+            } finally {
+                if (restoreInterrupt) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
     }
 
@@ -1745,6 +2169,7 @@ public final class StdioRuntime implements AutoCloseable {
                 runtime.close();
             }
             writer.close();
+            closeBootstrapPersistence();
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             faulted.set(true);
@@ -1753,9 +2178,23 @@ public final class StdioRuntime implements AutoCloseable {
                 runtime.close();
             }
             writer.close();
+            closeBootstrapPersistence();
         } finally {
             shutdownFinished.set(true);
             terminated.countDown();
+        }
+    }
+
+    /** Releases the pre-activation SQLite owner when no active graph transferred its lifecycle. */
+    private void closeBootstrapPersistence() {
+        if (bootstrapPersistence == null) {
+            return;
+        }
+        try {
+            bootstrapPersistence.close();
+        } catch (RuntimeException exception) {
+            faulted.set(true);
+            LOGGER.error("bootstrap SQLite close failed ({})", exception.getClass().getSimpleName());
         }
     }
 
@@ -1811,7 +2250,8 @@ public final class StdioRuntime implements AutoCloseable {
     private Capabilities capabilities() {
         List<String> methods = new java.util.ArrayList<>(List.of("initialize", "version",
                 "capabilities/read", "health/read", "shutdown",
-                "workspace/open", "profile/save", "profile/activate", "skill/list", "mcp/list",
+                "workspace/open", "workspace/list", "thread/create", "thread/list", "thread/read",
+                "profile/save", "profile/activate", "skill/list", "mcp/list",
                 "mcp/save", "mcp/delete", "mcp/test", "mcp/tools/read", "turn/start",
                 "turn/cancel"));
         return new Capabilities(methods,

@@ -22,6 +22,7 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
@@ -90,6 +91,101 @@ class StdioRuntimeChildIntegrationTest {
         assertEquals(0, process.exitValue());
         String diagnostic = stderr.get(5, TimeUnit.SECONDS);
         assertFalse(diagnostic.contains("Fake response"));
+    }
+
+    /** Verifies explicit fake data roots persist the history surface across two real App children. */
+    @Test
+    void childFakeHistoryPersistsOnlyWithExplicitDataDirectory() throws Exception {
+        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        Path root = Files.createTempDirectory("ja-fake-history-child-");
+        Path workspace = Files.createDirectory(root.resolve("workspace"));
+        Path data = root.resolve("data");
+        exerciseHistoryChild(java, workspace, data, false);
+        exerciseHistoryChild(java, workspace, data, true);
+        assertTrue(Files.isDirectory(data));
+
+        // A fake process without an explicit data root remains ephemeral and reports the frozen
+        // Java-side INVALID_STATE instead of silently selecting a repository/temp database.
+        Process process = startChild(java);
+        try (BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
+                process.getOutputStream(), StandardCharsets.UTF_8));
+             BufferedReader output = new BufferedReader(new InputStreamReader(
+                     process.getInputStream(), StandardCharsets.UTF_8))) {
+            send(input, historyInitializeFrame());
+            send(input, initializedFrame());
+            assertEquals("c:init", readJson(output).path("id").textValue());
+            assertEquals("ready", readJson(output).path("params").path("status").textValue());
+            send(input, historyRequest("c:ephemeral-list", "workspace/list", Map.of()));
+            JsonNode unavailable = readJson(output);
+            assertEquals("INVALID_STATE", unavailable.path("error").path("data")
+                    .path("jaCode").textValue());
+            send(input, "{\"jsonrpc\":\"2.0\",\"id\":\"c:stop\","
+                    + "\"method\":\"shutdown\",\"params\":{}}");
+            assertEquals("c:stop", readJson(output).path("id").textValue());
+        } finally {
+            if (process.isAlive() && !process.waitFor(5, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+            }
+        }
+        assertTrue(process.waitFor(5, TimeUnit.SECONDS));
+        assertEquals(0, process.exitValue());
+    }
+
+    /** Runs one real child against the same history database, optionally asserting restart data. */
+    private static void exerciseHistoryChild(String java, Path workspace, Path data,
+                                              boolean expectExisting) throws Exception {
+        Process process = startChild(java, data);
+        BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
+                process.getOutputStream(), StandardCharsets.UTF_8));
+        BufferedReader output = new BufferedReader(new InputStreamReader(
+                process.getInputStream(), StandardCharsets.UTF_8));
+        try {
+            send(input, historyInitializeFrame());
+            send(input, initializedFrame());
+            assertEquals("c:init", readJson(output).path("id").textValue());
+            assertEquals("ready", readJson(output).path("params").path("status").textValue());
+
+            send(input, workspaceOpenFrame(workspace));
+            assertEquals("c:workspace", readJson(output).path("id").textValue());
+            send(input, historyRequest("c:workspace-list", "workspace/list", Map.of()));
+            JsonNode workspaces = readJson(output);
+            assertEquals(1, workspaces.path("result").path("workspaces").size());
+
+            if (!expectExisting) {
+                send(input, historyRequest("c:create", "thread/create", Map.of(
+                        "workspaceId", "ws_fake_activation", "title", "Persisted history")));
+                JsonNode created = readJson(output);
+                assertEquals("c:create", created.path("id").textValue());
+                assertTrue(created.path("result").path("thread").path("threadId")
+                        .textValue().startsWith("thr_"));
+            }
+            send(input, historyRequest("c:thread-list", "thread/list", Map.of(
+                    "workspaceId", "ws_fake_activation")));
+            JsonNode threads = readJson(output);
+            assertEquals(1, threads.path("result").path("threads").size());
+            String threadId = threads.path("result").path("threads").get(0)
+                    .path("threadId").textValue();
+            send(input, historyRequest("c:thread-read", "thread/read", Map.of(
+                    "threadId", threadId)));
+            JsonNode read = readJson(output);
+            assertEquals(threadId, read.path("result").path("thread").path("threadId")
+                    .textValue());
+            assertEquals(0, read.path("result").path("items").size());
+
+            send(input, "{\"jsonrpc\":\"2.0\",\"id\":\"c:stop\","
+                    + "\"method\":\"shutdown\",\"params\":{}}");
+            assertEquals("c:stop", readJson(output).path("id").textValue());
+        } finally {
+            input.close();
+            output.close();
+            // The shutdown ACK is queued before the bounded drain; allow the real child to
+            // finish its SQLite close before treating it as stuck and forcing termination.
+            if (process.isAlive() && !process.waitFor(5, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+            }
+        }
+        assertTrue(process.waitFor(5, TimeUnit.SECONDS));
+        assertEquals(0, process.exitValue());
     }
 
     /** Verifies an identical client request id cannot admit a second fake turn. */
@@ -518,6 +614,20 @@ class StdioRuntimeChildIntegrationTest {
                 "\"maxInFlightRequests\":64,\"maxPendingRequests\":64,\"maxItemDeltaBytes\":65536," +
                 "\"maxInlineToolOutputBytes\":1048576,\"maxLogBytes\":1048576," +
                 "\"defaultRequestDeadlineMs\":120000,\"defaultApprovalDeadlineMs\":300000}}}";
+    }
+
+    /** Extends the child handshake with the minimal persisted-history methods under test. */
+    private static String historyInitializeFrame() {
+        return initializeFrame().replace("\"methods\":[\"initialize\",\"turn/start\",\"shutdown\"]",
+                "\"methods\":[\"initialize\",\"workspace/open\",\"workspace/list\","
+                        + "\"thread/create\",\"thread/list\",\"thread/read\",\"shutdown\"]");
+    }
+
+    /** Builds one history request with a typed JSON params object and no second protocol client. */
+    private static String historyRequest(String id, String method,
+                                         Map<String, ?> params) throws Exception {
+        return JSON.writeValueAsString(Map.of("jsonrpc", "2.0", "id", id,
+                "method", method, "params", params));
     }
 
     /** Extends the child handshake only for the activation replay without changing the baseline fixture. */

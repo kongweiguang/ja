@@ -30,6 +30,7 @@ public final class SqlitePersistence implements AutoCloseable {
     private final AtomicBoolean closeStarted = new AtomicBoolean();
     private final AgentStateStore agentState;
     private final TurnStateStore turnState;
+    private final SqliteHistoryStore history;
 
     /** Builds adapters only after migration and writer ownership are ready. */
     private SqlitePersistence(SqlitePersistenceConfig config, Connection connection,
@@ -42,6 +43,7 @@ public final class SqlitePersistence implements AutoCloseable {
         this.writer = writer;
         this.agentState = new SqliteAgentStateStore(this);
         this.turnState = new TurnStateStore(this);
+        this.history = new SqliteHistoryStore(this);
     }
 
     /** Opens the production migration catalog with explicit caller-provided paths. */
@@ -61,11 +63,15 @@ public final class SqlitePersistence implements AutoCloseable {
             Files.createDirectories(config.backupPath().getParent());
             connection = SqliteBackupRecovery.openAndRecover(config, catalog);
             SqliteMigrationRunner.apply(connection, catalog);
-            SqliteBackupRecovery.checkpoint(connection);
-            SqliteBackupRecovery.publish(config.databasePath(), config.backupPath());
             writer = new SingleWriter(config.writerQueueCapacity(), config.writerQueueBytes(),
                     config.writerOperationTimeout());
-            return new SqlitePersistence(config, connection, lock, writer);
+            SqlitePersistence persistence = new SqlitePersistence(config, connection, lock, writer);
+            // Recover only the durable projection after migrations and before the owner is
+            // returned; no fake terminal event is emitted for work interrupted by a restart.
+            persistence.history.recoverInterruptedThreads();
+            SqliteBackupRecovery.checkpoint(connection);
+            SqliteBackupRecovery.publish(config.databasePath(), config.backupPath());
+            return persistence;
         } catch (RuntimeException exception) {
             releaseOpenResources(writer, connection, lock, exception);
             throw exception;
@@ -122,6 +128,12 @@ public final class SqlitePersistence implements AutoCloseable {
     public TurnStateStore turnState() {
         ensureOpen();
         return turnState;
+    }
+
+    /** Exposes the restart-visible history through the same SQLite owner as AgentScope state. */
+    public SqliteHistoryStore history() {
+        ensureOpen();
+        return history;
     }
 
     /** Returns the configured database path for local diagnostics. */

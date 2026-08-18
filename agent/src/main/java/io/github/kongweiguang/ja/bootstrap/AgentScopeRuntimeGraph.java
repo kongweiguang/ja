@@ -53,6 +53,7 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
     private final String wireProfileRevision;
     private final String workspaceTrust;
     private final String profileAccessMode;
+    private final boolean ownsPersistence;
     private final AtomicBoolean closed = new AtomicBoolean();
 
     private AgentScopeRuntimeGraph(SqlitePersistence persistence, JaSandboxFilesystem filesystem,
@@ -61,7 +62,7 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
                                    McpRuntime mcpRuntime, Toolkit toolkit,
                                    ServerInstanceId serverInstanceId,
                                    String wireProfileRevision, String workspaceTrust,
-                                   String profileAccessMode) {
+                                   String profileAccessMode, boolean ownsPersistence) {
         this.persistence = persistence;
         this.filesystem = filesystem;
         this.skillSources = skillSources;
@@ -73,6 +74,7 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
         this.wireProfileRevision = wireProfileRevision;
         this.workspaceTrust = workspaceTrust;
         this.profileAccessMode = profileAccessMode;
+        this.ownsPersistence = ownsPersistence;
     }
 
     /**
@@ -145,6 +147,24 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
                                               Model model,
                                               List<String> skillRevisions,
                                               List<McpActivation> mcpActivations) {
+        return open(workspace, dataDirectory, serverInstanceId, wireProfileRevision,
+                workspaceTrust, profileAccessMode, model, skillRevisions, mcpActivations, null);
+    }
+
+    /**
+     * Opens the graph on a caller-owned SQLite owner when history was created before model
+     * activation. Keeping this overload explicit prevents a second lock/connection for the same
+     * data directory while preserving the existing direct-test factory above.
+     */
+    public static AgentScopeRuntimeGraph open(Path workspace, Path dataDirectory,
+                                              ServerInstanceId serverInstanceId,
+                                              String wireProfileRevision,
+                                              String workspaceTrust,
+                                              String profileAccessMode,
+                                              Model model,
+                                              List<String> skillRevisions,
+                                              List<McpActivation> mcpActivations,
+                                              SqlitePersistence existingPersistence) {
         Path root = requireDirectory(workspace, "workspace");
         Path data = requireDataDirectory(dataDirectory);
         Objects.requireNonNull(serverInstanceId, "serverInstanceId");
@@ -159,8 +179,9 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
         JaSkillSources skillSources = null;
         McpRuntime mcpRuntime = null;
         try {
-            persistence = SqlitePersistence.open(SqlitePersistenceConfig.of(
-                    data.resolve("ja.sqlite"), data.resolve("ja.sqlite.bak")));
+            persistence = existingPersistence != null ? existingPersistence
+                    : SqlitePersistence.open(SqlitePersistenceConfig.of(
+                            data.resolve("ja.sqlite"), data.resolve("ja.sqlite.bak")));
             filesystem = new JaSandboxFilesystem(root);
             // Keep user skills in the explicit sidecar data directory while the workspace source
             // remains rooted at the selected project; AgentScope still owns parsing and loading.
@@ -199,7 +220,7 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
                         factory.createEngine(model), serverInstanceId);
                 return new AgentScopeRuntimeGraph(persistence, filesystem, skillSources, factory, turns,
                         mcpRuntime, toolkit, serverInstanceId, wireProfileRevision,
-                        workspaceTrust, profileAccessMode);
+                        workspaceTrust, profileAccessMode, existingPersistence == null);
             } finally {
                 // The official MCP transports have consumed credentials; no failure path may
                 // retain the composition-only marker map until graph cleanup runs.
@@ -207,10 +228,12 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
             }
         } catch (IOException failure) {
             IllegalStateException wrapped = new IllegalStateException("skill_sources_invalid", failure);
-            closeAfterOpenFailure(mcpRuntime, filesystem, skillSources, persistence, wrapped);
+            closeAfterOpenFailure(mcpRuntime, filesystem, skillSources, persistence,
+                    existingPersistence == null, wrapped);
             throw wrapped;
         } catch (RuntimeException failure) {
-            closeAfterOpenFailure(mcpRuntime, filesystem, skillSources, persistence, failure);
+            closeAfterOpenFailure(mcpRuntime, filesystem, skillSources, persistence,
+                    existingPersistence == null, failure);
             throw failure;
         }
     }
@@ -237,6 +260,11 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
     /** Shares the event identity with the stdio handshake instead of creating a second server id. */
     public ServerInstanceId serverInstanceId() {
         return serverInstanceId;
+    }
+
+    /** Exposes the single history adapter so stdio can persist events without opening JDBC. */
+    public io.github.kongweiguang.ja.persistence.SqliteHistoryStore historyStore() {
+        return persistence.history();
     }
 
     /** Returns the immutable wire revision that this graph was activated for, when configured. */
@@ -422,8 +450,9 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
     }
 
     /**
-     * Closes the AgentScope engine first, then child-process resources and
-     * SQLite; this ordering prevents state writes from racing a closed store.
+     * Closes the AgentScope engine first, then child-process resources and its
+     * own SQLite owner; caller-owned persistence remains available for a retry
+     * or is closed by the outer stdio lifecycle.
      */
     @Override
     public void close() {
@@ -439,7 +468,9 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
         failure = closeResource(mcpRuntime, failure);
         failure = closeResource(filesystem, failure);
         failure = closeResource(skillSources, failure);
-        failure = closeResource(persistence, failure);
+        if (ownsPersistence) {
+            failure = closeResource(persistence, failure);
+        }
         if (failure != null) {
             throw failure;
         }
@@ -500,6 +531,7 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
                                               JaSandboxFilesystem filesystem,
                                               JaSkillSources skillSources,
                                               SqlitePersistence persistence,
+                                              boolean closePersistence,
                                               RuntimeException failure) {
         if (mcpRuntime != null) {
             try {
@@ -522,7 +554,7 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
                 failure.addSuppressed(cleanup);
             }
         }
-        if (persistence != null) {
+        if (closePersistence && persistence != null) {
             try {
                 persistence.close();
             } catch (RuntimeException cleanup) {

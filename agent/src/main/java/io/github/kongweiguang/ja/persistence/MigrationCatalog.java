@@ -15,6 +15,8 @@ import java.util.Objects;
 public final class MigrationCatalog {
     private static final String V1_RESOURCE = "/db/migration/V1__durable_state.sql";
     private static final String V1_CHECKSUM = "221d23571b1beaf101d4ba3d6340f113a4de8fa6a30df71c37bb4644291c6cbc";
+    private static final String V2_RESOURCE = "/db/migration/V2__thread_history.sql";
+    private static final String V2_CHECKSUM = "beeb8727fc471a225497841210ec3330da84c22b01b5fa595a5fd923f37474a6";
     private final List<SchemaMigration> migrations;
 
     /** Rejects gaps, duplicates, and edited migration definitions before opening a database. */
@@ -44,7 +46,13 @@ public final class MigrationCatalog {
             throw new PersistenceException(PersistenceException.Code.MIGRATION_CHECKSUM,
                     "production migration resource checksum drifted");
         }
-        return new MigrationCatalog(List.of(migration));
+        String historySql = readResource(V2_RESOURCE);
+        SchemaMigration history = SchemaMigration.fixed(2, "thread-history", historySql);
+        if (!V2_CHECKSUM.equals(history.checksum())) {
+            throw new PersistenceException(PersistenceException.Code.MIGRATION_CHECKSUM,
+                    "thread history migration resource checksum drifted");
+        }
+        return new MigrationCatalog(List.of(migration, history));
     }
 
     /** Returns an immutable catalog snapshot for deterministic migration tests. */
