@@ -219,10 +219,7 @@ impl GitReadOnly {
     }
 
     fn run(&self, args: &[&str], cancellation: &CancellationToken) -> Result<Vec<u8>, GitError> {
-        let args = args
-            .iter()
-            .map(|arg| OsString::from(arg))
-            .collect::<Vec<_>>();
+        let args = args.iter().map(OsString::from).collect::<Vec<_>>();
         self.run_os(&args, cancellation)
     }
 
@@ -349,10 +346,10 @@ fn resolve_git_program() -> Option<PathBuf> {
     for directory in std::env::split_paths(&path) {
         for name in names {
             let candidate = directory.join(name);
-            if candidate.is_file() {
-                if let Ok(canonical) = candidate.canonicalize() {
-                    return Some(canonical);
-                }
+            if candidate.is_file()
+                && let Ok(canonical) = candidate.canonicalize()
+            {
+                return Some(canonical);
             }
         }
     }
@@ -831,10 +828,9 @@ fn validate_alternates(workspace: &WorkspaceHandle, info_rel: &str) -> Result<()
     for name in ["alternates", "http-alternates"] {
         let relative_path = repo_child(info_rel, name);
         if let Some(value) = read_optional_text_file(workspace, &relative_path, MAX_POINTER_BYTES)?
+            && !value.is_empty()
         {
-            if !value.is_empty() {
-                return Err(GitError::ExternalWorktree);
-            }
+            return Err(GitError::ExternalWorktree);
         }
     }
     Ok(())
@@ -953,7 +949,7 @@ fn reject_submodule_metadata(workspace: &WorkspaceHandle, base_rel: &str) -> Res
     if validate_directory(workspace, &modules_rel, false)? {
         return Err(GitError::ExternalWorktree);
     }
-    if let Some(_) = read_optional_text_file(workspace, ".gitmodules", MAX_CONFIG_BYTES)? {
+    if read_optional_text_file(workspace, ".gitmodules", MAX_CONFIG_BYTES)?.is_some() {
         return Err(GitError::ExternalWorktree);
     }
     Ok(())

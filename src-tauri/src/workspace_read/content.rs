@@ -49,9 +49,9 @@ impl FileReader {
         self.workspace.verify_resolved(&resolved, Some(false))?;
         let path = &resolved.path;
         let before =
-            fs::symlink_metadata(&path).map_err(|error| WorkspaceError::io("stat", error))?;
+            fs::symlink_metadata(path).map_err(|error| WorkspaceError::io("stat", error))?;
         let hash_limit = self.policy.hash_limit_bytes.min(self.policy.max_bytes);
-        let before_metadata = metadata_for_path(&path, &before, hash_limit)?;
+        let before_metadata = metadata_for_path(path, &before, hash_limit)?;
         if before.len() > self.policy.max_bytes {
             self.workspace.verify_resolved(&resolved, Some(false))?;
             return Ok(FileContent {
@@ -63,7 +63,7 @@ impl FileReader {
                 truncated: true,
             });
         }
-        let file = File::open(&path).map_err(|error| WorkspaceError::io("open", error))?;
+        let file = File::open(path).map_err(|error| WorkspaceError::io("open", error))?;
         let capacity = usize::try_from(self.policy.max_bytes)
             .map_err(|_| WorkspaceError::FileTooLarge)?
             .saturating_add(1);
@@ -72,8 +72,8 @@ impl FileReader {
             .read_to_end(&mut bytes)
             .map_err(|error| WorkspaceError::io("read", error))?;
         let after =
-            fs::symlink_metadata(&path).map_err(|error| WorkspaceError::io("stat", error))?;
-        let after_metadata = metadata_for_path(&path, &after, hash_limit)?;
+            fs::symlink_metadata(path).map_err(|error| WorkspaceError::io("stat", error))?;
+        let after_metadata = metadata_for_path(path, &after, hash_limit)?;
         if before_metadata.revision != after_metadata.revision {
             return Err(WorkspaceError::ChangedDuringRead);
         }

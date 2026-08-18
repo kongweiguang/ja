@@ -1247,6 +1247,50 @@ impl TurnStartInput {
     }
 }
 
+/// Typed cancellation input keeps the host request narrow and prevents a
+/// cancel click from becoming a generic sidecar method or payload tunnel.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TurnCancelInput {
+    pub thread_id: String,
+    pub turn_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl TurnCancelInput {
+    /// Converts the user intent to the frozen `turn/cancel` envelope while
+    /// bounding both identities and the optional human-readable reason.
+    pub(super) fn into_params(self) -> Result<Value, RuntimeCommandError> {
+        if !valid_protocol_id(&self.thread_id, "thr_", 100)
+            || !valid_frozen_turn_id(&self.turn_id)
+            || self.reason.as_ref().is_some_and(|reason| {
+                reason.chars().count() > 512 || reason.chars().any(char::is_control)
+            })
+        {
+            return Err(RuntimeCommandError::invalid_params());
+        }
+        let mut params = json!({
+            "threadId": self.thread_id,
+            "turnId": self.turn_id,
+        });
+        if let Some(reason) = self.reason {
+            params["reason"] = Value::String(reason);
+        }
+        Ok(params)
+    }
+}
+
+/// Acknowledges only the sidecar's frozen cancel result; completion remains
+/// an event fact so this response cannot claim that the turn already ended.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnCancelResult {
+    pub accepted: bool,
+    pub turn_id: String,
+    pub status: String,
+}
+
 /// Accepted response for `ja_turn_start`; events arrive on the fixed event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1448,6 +1492,35 @@ fn valid_text_id(value: &str, max: usize) -> bool {
         })
 }
 
+/// Validates protocol identities with their domain prefix instead of allowing
+/// an internal UUID or arbitrary JSON key to stand in for a thread/turn id.
+fn valid_protocol_id(value: &str, prefix: &str, max: usize) -> bool {
+    let Some(tail) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    value.len() <= max
+        && !tail.is_empty()
+        && tail.as_bytes()[0].is_ascii_alphanumeric()
+        && tail
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+/// Keeps turn cancellation on the frozen wire grammar so a malformed request
+/// cannot be sent and later compared against a broader response identity.
+pub(super) fn valid_frozen_turn_id(value: &str) -> bool {
+    let Some(tail) = value.strip_prefix("turn_") else {
+        return false;
+    };
+    value.len() <= 101
+        && !tail.is_empty()
+        && tail.len() <= 96
+        && tail.as_bytes()[0].is_ascii_alphanumeric()
+        && tail
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1531,6 +1604,61 @@ mod tests {
         .expect_err("missing active profile must fail");
         assert_eq!(error.code, "PROFILE_UNAVAILABLE");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Rejects wrong-domain ids, control text, and unknown fields before a
+    /// cancel request can consume a bridge queue slot.
+    #[test]
+    fn cancel_input_is_strict_and_bounded() {
+        let valid: TurnCancelInput = serde_json::from_value(json!({
+            "threadId": "thr_fixture",
+            "turnId": "turn_fixture",
+            "reason": "user clicked cancel"
+        }))
+        .expect("valid cancel input");
+        assert_eq!(
+            valid.into_params().expect("cancel params"),
+            json!({
+                "threadId": "thr_fixture",
+                "turnId": "turn_fixture",
+                "reason": "user clicked cancel"
+            })
+        );
+        assert!(
+            TurnCancelInput {
+                thread_id: "thread_fixture".to_owned(),
+                turn_id: "turn_fixture".to_owned(),
+                reason: None,
+            }
+            .into_params()
+            .is_err()
+        );
+        assert!(
+            TurnCancelInput {
+                thread_id: "thr_fixture".to_owned(),
+                turn_id: "turn_._fixture".to_owned(),
+                reason: None,
+            }
+            .into_params()
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<TurnCancelInput>(json!({
+                "threadId": "thr_fixture",
+                "turnId": "turn_fixture",
+                "unknown": true
+            }))
+            .is_err()
+        );
+        assert!(
+            TurnCancelInput {
+                thread_id: "thr_fixture".to_owned(),
+                turn_id: "turn_fixture".to_owned(),
+                reason: Some("x".repeat(513)),
+            }
+            .into_params()
+            .is_err()
+        );
     }
 
     /// Unix runtime directories stay private even when the parent app-data

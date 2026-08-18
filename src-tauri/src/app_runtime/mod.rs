@@ -14,10 +14,11 @@ pub use bridge::RuntimeBridge;
 pub use config::{
     ApprovalResponseInput, EventEmitError, EventSink, LaunchConfig, ManualRecoveryConfirmation,
     ManualRecoveryReason, RuntimeCommandError, RuntimeConfigurationStatus, RuntimeConfigureInput,
-    RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind, TurnAccepted, TurnInputPart,
-    TurnStartInput, bundled_launch_config, prepare_run_dir,
+    RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind, TurnAccepted, TurnCancelInput,
+    TurnCancelResult, TurnInputPart, TurnStartInput, bundled_launch_config, prepare_run_dir,
 };
 pub use host::RuntimeHost;
+pub(crate) use host::WorkspaceLookup;
 pub use projection::RPC_FRAME_EVENT;
 
 /// Registers each sidecar command once at the native composition root.
@@ -30,7 +31,13 @@ pub fn register_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
         ja_runtime_acknowledge_recovery,
         ja_runtime_configure,
         ja_approval_respond,
-        ja_turn_start
+        ja_turn_start,
+        ja_turn_cancel,
+        crate::workspace_read::command::ja_workspace_tree,
+        crate::workspace_read::command::ja_workspace_read_file,
+        crate::workspace_read::command::ja_workspace_search,
+        crate::git_read::commands::ja_git_status,
+        crate::git_read::commands::ja_git_diff
     ])
 }
 
@@ -66,6 +73,16 @@ pub fn ja_turn_start(
     state: tauri::State<'_, RuntimeHost>,
 ) -> Result<TurnAccepted, RuntimeCommandError> {
     state.turn_start(input)
+}
+
+/// Requests interruption of one active turn while preserving the sidecar
+/// process and waiting for its eventual completion event.
+#[tauri::command]
+pub fn ja_turn_cancel(
+    input: TurnCancelInput,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<TurnCancelResult, RuntimeCommandError> {
+    state.turn_cancel(input)
 }
 
 /// Returns the token-free native recovery gate for the settings/recovery UI.

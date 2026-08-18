@@ -95,8 +95,8 @@ impl WorkspaceHandle {
         self.verify_resolved(&resolved, None)?;
         let path = &resolved.path;
         let metadata =
-            fs::symlink_metadata(&path).map_err(|error| WorkspaceError::io("stat", error))?;
-        let result = metadata_for_path(&path, &metadata, hash_limit)?;
+            fs::symlink_metadata(path).map_err(|error| WorkspaceError::io("stat", error))?;
+        let result = metadata_for_path(path, &metadata, hash_limit)?;
         self.verify_resolved(&resolved, None)?;
         Ok(result)
     }
@@ -207,14 +207,14 @@ impl WorkspaceHandle {
         if physical_identity(&canonical)? != resolved.final_identity {
             return Err(WorkspaceError::PathChanged);
         }
-        if let Some(directory) = directory {
-            if directory != metadata.is_dir() {
-                return Err(if directory {
-                    WorkspaceError::NotDirectory
-                } else {
-                    WorkspaceError::NotFile
-                });
-            }
+        if let Some(directory) = directory
+            && directory != metadata.is_dir()
+        {
+            return Err(if directory {
+                WorkspaceError::NotDirectory
+            } else {
+                WorkspaceError::NotFile
+            });
         }
         if metadata.is_file() && hard_link_count(&canonical, &metadata)? > 1 {
             return Err(WorkspaceError::LinkNotAllowed);
@@ -376,9 +376,9 @@ fn physical_identity(path: &Path) -> Result<FileIdentity, WorkspaceError> {
     }
     #[cfg(windows)]
     {
-        return query_windows_file_information(path)
+        query_windows_file_information(path)
             .map(|(identity, _)| identity)
-            .map_err(|error| WorkspaceError::io("identity", error));
+            .map_err(|error| WorkspaceError::io("identity", error))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -402,9 +402,9 @@ fn hard_link_count(path: &Path, metadata: &Metadata) -> Result<u64, WorkspaceErr
     #[cfg(windows)]
     {
         let _ = metadata;
-        return query_windows_file_information(path)
+        query_windows_file_information(path)
             .map(|(_, links)| u64::from(links))
-            .map_err(|error| WorkspaceError::io("link_count", error));
+            .map_err(|error| WorkspaceError::io("link_count", error))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -538,7 +538,7 @@ fn query_windows_file_information(path: &Path) -> std::io::Result<(FileIdentity,
 /// any I/O; the empty string alone denotes the workspace root.
 pub(crate) fn validate_relative_path(relative_path: &str) -> Result<(), WorkspaceError> {
     if relative_path.contains('\0')
-        || relative_path.as_bytes().len() > 4 * 1024
+        || relative_path.len() > 4 * 1024
         || relative_path.contains(':')
         || relative_path.contains('\\')
     {
@@ -757,7 +757,7 @@ pub(crate) fn is_reparse_point(_metadata: &Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        return _metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        _metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     {
@@ -801,5 +801,53 @@ pub(crate) fn map_path_error(error: std::io::Error, operation: &'static str) -> 
             kind: std::io::ErrorKind::PermissionDenied,
         },
         _ => WorkspaceError::io(operation, error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies normal canonical admission and proves an available directory
+    /// alias is rejected before canonicalization can erase its raw spelling.
+    #[test]
+    fn register_checks_raw_alias_before_canonicalize() {
+        let base = std::env::temp_dir().join(format!("ja-workspace-registry-{}", Uuid::new_v4()));
+        let root = base.join("root");
+        let alias = base.join("alias");
+        fs::create_dir_all(&root).expect("workspace root");
+        let registry = WorkspaceRegistry::default();
+        let info = registry.register(&root).expect("normal canonical root");
+        let handle = registry.get(info.id).expect("registered handle");
+        assert_eq!(
+            handle.root_path(),
+            fs::canonicalize(&root).expect("canonical root")
+        );
+
+        if create_directory_alias(&root, &alias) {
+            assert!(matches!(
+                registry.register(&alias),
+                Err(WorkspaceError::InvalidRoot)
+            ));
+        }
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Creates the platform-native alias used by the raw-admission regression
+    /// test; unsupported hosts simply retain the normal-root assertion.
+    fn create_directory_alias(target: &Path, alias: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, alias).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, alias).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, alias);
+            false
+        }
     }
 }

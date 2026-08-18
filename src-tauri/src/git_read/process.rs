@@ -279,7 +279,7 @@ impl ProcessTree {
                 unsafe { CloseHandle(job) };
                 return Err(io::Error::last_os_error());
             }
-            return Ok(Self { job });
+            Ok(Self { job })
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -298,7 +298,7 @@ impl ProcessTree {
             if assigned == 0 {
                 return Err(io::Error::last_os_error());
             }
-            return resume_suspended_process(child.id());
+            resume_suspended_process(child.id())
         }
         #[cfg(not(windows))]
         {

@@ -3,9 +3,11 @@
 
 pub mod agent_process;
 pub mod app_runtime;
+pub mod git_read;
 pub mod preview;
 pub mod settings;
 pub mod terminal;
+pub mod workspace_read;
 
 use app_runtime::{
     EventEmitError, EventSink, RPC_FRAME_EVENT, RuntimeHost, cleanup_on_exit, prepare_run_dir,
@@ -60,6 +62,12 @@ pub fn run() {
             app_runtime::ja_runtime_configure,
             app_runtime::ja_approval_respond,
             app_runtime::ja_turn_start,
+            app_runtime::ja_turn_cancel,
+            workspace_read::command::ja_workspace_tree,
+            workspace_read::command::ja_workspace_read_file,
+            workspace_read::command::ja_workspace_search,
+            git_read::commands::ja_git_status,
+            git_read::commands::ja_git_diff,
             terminal::commands::ja_terminal_configure,
             terminal::commands::ja_terminal_open,
             terminal::commands::ja_terminal_input,

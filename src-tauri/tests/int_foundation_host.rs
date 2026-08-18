@@ -105,10 +105,13 @@ fn test_jar() -> PathBuf {
     jar
 }
 
-/// Adds a unique JVM property so the host test can query the real child
-/// command line and prove the process tree disappeared after shutdown.
+/// Adds a unique JVM property and data directory so the host test can query the
+/// real child command line while profile activation has the same required
+/// writable runtime state as the production-shaped launch.
 fn marked_fixture_config(run_dir: &TempRunDir, marker: &str) -> LaunchConfig {
     let java = java_executable();
+    let data_dir = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(run_dir.0.to_string_lossy().as_bytes());
     LaunchConfig::for_test(
         java,
         vec![
@@ -116,6 +119,7 @@ fn marked_fixture_config(run_dir: &TempRunDir, marker: &str) -> LaunchConfig {
             OsString::from("-jar"),
             test_jar().into_os_string(),
             OsString::from("--runtime=fake"),
+            OsString::from(format!("--data-dir-base64={data_dir}")),
         ],
         run_dir.0.clone(),
     )
@@ -445,6 +449,30 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
     use tauri::webview::InvokeRequest;
 
     let run_dir = TempRunDir::create("tauri-mock");
+    let marker = format!("ja-tauri-cancel-{}", std::process::id());
+    let workspace_root = run_dir.0.join("workspace");
+    std::fs::create_dir_all(&workspace_root).expect("mock workspace");
+    std::fs::write(
+        workspace_root.join("README.md"),
+        "hello from the Tauri command composition test\n",
+    )
+    .expect("mock workspace file");
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&workspace_root)
+        .status()
+        .expect("git executable")
+        .success()
+        .then_some(())
+        .expect("initialize temporary repository");
+    Command::new("git")
+        .args(["add", "README.md"])
+        .current_dir(&workspace_root)
+        .status()
+        .expect("git executable")
+        .success()
+        .then_some(())
+        .expect("stage temporary file for read-only diff");
     let app_slot: Arc<OnceLock<tauri::AppHandle<tauri::test::MockRuntime>>> =
         Arc::new(OnceLock::new());
     let slot_for_sink = Arc::clone(&app_slot);
@@ -453,7 +481,7 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
         app.emit(RPC_FRAME_EVENT, value)
             .map_err(|_| EventEmitError::DeliveryFailed)
     });
-    let host = RuntimeHost::new(fixture_config(&run_dir), sink);
+    let host = RuntimeHost::new(marked_fixture_config(&run_dir, &marker), sink);
     let app = register_commands(mock_builder())
         .manage(host)
         .build(mock_context(noop_assets()))
@@ -464,7 +492,11 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
     app_slot
         .set(app.handle().clone())
         .expect("single mock app handle");
-    let (event_sender, event_receiver) = mpsc::sync_channel(64);
+    // This bounded channel only observes frames in the MockRuntime test. Its
+    // 512 slots cover the current 1 MiB fake turn at the negotiated delta
+    // size plus lifecycle frames; production backpressure remains enforced
+    // by the bridge's own bounded event queues.
+    let (event_sender, event_receiver) = mpsc::sync_channel(512);
     let _event_id = app.listen(RPC_FRAME_EVENT, move |event| {
         let payload = serde_json::from_str::<Value>(event.payload()).expect("event JSON");
         let _ = event_sender.try_send(payload);
@@ -491,11 +523,90 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
                 .map_err(|error| Value::String(error.to_string()))
         })
     };
+    let configured: ja_lib::app_runtime::RuntimeConfigurationStatus = serde_json::from_value(
+        invoke(
+            "ja_runtime_configure",
+            serde_json::json!({
+                "input": {
+                    "workspaceId": "ws_mock",
+                    "rootPath": workspace_root.to_string_lossy(),
+                    "trust": "trusted",
+                    "settings": {
+                        "schemaVersion": 1,
+                        "activeProfileRevision": "profile_host",
+                        "profiles": [{
+                            "profileRevision": "profile_host",
+                            "name": "Fixture",
+                            "provider": "fixture",
+                            "protocol": "open_ai_chat_completions",
+                            "model": "fixture-model",
+                            "baseUrl": "http://127.0.0.1:8080/v1",
+                            "accessMode": "workspace",
+                            "skillRevisions": [],
+                            "mcpRevisions": []
+                        }],
+                        "mcpServers": []
+                    }
+                }
+            }),
+        )
+        .expect("typed configure command"),
+    )
+    .expect("configuration response");
+    assert!(configured.configured);
     let started: RuntimeStatus = serde_json::from_value(
         invoke("ja_runtime_start", serde_json::json!({})).expect("typed start command"),
     )
     .expect("runtime start response");
     assert_eq!(started.status, RuntimeStatusKind::Ready);
+    assert_process_marker_visible(&marker, total_deadline);
+    let tree = invoke(
+        "ja_workspace_tree",
+        serde_json::json!({
+            "input": {"workspaceId": "ws_mock", "relativePath": ""}
+        }),
+    )
+    .expect("typed workspace tree command");
+    assert!(
+        tree["entries"]
+            .as_array()
+            .expect("tree entries")
+            .iter()
+            .any(|entry| entry["relativePath"] == "README.md")
+    );
+    let file = invoke(
+        "ja_workspace_read_file",
+        serde_json::json!({
+            "input": {"workspaceId": "ws_mock", "relativePath": "README.md"}
+        }),
+    )
+    .expect("typed workspace read command");
+    assert_eq!(
+        file["text"],
+        "hello from the Tauri command composition test\n"
+    );
+    let search = invoke(
+        "ja_workspace_search",
+        serde_json::json!({
+            "input": {"workspaceId": "ws_mock", "relativePath": "", "query": "hello"}
+        }),
+    )
+    .expect("typed workspace search command");
+    assert_eq!(search["hits"].as_array().expect("search hits").len(), 1);
+    let status = invoke(
+        "ja_git_status",
+        serde_json::json!({"input": {"workspaceId": "ws_mock"}}),
+    )
+    .expect("typed git status command");
+    assert!(status.is_array());
+    let diff = invoke(
+        "ja_git_diff",
+        serde_json::json!({
+            "input": {"workspaceId": "ws_mock", "staged": true}
+        }),
+    )
+    .expect("typed git diff command");
+    assert!(diff["bytes"].is_array());
     let ready = event_receiver
         .recv_timeout(total_deadline.saturating_duration_since(Instant::now()))
         .expect("ready event");
@@ -533,11 +644,112 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
         Instant::now() < total_deadline,
         "mock turn exceeded total deadline"
     );
+    let before_cancel: RuntimeStatus = serde_json::from_value(
+        invoke("ja_runtime_state", serde_json::json!({})).expect("state before cancel"),
+    )
+    .expect("state before cancel response");
+    let cancel_input = "cancel me ".repeat(100_000);
+    let cancel_accepted: ja_lib::app_runtime::TurnAccepted = serde_json::from_value(
+        invoke(
+            "ja_turn_start",
+            serde_json::json!({
+                "input": {
+                    "threadId": "thr_cancel_mock",
+                    "accessMode": "workspace",
+                    "profileRevision": "profile_host",
+                    "input": [{"type": "text", "text": cancel_input}]
+                }
+            }),
+        )
+        .expect("cancel fixture turn start"),
+    )
+    .expect("cancel fixture turn response");
+    let cancel_ack: ja_lib::app_runtime::TurnCancelResult = serde_json::from_value(
+        invoke(
+            "ja_turn_cancel",
+            serde_json::json!({
+                "input": {
+                    "threadId": "thr_cancel_mock",
+                    "turnId": cancel_accepted.turn_id,
+                    "reason": "test cancel"
+                }
+            }),
+        )
+        .expect("typed turn cancel command"),
+    )
+    .expect("cancel acknowledgement");
+    assert!(cancel_ack.accepted);
+    assert_eq!(cancel_ack.turn_id, cancel_accepted.turn_id);
+    assert!(matches!(
+        cancel_ack.status.as_str(),
+        "interrupting" | "interrupted"
+    ));
+    assert_process_marker_visible(&marker, total_deadline);
+    let after_cancel: RuntimeStatus = serde_json::from_value(
+        invoke("ja_runtime_state", serde_json::json!({})).expect("state after cancel"),
+    )
+    .expect("state after cancel response");
+    assert_eq!(after_cancel.generation, before_cancel.generation);
+    assert_eq!(
+        after_cancel.server_instance_id,
+        before_cancel.server_instance_id
+    );
+    let duplicate_cancel = invoke(
+        "ja_turn_cancel",
+        serde_json::json!({
+            "input": {
+                "threadId": "thr_cancel_mock",
+                "turnId": cancel_accepted.turn_id,
+                "reason": "duplicate test cancel"
+            }
+        }),
+    );
+    let after_duplicate: RuntimeStatus = serde_json::from_value(
+        invoke("ja_runtime_state", serde_json::json!({})).expect("state after duplicate cancel"),
+    )
+    .expect("state after duplicate cancel response");
+    assert_eq!(after_duplicate.generation, before_cancel.generation);
+    assert_eq!(
+        after_duplicate.server_instance_id,
+        before_cancel.server_instance_id
+    );
+    if let Ok(value) = duplicate_cancel {
+        let duplicate_ack: ja_lib::app_runtime::TurnCancelResult =
+            serde_json::from_value(value).expect("duplicate cancel acknowledgement");
+        assert!(duplicate_ack.accepted);
+        assert_eq!(duplicate_ack.turn_id, cancel_accepted.turn_id);
+        assert!(matches!(
+            duplicate_ack.status.as_str(),
+            "interrupting" | "interrupted"
+        ));
+    }
+    let mut interrupted = false;
+    for _ in 0..32 {
+        let event = event_receiver
+            .recv_timeout(total_deadline.saturating_duration_since(Instant::now()))
+            .expect("cancel terminal event");
+        assert_no_token(&event);
+        if method(&event) == Some("turn/completed")
+            && event
+                .get("params")
+                .and_then(|params| params.get("terminalStatus"))
+                .and_then(Value::as_str)
+                == Some("interrupted")
+        {
+            interrupted = true;
+            break;
+        }
+    }
+    assert!(
+        interrupted,
+        "cancel fixture must publish interrupted completion"
+    );
     let stopped: RuntimeStatus = serde_json::from_value(
         invoke("ja_runtime_stop", serde_json::json!({})).expect("typed stop command"),
     )
     .expect("runtime stop response");
     assert_eq!(stopped.status, RuntimeStatusKind::Stopped);
+    assert_process_tree_gone(&marker, total_deadline);
     cleanup_on_exit(&app.state::<RuntimeHost>()).expect("mock actor shutdown");
 }
 

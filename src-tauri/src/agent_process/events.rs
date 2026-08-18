@@ -347,7 +347,6 @@ mod tests {
             EventPriority::Data,
             QueueKind::Stderr,
         );
-
         assert!(matches!(
             queue.pop(Duration::ZERO),
             Some(SessionEvent::Notification(_))
@@ -447,5 +446,124 @@ mod tests {
             panic!("data event must make progress after request burst");
         };
         assert_eq!(frame.method(), Some("item/delta"));
+    }
+
+    /// A saturated data lane reports one overflow but still delivers the one
+    /// terminal fact through control, so the UI can close a turn reliably.
+    #[test]
+    fn turn_completed_survives_data_overflow_exactly_once() {
+        let queue = EventQueue::new(1, 4 * 1024 * 1024);
+        queue.push(
+            SessionEvent::Notification(
+                RpcFrame::notification("item/seed", serde_json::json!({})).unwrap(),
+            ),
+            EventPriority::Data,
+            QueueKind::Data,
+        );
+        queue.push(
+            SessionEvent::Notification(
+                RpcFrame::notification("item/delta", serde_json::json!({})).unwrap(),
+            ),
+            EventPriority::Data,
+            QueueKind::Data,
+        );
+        let terminal = RpcFrame::notification(
+            "turn/completed",
+            serde_json::json!({
+                "turn": {
+                    "turnId": "turn_one",
+                    "threadId": "thr_one",
+                    "status": "completed",
+                    "accessMode": "workspace"
+                },
+                "terminalStatus": "completed"
+            }),
+        )
+        .unwrap();
+        queue.push(
+            SessionEvent::Notification(terminal),
+            EventPriority::Control,
+            QueueKind::Control,
+        );
+
+        let mut overflow_count = 0;
+        let mut terminal_count = 0;
+        let mut dropped_delta_count = 0;
+        while let Some(event) = queue.pop(Duration::ZERO) {
+            match event {
+                SessionEvent::QueueOverflow(QueueKind::Data) => overflow_count += 1,
+                SessionEvent::Notification(frame) if frame.method() == Some("turn/completed") => {
+                    terminal_count += 1
+                }
+                SessionEvent::Notification(frame) if frame.method() == Some("item/delta") => {
+                    dropped_delta_count += 1
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(overflow_count, 1);
+        assert_eq!(terminal_count, 1);
+        assert_eq!(dropped_delta_count, 0);
+        assert!(!queue.is_fatal());
+    }
+
+    /// Closing clears ordinary data and overflow notices but retains a queued
+    /// turn terminal, allowing a concurrent shutdown to preserve final state.
+    #[test]
+    fn close_retains_turn_completed_once() {
+        let queue = EventQueue::new(1, 4 * 1024 * 1024);
+        queue.push(
+            SessionEvent::Notification(
+                RpcFrame::notification("item/delta", serde_json::json!({})).unwrap(),
+            ),
+            EventPriority::Data,
+            QueueKind::Data,
+        );
+        queue.push(
+            SessionEvent::Notification(
+                RpcFrame::notification(
+                    "turn/completed",
+                    serde_json::json!({
+                        "turn": {
+                            "turnId": "turn_one",
+                            "threadId": "thr_one",
+                            "status": "failed",
+                            "accessMode": "workspace"
+                        },
+                        "terminalStatus": "failed"
+                    }),
+                )
+                .unwrap(),
+            ),
+            EventPriority::Control,
+            QueueKind::Control,
+        );
+        queue.close();
+        assert!(matches!(
+            queue.pop(Duration::ZERO),
+            Some(SessionEvent::Notification(frame)) if frame.method() == Some("turn/completed")
+        ));
+        assert!(queue.pop(Duration::ZERO).is_none());
+    }
+
+    /// A genuinely full control lane remains fatal; the terminal reserve does
+    /// not create a hidden second queue or allow unbounded control growth.
+    #[test]
+    fn control_saturation_remains_fatal() {
+        let queue = EventQueue::new(1, 4 * 1024);
+        for _ in 0..CONTROL_QUEUE_CAPACITY + 1 {
+            queue.push(
+                SessionEvent::Notification(
+                    RpcFrame::notification("runtime/status", serde_json::json!({})).unwrap(),
+                ),
+                EventPriority::Control,
+                QueueKind::Control,
+            );
+        }
+        assert!(queue.is_fatal());
+        assert!(matches!(
+            queue.pop(Duration::ZERO),
+            Some(SessionEvent::QueueFatalOverflow(QueueKind::Control))
+        ));
     }
 }

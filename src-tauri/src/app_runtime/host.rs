@@ -7,9 +7,10 @@ use super::bridge::RuntimeBridge;
 use super::config::{
     ApprovalResponseInput, EventSink, LaunchConfig, ManualRecoveryConfirmation,
     RuntimeCommandError, RuntimeConfigurationStatus, RuntimeConfigureInput, RuntimeRecoveryState,
-    RuntimeReplayConfig, RuntimeStatus, RuntimeStatusKind, TurnAccepted, TurnStartInput,
-    recovery_state,
+    RuntimeReplayConfig, RuntimeStatus, RuntimeStatusKind, TurnAccepted, TurnCancelInput,
+    TurnCancelResult, TurnStartInput, recovery_state,
 };
+use crate::workspace_read::{WorkspaceHandle, WorkspaceRegistry};
 #[cfg(feature = "tauri-smoke")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
@@ -24,10 +25,26 @@ pub struct RuntimeHost {
     config: Arc<Mutex<LaunchConfig>>,
     sink: EventSink,
     bridge: Arc<Mutex<Option<RuntimeBridge>>>,
+    workspace: Arc<Mutex<Option<ConfiguredWorkspace>>>,
     #[cfg(feature = "tauri-smoke")]
     exit_timeout: Option<Duration>,
     #[cfg(feature = "tauri-smoke")]
     shutdown_failure_injector: Option<Arc<AtomicUsize>>,
+}
+
+/// Binds the protocol workspace id to the exact canonical handle admitted by
+/// the runtime host; the internal registry UUID never crosses this boundary.
+struct ConfiguredWorkspace {
+    protocol_id: String,
+    handle: WorkspaceHandle,
+}
+
+/// Describes why a typed workspace command cannot be admitted without
+/// exposing a root path or allowing a caller to select an arbitrary handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceLookup {
+    Unconfigured,
+    Unknown,
 }
 
 impl RuntimeHost {
@@ -38,6 +55,7 @@ impl RuntimeHost {
             config: Arc::new(Mutex::new(config)),
             sink,
             bridge: Arc::new(Mutex::new(None)),
+            workspace: Arc::new(Mutex::new(None)),
             #[cfg(feature = "tauri-smoke")]
             exit_timeout: None,
             #[cfg(feature = "tauri-smoke")]
@@ -58,6 +76,7 @@ impl RuntimeHost {
             config: Arc::new(Mutex::new(config)),
             sink,
             bridge: Arc::new(Mutex::new(None)),
+            workspace: Arc::new(Mutex::new(None)),
             exit_timeout: Some(timeout),
             shutdown_failure_injector: Some(shutdown_failure_injector),
         }
@@ -99,7 +118,18 @@ impl RuntimeHost {
     /// Starts the lazy bridge through the one native owner used by all typed
     /// commands; no WebView field can select an executable or environment.
     pub fn start(&self) -> Result<RuntimeStatus, RuntimeCommandError> {
-        self.ensure_bridge()?.start()
+        let result = self.ensure_bridge().and_then(|bridge| bridge.start());
+        // A failed start leaves the sidecar non-Ready (or absent), so the
+        // previous binding must not become a capability to read a stale root
+        // after the caller retries configuration or recovery.
+        if result
+            .as_ref()
+            .map(|status| status.status != RuntimeStatusKind::Ready)
+            .unwrap_or(true)
+        {
+            self.clear_workspace();
+        }
+        result
     }
 
     /// Stops an existing bridge, while preserving a recovery-required result
@@ -110,7 +140,7 @@ impl RuntimeHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        match bridge {
+        let result = match bridge {
             Some(bridge) => bridge.stop(),
             None if recovery_state(&self.run_dir()).required => {
                 Err(RuntimeCommandError::recovery_required())
@@ -120,7 +150,12 @@ impl RuntimeHost {
                 generation: 0,
                 server_instance_id: None,
             }),
-        }
+        };
+        // A stop is a lifecycle boundary even when cleanup reports an error;
+        // retaining the old handle would let a file command outlive the
+        // generation that owned its admission.
+        self.clear_workspace();
+        result
     }
 
     /// Returns bridge state when present, otherwise exposes a minimal
@@ -152,6 +187,15 @@ impl RuntimeHost {
         self.ensure_bridge()?.turn_start(input)
     }
 
+    /// Routes cancellation through the current bridge without replacing or
+    /// stopping the sidecar; completion still arrives on the event channel.
+    pub fn turn_cancel(
+        &self,
+        input: TurnCancelInput,
+    ) -> Result<TurnCancelResult, RuntimeCommandError> {
+        self.ensure_bridge()?.turn_cancel(input)
+    }
+
     /// Freezes a validated workspace/profile snapshot and cleanly replaces a
     /// previous generation before storing it; this keeps settings replay out
     /// of a live AgentScope graph and makes every restart use one snapshot.
@@ -159,7 +203,23 @@ impl RuntimeHost {
         &self,
         input: RuntimeConfigureInput,
     ) -> Result<RuntimeConfigurationStatus, RuntimeCommandError> {
+        // Clear before validation/admission so every failed reconfiguration
+        // leaves no stale workspace binding behind.
+        self.clear_workspace();
+        // Admit the canonical root through the existing registry so every
+        // read/Git command shares one physical identity and no command can
+        // substitute its own absolute path.
+        let registry = WorkspaceRegistry::default();
+        let workspace_info = registry
+            .register(&input.root_path)
+            .map_err(|_| RuntimeCommandError::configuration())?;
+        let workspace_handle = registry
+            .get(workspace_info.id)
+            .map_err(|_| RuntimeCommandError::configuration())?;
+        // RuntimeReplayConfig performs the remaining settings/profile checks;
+        // raw link admission above intentionally precedes its canonicalize.
         let replay = RuntimeReplayConfig::from_input(input)?;
+        let workspace_id = replay.workspace_id.clone();
         let status = RuntimeConfigurationStatus {
             configured: true,
             profile_revision: replay.profile.profile_revision.clone(),
@@ -183,7 +243,73 @@ impl RuntimeHost {
             }
         }
         self.config_snapshot_mut().replay = Some(replay);
+        *self
+            .workspace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ConfiguredWorkspace {
+            protocol_id: workspace_id,
+            handle: workspace_handle,
+        });
         Ok(status)
+    }
+
+    /// Runs one read-only operation while holding the binding lock, so a
+    /// configuration switch cannot leave a previously selected handle usable
+    /// after the switch linearizes.
+    pub(crate) fn with_configured_workspace<T>(
+        &self,
+        workspace_id: &str,
+        operation: impl FnOnce(&WorkspaceHandle) -> T,
+    ) -> Result<T, WorkspaceLookup> {
+        let workspace = self
+            .workspace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(binding) = workspace.as_ref() else {
+            return Err(WorkspaceLookup::Unconfigured);
+        };
+        // Configuration alone is not an authorization boundary: a binding is
+        // usable only after the same sidecar generation reaches Ready. The
+        // lifecycle owner clears it on configure/stop/start failure; a read
+        // attempt merely fails closed so a later valid reconfiguration can
+        // still replace the frozen snapshot deterministically.
+        if !self.workspace_access_ready() {
+            return Err(WorkspaceLookup::Unknown);
+        }
+        if binding.protocol_id != workspace_id {
+            return Err(WorkspaceLookup::Unknown);
+        }
+        Ok(operation(&binding.handle))
+    }
+
+    /// Returns whether the current lifecycle still owns a read-capable
+    /// workspace. Stop, shutdown, failed start and crashed generations all
+    /// fail closed while the lazy post-configure state remains available.
+    fn workspace_access_ready(&self) -> bool {
+        let bridge = self
+            .bridge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match bridge {
+            // A successful configure freezes a binding but does not start a
+            // generation; commands stay closed until an authoritative Ready
+            // projection exists.
+            None => false,
+            Some(bridge) => bridge
+                .state()
+                .map(|status| status.status == RuntimeStatusKind::Ready)
+                .unwrap_or(false),
+        }
+    }
+
+    /// Removes the protocol-to-handle binding at every lifecycle boundary;
+    /// this is deliberately the only mutation path for the active binding.
+    fn clear_workspace(&self) {
+        *self
+            .workspace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Routes a user approval only to the currently owned sidecar session;
@@ -237,10 +363,14 @@ impl RuntimeHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        match bridge {
+        let result = match bridge {
             Some(bridge) => bridge.shutdown(),
             None => Ok(()),
-        }
+        };
+        // Shutdown invalidates every old workspace handle even when native
+        // cleanup needs recovery; a later start must be preceded by configure.
+        self.clear_workspace();
+        result
     }
 
     /// Reports whether a final Tauri Exit is safe for the currently managed

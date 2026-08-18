@@ -318,6 +318,31 @@ fn write_frame_with_watchdog<W: Write>(
 
 const MAX_CONTROL_BURST: usize = 8;
 
+/// Match the one terminal notification whose delivery must survive a full
+/// data lane; payload validation remains the protocol decoder's concern so a
+/// malformed terminal frame still follows the same routing policy.
+fn is_turn_completed_terminal_notification(frame: &RpcFrame) -> bool {
+    frame.method() == Some("turn/completed")
+}
+
+/// Keep the existing runtime control lane and promote only the exact turn
+/// terminal method; queue kind follows the lane so a truly full control
+/// reserve still reports the established fatal overflow rather than silently
+/// dropping data.
+fn notification_routing(frame: &RpcFrame) -> (EventPriority, QueueKind) {
+    if is_turn_completed_terminal_notification(frame) {
+        return (EventPriority::Control, QueueKind::Control);
+    }
+    if frame
+        .method()
+        .is_some_and(|method| method.starts_with("runtime/"))
+    {
+        (EventPriority::Control, QueueKind::Data)
+    } else {
+        (EventPriority::Data, QueueKind::Data)
+    }
+}
+
 /// Select the next frame with bounded control preference and no polling delay.
 fn next_frame(
     control: &Receiver<Vec<u8>>,
@@ -488,15 +513,8 @@ fn dispatch_frame(frame: RpcFrame, inner: &Arc<SessionInner>) {
                 fail_closed(inner);
                 return;
             }
-            let priority = if frame
-                .method()
-                .is_some_and(|method| method.starts_with("runtime/"))
-            {
-                EventPriority::Control
-            } else {
-                EventPriority::Data
-            };
-            push_event(inner, frame.into_notification(), priority, QueueKind::Data);
+            let (priority, kind) = notification_routing(&frame);
+            push_event(inner, frame.into_notification(), priority, kind);
         }
         Ok(FrameKind::ClientRequest) | Err(_) => {
             push_event(
@@ -751,6 +769,9 @@ pub(super) fn is_terminal_event(event: &SessionEvent) -> bool {
             | SessionEvent::QueueFatalOverflow(_)
             | SessionEvent::ProcessExited { .. }
             | SessionEvent::ResponseRejected(_)
+    ) || matches!(
+        event,
+        SessionEvent::Notification(frame) if is_turn_completed_terminal_notification(frame)
     )
 }
 
@@ -838,6 +859,53 @@ mod tests {
                 .expect("data must make progress")
                 .1,
             EventPriority::Data
+        );
+    }
+
+    /// Only the exact terminal method earns the control reserve; other turn/item
+    /// notifications remain data so ordinary deltas cannot consume control space.
+    #[test]
+    fn exact_turn_completed_uses_control_routing() {
+        let valid = RpcFrame::notification(
+            "turn/completed",
+            serde_json::json!({
+                "turn": {
+                    "turnId": "turn_one",
+                    "threadId": "thr_one",
+                    "status": "completed",
+                    "accessMode": "workspace"
+                },
+                "terminalStatus": "completed"
+            }),
+        )
+        .expect("valid terminal notification");
+        assert_eq!(
+            notification_routing(&valid),
+            (EventPriority::Control, QueueKind::Control)
+        );
+
+        let minimal_terminal = RpcFrame::notification("turn/completed", serde_json::json!({}))
+            .expect("notification envelope");
+        assert_eq!(
+            notification_routing(&minimal_terminal),
+            (EventPriority::Control, QueueKind::Control)
+        );
+
+        let ordinary_turn_event = RpcFrame::notification(
+            "turn/started",
+            serde_json::json!({
+                "turn": {
+                    "turnId": "turn_one",
+                    "threadId": "thr_one",
+                    "status": "running",
+                    "accessMode": "workspace"
+                }
+            }),
+        )
+        .expect("ordinary turn notification");
+        assert_eq!(
+            notification_routing(&ordinary_turn_event),
+            (EventPriority::Data, QueueKind::Data)
         );
     }
 }

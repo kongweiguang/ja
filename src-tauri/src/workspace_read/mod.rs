@@ -9,6 +9,7 @@
 //! a WebView command handler.
 
 mod changes;
+pub mod command;
 mod content;
 mod error;
 mod model;
@@ -19,6 +20,13 @@ mod tree;
 pub use changes::{
     ChangeBatch, ChangeDetector, ChangeKind, ChangeRecord, PollState, PollingChangeDetector,
     PollingPolicy,
+};
+pub use command::{
+    WorkspaceCommandError, WorkspaceCommandErrorCode, WorkspaceFileContentDto,
+    WorkspaceFileMetadataDto, WorkspaceFileRevisionDto, WorkspaceReadFileInput,
+    WorkspaceSearchHitDto, WorkspaceSearchInput, WorkspaceSearchResultDto, WorkspaceTreeEntryDto,
+    WorkspaceTreeInput, WorkspaceTreePageDto, ja_workspace_read_file, ja_workspace_search,
+    ja_workspace_tree,
 };
 pub use content::{ContentPolicy, FileReader};
 pub use error::WorkspaceError;

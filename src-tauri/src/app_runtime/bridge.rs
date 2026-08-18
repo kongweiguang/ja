@@ -9,8 +9,9 @@
 
 use super::config::{
     ApprovalResponseInput, EventSink, LaunchConfig, RuntimeCommandError, RuntimeReplayConfig,
-    RuntimeStatus, RuntimeStatusKind, TurnAccepted, TurnStartInput, clear_recovery_record,
-    ensure_recovery_clear, persist_recovery_record, recovery_marker_path,
+    RuntimeStatus, RuntimeStatusKind, TurnAccepted, TurnCancelInput, TurnCancelResult,
+    TurnStartInput, clear_recovery_record, ensure_recovery_clear, persist_recovery_record,
+    recovery_marker_path, valid_frozen_turn_id,
 };
 use super::projection::{emit_frame, emit_status, frame_to_value, project_approval_request};
 use crate::agent_process::codec::RpcFrame;
@@ -392,6 +393,10 @@ enum BridgeCommand {
     TurnStart {
         params: Value,
         reply: Reply<TurnAccepted>,
+    },
+    TurnCancel {
+        params: Value,
+        reply: Reply<TurnCancelResult>,
     },
     ApprovalRespond {
         input: ApprovalResponseInput,
@@ -1190,6 +1195,16 @@ impl RuntimeBridge {
         self.call(|reply| BridgeCommand::TurnStart { params, reply })
     }
 
+    /// Enqueues cancellation through the existing bridge actor; the sidecar
+    /// remains alive and its final completion event stays authoritative.
+    pub fn turn_cancel(
+        &self,
+        input: TurnCancelInput,
+    ) -> Result<TurnCancelResult, RuntimeCommandError> {
+        let params = input.into_params()?;
+        self.call(|reply| BridgeCommand::TurnCancel { params, reply })
+    }
+
     /// Enqueues a typed approval decision; the actor resolves the private
     /// server request ID from the current generation's bounded map.
     pub fn approval_respond(
@@ -1697,6 +1712,14 @@ fn actor_loop(
                 let _ = reply.send(turn_runtime(
                     &context.config,
                     &context.sink,
+                    &mut runtime,
+                    params,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::TurnCancel { params, reply }) => {
+                let _ = reply.send(turn_cancel_runtime(
+                    &context.config,
                     &mut runtime,
                     params,
                     &context.exit_control,
@@ -2428,6 +2451,78 @@ fn turn_runtime(
         accepted,
         turn_id: turn_id.to_owned(),
         queued,
+        status: status.to_owned(),
+    })
+}
+
+/// Sends the typed cancel request without touching lifecycle generation or
+/// stopping the sidecar; the eventual terminal event remains authoritative.
+fn turn_cancel_runtime(
+    config: &LaunchConfig,
+    runtime: &mut Option<RunningRuntime>,
+    params: Value,
+    exit_control: &ExitControl,
+) -> Result<TurnCancelResult, RuntimeCommandError> {
+    let Some(current) = runtime.as_mut() else {
+        return Err(RuntimeCommandError {
+            code: "RUNTIME_NOT_READY",
+            message: "runtime is not ready",
+            retryable: true,
+        });
+    };
+    if let Some(session) = current.supervisor.session_for_cancellation() {
+        exit_control.attach_session(session);
+    }
+    let _session_cancellation_guard = SessionCancellationGuard::new(exit_control);
+    let timeout = operation_timeout(config.request_timeout, exit_control)?;
+    let requested_turn_id = params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .filter(|value| valid_frozen_turn_id(value))
+        .ok_or_else(RuntimeCommandError::invalid_params)?
+        .to_owned();
+    let response = current
+        .supervisor
+        .request("turn/cancel", params, timeout)
+        .map_err(|error| RuntimeCommandError::from_process(&error))?;
+    let value = frame_to_value(&response).map_err(|_| RuntimeCommandError::unavailable())?;
+    if let Some(error) = value.get("error") {
+        return Err(command_error_from_rpc(error));
+    }
+    parse_turn_cancel_result(&requested_turn_id, &value)
+}
+
+/// Parses a cancellation acknowledgement as a complete value object; missing
+/// fields, identity drift, and an unaccepted cancellation are not projected to
+/// the UI as a successful command.
+fn parse_turn_cancel_result(
+    requested_turn_id: &str,
+    value: &Value,
+) -> Result<TurnCancelResult, RuntimeCommandError> {
+    let result = value
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    let accepted = result
+        .get("accepted")
+        .and_then(Value::as_bool)
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    let turn_id = result
+        .get("turnId")
+        .and_then(Value::as_str)
+        .filter(|value| valid_frozen_turn_id(value))
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    if turn_id != requested_turn_id || !accepted {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    let status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "interrupting" | "interrupted"))
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    Ok(TurnCancelResult {
+        accepted,
+        turn_id: turn_id.to_owned(),
         status: status.to_owned(),
     })
 }
@@ -3398,6 +3493,53 @@ mod tests {
         assert!(!notification_matches_identity(&missing, "srv_current"));
         assert!(!notification_matches_identity(&stale, "srv_current"));
         assert!(notification_matches_identity(&current, "srv_current"));
+    }
+
+    /// Cancel acknowledgements are complete, current-generation value
+    /// objects; malformed, duplicate-identity, or semantically unaccepted
+    /// results must never look like a successful interruption.
+    #[test]
+    fn cancel_ack_requires_exact_identity_and_semantics() {
+        let requested = "turn_fixture";
+        let valid = json!({
+            "result": {
+                "accepted": true,
+                "turnId": requested,
+                "status": "interrupting"
+            }
+        });
+        assert_eq!(
+            parse_turn_cancel_result(requested, &valid).expect("valid cancel ack"),
+            TurnCancelResult {
+                accepted: true,
+                turn_id: requested.to_owned(),
+                status: "interrupting".to_owned(),
+            }
+        );
+        for malformed in [
+            json!({"result": {"turnId": requested, "status": "interrupting"}}),
+            json!({"result": {"accepted": true, "status": "interrupting"}}),
+            json!({"result": {"accepted": true, "turnId": "turn_other", "status": "interrupting"}}),
+            json!({"result": {"accepted": true, "turnId": "turn_:bad", "status": "interrupting"}}),
+            json!({"result": {"accepted": true, "turnId": requested, "status": "queued"}}),
+            json!({"result": {"accepted": false, "turnId": requested, "status": "interrupted"}}),
+        ] {
+            assert!(
+                parse_turn_cancel_result(requested, &malformed).is_err(),
+                "malformed cancel ack must fail: {malformed}"
+            );
+        }
+    }
+
+    /// The returned identifier follows the frozen Java prefix and ASCII tail
+    /// grammar rather than the broader event-id alphabet.
+    #[test]
+    fn frozen_turn_id_uses_java_id_grammar() {
+        assert!(valid_frozen_turn_id("turn_a1._-z"));
+        assert!(!valid_frozen_turn_id("turn_"));
+        assert!(!valid_frozen_turn_id("turn_:bad"));
+        assert!(!valid_frozen_turn_id("turn_é"));
+        assert!(!valid_frozen_turn_id(&format!("turn_a{}", "x".repeat(96))));
     }
 
     /// A full server-request lane must not consume the reserved terminal
