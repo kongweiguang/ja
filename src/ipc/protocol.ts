@@ -293,10 +293,19 @@ function isSafeMcpConfigValue(value: string): boolean {
 
 /**
  * Stdio endpoints are paths, not shell command lines; this guard preserves
- * spaces inside a path while rejecting whitespace-separated command flags.
+ * spaces inside a path while rejecting whitespace-separated command flags. The
+ * explicit character-code checks keep the exact control-character boundary
+ * without embedding a control character in a regular expression.
  */
 function isSingleMcpExecutable(endpoint: string): boolean {
-  if (endpoint.trim() !== endpoint || /[\u0000\r\n;&|`$<>]/.test(endpoint)) return false;
+  if (endpoint.trim() !== endpoint) return false;
+  for (let index = 0; index < endpoint.length; index += 1) {
+    const code = endpoint.charCodeAt(index);
+    const character = endpoint[index];
+    if (code === 0 || code === 10 || code === 13 || ";&|`$<>".includes(character ?? "")) {
+      return false;
+    }
+  }
   if (/\s+[-/]{1,2}\S*/.test(endpoint)) return false;
   if (/\s/.test(endpoint) && !/[\\/]/.test(endpoint)) return false;
   return isSafeMcpConfigValue(endpoint);
