@@ -261,6 +261,23 @@ final class AgentScopeTurnRuntimeTest {
 
             engine.releaseResume.countDown();
             assertTrue(runtime.awaitQuiescence(java.time.Duration.ofSeconds(2)));
+            List<TurnEvent> approvalTimeline = events.stream()
+                    .filter(event -> event.method().startsWith("approval/"))
+                    .toList();
+            assertEquals(List.of("approval/requested", "approval/resolved"),
+                    approvalTimeline.stream().map(TurnEvent::method).toList());
+            long requestedSeq = approvalTimeline.getFirst().params().path("seq").longValue();
+            long resolvedSeq = approvalTimeline.getLast().params().path("seq").longValue();
+            assertTrue(requestedSeq > 0 && resolvedSeq == requestedSeq + 1,
+                    "approval facts must use one continuous thread sequence");
+            int requestedIndex = events.indexOf(approvalTimeline.getFirst());
+            int resolvedIndex = events.indexOf(approvalTimeline.getLast());
+            assertTrue(requestedIndex < resolvedIndex);
+            assertTrue(events.subList(resolvedIndex + 1, events.size()).stream()
+                    .allMatch(event -> event.params().path("seq").longValue() > resolvedSeq),
+                    "resume/tool events must follow approval/resolved");
+            assertTrue(events.stream().noneMatch(event -> event.method().equals("approval/request")),
+                    "private approval request must not become a UI event");
             assertEquals(1, events.stream().filter(event -> "turn/completed".equals(event.method()))
                     .count());
             assertEquals("completed", events.getLast().params().path("turn")

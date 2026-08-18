@@ -23,7 +23,9 @@ import io.github.kongweiguang.ja.protocol.RpcRequest;
 import io.github.kongweiguang.ja.protocol.WireEnums;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -35,6 +37,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -44,6 +47,10 @@ import java.util.function.Consumer;
  */
 public final class DeterministicFakeTurnRuntime implements TurnRuntime {
     private static final int MAX_INPUT_CHARS = 1_048_576;
+    /** Explicit opt-in input used only by the fake sidecar approval fixture. */
+    static final String APPROVAL_FIXTURE_INPUT = "__JA_FAKE_APPROVAL_FIXTURE__";
+    private static final Duration APPROVAL_WAIT_TIMEOUT = Duration.ofMinutes(5);
+    private static final String APPROVAL_FIXTURE_COMMAND = "echo JA-FAKE-APPROVAL";
 
     private final ServerInstanceId serverInstanceId;
     private final Clock clock;
@@ -56,10 +63,13 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
     private final AtomicLong eventSequence = new AtomicLong();
     private final ConcurrentHashMap<ThreadId, TurnId> activeTurns = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<TurnId, AtomicBoolean> cancellationFlags = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<TurnId, Thread> workerThreads = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<TurnId, WorkerState> workerThreads = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<ThreadId, AtomicLong> threadSequences = new ConcurrentHashMap<>();
     private final AtomicBoolean accepting = new AtomicBoolean(true);
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private volatile ApprovalSink approvalSink = (prompt, resolver) -> {
+        throw new ProtocolException(JaErrorCode.CAPABILITY_UNSUPPORTED);
+    };
 
     /** Uses the system clock for the production fixture while keeping IDs local to one sidecar. */
     public DeterministicFakeTurnRuntime(ServerInstanceId serverInstanceId) {
@@ -151,7 +161,7 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
         if (!cancelled.compareAndSet(false, true)) {
             return new CancelResult(true, turnId, "interrupted");
         }
-        Thread worker = workerThreads.get(turnId);
+        WorkerState worker = workerThreads.get(turnId);
         if (worker != null) {
             worker.interrupt();
         }
@@ -166,10 +176,19 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
         return true;
     }
 
-    /** Stops admission so accepted turns can drain without being discarded. */
+    /** Installs StdioRuntime's existing pending-request-backed approval sink. */
+    @Override
+    public void setApprovalSink(ApprovalSink sink) {
+        approvalSink = Objects.requireNonNull(sink, "sink");
+    }
+
+    /** Stops admission and wakes only workers blocked on the explicit approval fixture. */
     @Override
     public void stopAccepting() {
-        accepting.set(false);
+        synchronized (activeMonitor) {
+            accepting.set(false);
+            workerThreads.values().forEach(WorkerState::interruptIfWaitingForApproval);
+        }
     }
 
     /** Waits for every accepted turn to publish its terminal event. */
@@ -213,9 +232,10 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
         }
     }
 
-    /** Emits one complete, ordered fixture timeline and releases the thread admission. */
+    /** Emits one complete timeline, optionally pausing at the explicit approval fixture gate. */
     private void runTurn(TurnInput input, TurnId turnId, Consumer<TurnEvent> eventPublisher) {
-        workerThreads.put(turnId, Thread.currentThread());
+        WorkerState worker = new WorkerState(Thread.currentThread());
+        workerThreads.put(turnId, worker);
         Instant startedAt = clock.instant();
         TurnState queued = TurnState.queued(turnId, input.threadId(), input.accessMode(),
                 PermissionMode.ASK, startedAt);
@@ -237,15 +257,40 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
             }
             latest = queued.transition(TurnStatus.RUNNING, clock.instant());
             eventPublisher.accept(new TurnEvent("turn/started", turnParams(latest)));
-            eventPublisher.accept(new TurnEvent("item/started", itemParams(item, turnId,
-                    ItemStatus.STARTED, input.outputText(), input.inputText())));
-            for (String delta : utf8Chunks(input.outputText(), limits.maxItemDeltaBytes())) {
+            String outputText = input.outputText();
+            ItemIdParts responseItem = item;
+            if (APPROVAL_FIXTURE_INPUT.equals(input.inputText())) {
+                TurnRuntime.ApprovalPrompt prompt = approvalPrompt(input, turnId, item);
+                // The approval row must exist before the durable request so the UI can correlate
+                // the request by itemId instead of racing a later item/started notification.
+                eventPublisher.accept(new TurnEvent("item/started",
+                        approvalItemParams(item, turnId, ItemStatus.STARTED)));
+                // The fixture follows the production order: the durable business notification is
+                // visible before the private JSON-RPC request is offered to the host.
+                eventPublisher.accept(new TurnEvent("approval/requested",
+                        approvalRequestedParams(prompt, item.threadId)));
+                TurnRuntime.ApprovalDecision decision = awaitApprovalFixture(
+                        input, turnId, item, worker, prompt, eventPublisher);
+                // Keep the approval item's lifecycle separate from the final agent message. This
+                // mirrors AgentScope's hidden approval block and prevents the card from vanishing
+                // when the model's response starts after the decision.
+                eventPublisher.accept(new TurnEvent("item/completed",
+                        approvalItemParams(item, turnId, ItemStatus.COMPLETED)));
+                if (!approvalAllowsExecution(decision)) {
+                    outputText = "Fake response: approval denied";
+                }
+                responseItem = new ItemIdParts("item_fake_" + itemSequence.incrementAndGet(),
+                        input.threadId());
+            }
+            eventPublisher.accept(new TurnEvent("item/started", itemParams(responseItem, turnId,
+                    ItemStatus.STARTED, outputText, input.inputText())));
+            for (String delta : utf8Chunks(outputText, limits.maxItemDeltaBytes())) {
                 if (cancelled != null && cancelled.get()) {
                     publishInterrupted(latest, eventPublisher);
                     terminalPublished = true;
                     return;
                 }
-                eventPublisher.accept(new TurnEvent("item/delta", deltaParams(item, delta)));
+                eventPublisher.accept(new TurnEvent("item/delta", deltaParams(responseItem, delta)));
             }
             if (cancelled != null && cancelled.get()) {
                 publishInterrupted(latest, eventPublisher);
@@ -253,8 +298,8 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
                 return;
             }
             TurnState completed = latest.transition(TurnStatus.COMPLETED, clock.instant());
-            eventPublisher.accept(new TurnEvent("item/completed", itemParams(item, turnId,
-                    ItemStatus.COMPLETED, input.outputText(), input.inputText())));
+            eventPublisher.accept(new TurnEvent("item/completed", itemParams(responseItem, turnId,
+                    ItemStatus.COMPLETED, outputText, input.inputText())));
             ObjectNode completedParams = turnParams(completed);
             completedParams.put("terminalStatus", "completed");
             eventPublisher.accept(new TurnEvent("turn/completed", completedParams));
@@ -273,12 +318,118 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
                 publishAborted(latest, eventPublisher);
             }
         } finally {
-            workerThreads.remove(turnId, Thread.currentThread());
+            workerThreads.remove(turnId, worker);
             cancellationFlags.remove(turnId);
             activeTurns.remove(input.threadId(), turnId);
             synchronized (activeMonitor) {
                 activeMonitor.notifyAll();
             }
+        }
+    }
+
+    /**
+     * Routes the explicit fixture prompt through StdioRuntime's pending registry and waits for
+     * exactly one decision. The local latch is only a worker rendezvous; request correlation
+     * remains owned by the transport approval sink.
+     */
+    private TurnRuntime.ApprovalDecision awaitApprovalFixture(
+            TurnInput input, TurnId turnId, ItemIdParts item, WorkerState worker,
+            TurnRuntime.ApprovalPrompt prompt, Consumer<TurnEvent> eventPublisher)
+            throws InterruptedException {
+        CountDownLatch resolved = new CountDownLatch(1);
+        AtomicReference<TurnRuntime.ApprovalDecision> decision = new AtomicReference<>();
+        AtomicBoolean callbackClaimed = new AtomicBoolean();
+        Consumer<TurnRuntime.ApprovalDecision> resolver = value -> {
+            Objects.requireNonNull(value, "approval decision");
+            if (callbackClaimed.compareAndSet(false, true)) {
+                decision.set(value);
+                resolved.countDown();
+            }
+        };
+        synchronized (activeMonitor) {
+            if (!accepting.get() || closed.get()) {
+                throw new ProtocolException(JaErrorCode.SHUTTING_DOWN);
+            }
+            worker.beginApprovalWait();
+        }
+        TurnRuntime.ApprovalHandle handle = TurnRuntime.ApprovalHandle.noop();
+        try {
+            handle = Objects.requireNonNull(approvalSink.requestWithHandle(prompt, resolver),
+                    "approval handle");
+            if (!resolved.await(APPROVAL_WAIT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
+                throw new ProtocolException(JaErrorCode.REQUEST_DEADLINE_EXCEEDED);
+            }
+            TurnRuntime.ApprovalDecision result = decision.get();
+            if (result == null) {
+                throw new ProtocolException(JaErrorCode.INTERNAL_ERROR);
+            }
+            // The decision callback wins the one-shot gate before this fact is published, so a
+            // later item or terminal event can never appear ahead of approval/resolved.
+            eventPublisher.accept(new TurnEvent("approval/resolved",
+                    approvalResolvedParams(prompt, result, item.threadId)));
+            return result;
+        } finally {
+            if (!callbackClaimed.get()) {
+                cancelApprovalHandle(handle);
+            }
+            worker.finishApprovalWait();
+        }
+    }
+
+    /** Creates the bounded shell summary used by the deterministic approval fixture. */
+    private TurnRuntime.ApprovalPrompt approvalPrompt(TurnInput input, TurnId turnId,
+                                                      ItemIdParts item) {
+        String suffix = turnId.value().replace("turn_fake_", "");
+        return new TurnRuntime.ApprovalPrompt(
+                "appr_fake_" + suffix, input.threadId().value(), turnId.value(), item.itemId,
+                "shell", APPROVAL_FIXTURE_COMMAND, ".", List.of(), "high",
+                WireEnums.encode(input.accessMode()), clock.instant().plus(APPROVAL_WAIT_TIMEOUT),
+                "Explicit fake approval fixture request");
+    }
+
+    /** Serializes only the frozen approval summary while reusing the fixture's thread sequence. */
+    private ObjectNode approvalRequestedParams(TurnRuntime.ApprovalPrompt prompt, ThreadId threadId) {
+        ObjectNode params = eventBase(threadId);
+        ObjectNode approval = JsonNodes.object();
+        approval.put("approvalId", prompt.approvalId());
+        approval.put("threadId", prompt.threadId());
+        approval.put("turnId", prompt.turnId());
+        approval.put("itemId", prompt.itemId());
+        ObjectNode action = JsonNodes.object();
+        action.put("kind", prompt.actionKind());
+        action.put("command", prompt.command());
+        action.put("cwd", prompt.cwd());
+        approval.set("action", action);
+        approval.put("risk", prompt.risk());
+        approval.put("accessMode", prompt.accessMode());
+        approval.put("expiresAt", prompt.expiresAt().toString());
+        params.set("approval", approval);
+        return params;
+    }
+
+    /** Serializes the one-shot decision fact before the fixture continues with its final item. */
+    private ObjectNode approvalResolvedParams(TurnRuntime.ApprovalPrompt prompt,
+                                              TurnRuntime.ApprovalDecision decision,
+                                              ThreadId threadId) {
+        ObjectNode params = eventBase(threadId);
+        params.put("approvalId", prompt.approvalId());
+        params.put("decision", decision.decision());
+        params.put("resolvedAt", decision.resolvedAt().toString());
+        return params;
+    }
+
+    /** Keeps allow decisions on the original fake output path and treats all other decisions as denial. */
+    private static boolean approvalAllowsExecution(TurnRuntime.ApprovalDecision decision) {
+        return "allow_once".equals(decision.decision())
+                || "allow_session".equals(decision.decision());
+    }
+
+    /** Retires a transport approval request during cancel/close without masking the terminal event. */
+    private static void cancelApprovalHandle(TurnRuntime.ApprovalHandle handle) {
+        try {
+            handle.cancel();
+        } catch (RuntimeException ignored) {
+            // The worker's interrupted/aborted terminal is the authoritative cleanup signal.
         }
     }
 
@@ -344,6 +495,26 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
         ObjectNode metadata = JsonNodes.object();
         metadata.put("runtime", "fake");
         metadata.put("input", inputText);
+        itemNode.set("metadata", metadata);
+        params.set("item", itemNode);
+        return params;
+    }
+
+    /**
+     * Serializes the hidden approval block without inventing a second approval protocol; keeping
+     * the same item identity through completion is what lets the timeline attach the card safely.
+     */
+    private ObjectNode approvalItemParams(ItemIdParts item, TurnId turnId, ItemStatus status) {
+        ObjectNode params = eventBase(item.threadId);
+        ObjectNode itemNode = JsonNodes.object();
+        itemNode.put("itemId", item.itemId);
+        itemNode.put("turnId", turnId.value());
+        itemNode.put("kind", WireEnums.encode(ItemKind.APPROVAL));
+        itemNode.put("status", WireEnums.encode(status));
+        itemNode.put("title", "需要确认");
+        ObjectNode metadata = JsonNodes.object();
+        metadata.put("runtime", "fake");
+        metadata.put("requiresUserAction", true);
         itemNode.set("metadata", metadata);
         params.set("item", itemNode);
         return params;
@@ -461,6 +632,39 @@ public final class DeterministicFakeTurnRuntime implements TurnRuntime {
         private ItemIdParts(String itemId, ThreadId threadId) {
             this.itemId = itemId;
             this.threadId = threadId;
+        }
+    }
+
+    /** Holds one worker's approval wait capability without introducing a second request registry. */
+    private static final class WorkerState {
+        private final Thread thread;
+        private volatile boolean waitingForApproval;
+
+        /** Associates cancellation with the exact virtual worker that owns the turn. */
+        private WorkerState(Thread thread) {
+            this.thread = Objects.requireNonNull(thread, "thread");
+        }
+
+        /** Interrupts only a worker that is currently waiting for the fixture decision. */
+        private void interruptIfWaitingForApproval() {
+            if (waitingForApproval) {
+                thread.interrupt();
+            }
+        }
+
+        /** Marks the worker's bounded approval rendezvous before calling the transport sink. */
+        private void beginApprovalWait() {
+            waitingForApproval = true;
+        }
+
+        /** Clears the wait state after resolver, cancellation, timeout, or shutdown. */
+        private void finishApprovalWait() {
+            waitingForApproval = false;
+        }
+
+        /** Interrupts one accepted worker from the public turn/cancel path. */
+        private void interrupt() {
+            thread.interrupt();
         }
     }
 }

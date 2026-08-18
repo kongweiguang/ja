@@ -14,7 +14,7 @@ use super::config::{
     recovery_marker_path, valid_frozen_turn_id,
 };
 use super::history::HistoryMethod;
-use super::projection::{emit_frame, emit_status, frame_to_value, project_approval_request};
+use super::projection::{emit_frame, emit_status, frame_to_value};
 use crate::agent_process::codec::RpcFrame;
 use crate::agent_process::{AgentClient, EventPump, Session, SessionEvent, SidecarSupervisor};
 use crate::settings::{CredentialPurpose, CredentialRef, CredentialVault, SecretError};
@@ -424,6 +424,16 @@ enum BridgeSignal {
     ServerRequest {
         generation: u64,
         frame: RpcFrame,
+    },
+    /// Carries an approval request with a one-shot registration acknowledgement.
+    ///
+    /// The event pump prioritizes server requests over data notifications.  Waiting for this
+    /// acknowledgement before forwarding Java's already-durable `approval/requested` frame keeps
+    /// the existing actor map authoritative when a WebView responds immediately after rendering.
+    ApprovalRequest {
+        generation: u64,
+        frame: RpcFrame,
+        registered: SyncSender<bool>,
     },
     TurnTerminal {
         generation: u64,
@@ -1407,7 +1417,6 @@ struct RunningRuntime {
     /// consume a fresh request slot after turn/generation cleanup.
     retired_approvals: HashSet<String>,
     retired_approval_order: VecDeque<String>,
-    next_approval_sequence: u64,
 }
 
 /// Keeps the private request correlation and the exact turn/expiry ownership
@@ -2298,7 +2307,6 @@ fn start_runtime(context: StartRuntimeContext<'_>) -> Result<RuntimeStatus, Runt
         pending_approvals: HashMap::new(),
         retired_approvals: HashSet::new(),
         retired_approval_order: VecDeque::new(),
-        next_approval_sequence: 0,
     };
     if let Err(error) = emit_status(
         sink,
@@ -2776,6 +2784,10 @@ fn spawn_event_drain(spec: EventDrainSpec) -> Result<EventDrain, RuntimeCommandE
 
 /// Polls notifications continuously, rejecting stale identity before the UI.
 fn event_drain_loop(mut context: EventDrainContext) {
+    // A rejected private approval request must not cause its paired Java notification to become a
+    // Rust-created timeline entry.  One marker is enough because Java serializes each requested
+    // notification immediately before its corresponding private request.
+    let mut suppress_next_approval_notification = false;
     loop {
         if !event_is_current(
             &context.cancel_receiver,
@@ -2801,6 +2813,12 @@ fn event_drain_loop(mut context: EventDrainContext) {
                 if !notification_matches_identity(&frame, &context.server_instance_id) {
                     continue;
                 }
+                if suppress_next_approval_notification
+                    && frame.method() == Some("approval/requested")
+                {
+                    suppress_next_approval_notification = false;
+                    continue;
+                }
                 if emit_frame(&context.sink, &frame).is_err() {
                     signal_projection_failure(&context.terminal_fault, context.generation);
                     break;
@@ -2818,7 +2836,36 @@ fn event_drain_loop(mut context: EventDrainContext) {
                 }
             }
             SessionEvent::ServerRequest(frame) => {
-                if !queue_server_request(
+                if frame.method() == Some("approval/request") {
+                    let (registered, result) = mpsc::sync_channel(1);
+                    if !queue_approval_request(
+                        &context.server_request_sender,
+                        context.generation,
+                        frame,
+                        registered,
+                        &context.terminal_fault,
+                    ) {
+                        break;
+                    }
+                    // The actor owns the correlation map.  A bounded acknowledgement is the
+                    // smallest ordering barrier that prevents a fast UI response from racing
+                    // the map insertion; it does not create a second sequence or event source.
+                    match result.recv_timeout(APPROVAL_REGISTRATION_TIMEOUT) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            // The malformed/duplicate request was rejected before any private
+                            // request could be answered.  No Rust timeline event is fabricated;
+                            // the following Java notification is consumed by the normal loop.
+                            suppress_next_approval_notification = true;
+                        }
+                        Err(_) => {
+                            context
+                                .terminal_fault
+                                .publish(context.generation, TERMINAL_SERVER_REQUEST_QUEUE);
+                            break;
+                        }
+                    }
+                } else if !queue_server_request(
                     &context.server_request_sender,
                     context.generation,
                     frame,
@@ -2864,6 +2911,32 @@ fn event_drain_loop(mut context: EventDrainContext) {
             SessionEvent::ProcessExited { .. }
             | SessionEvent::StderrLine(_)
             | SessionEvent::StderrTruncated => {}
+        }
+    }
+}
+
+const APPROVAL_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Queues one approval request while giving the actor a bounded registration handshake.
+///
+/// The request ID remains private to `PendingApproval`; the acknowledgement only communicates
+/// whether the existing actor-owned map accepted the association before UI projection continues.
+fn queue_approval_request(
+    sender: &SyncSender<BridgeSignal>,
+    generation: u64,
+    frame: RpcFrame,
+    registered: SyncSender<bool>,
+    terminal_fault: &Arc<TerminalFault>,
+) -> bool {
+    match sender.try_send(BridgeSignal::ApprovalRequest {
+        generation,
+        frame,
+        registered,
+    }) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+            terminal_fault.publish(generation, TERMINAL_SERVER_REQUEST_QUEUE);
+            false
         }
     }
 }
@@ -2953,10 +3026,10 @@ fn signal_projection_failure(fault: &Arc<TerminalFault>, generation: u64) {
 /// to mutate a newly started supervisor or expose its private request ID.
 fn drain_signals(
     config: &LaunchConfig,
-    sink: &EventSink,
+    _sink: &EventSink,
     runtime: &mut Option<RunningRuntime>,
     receiver: &Receiver<BridgeSignal>,
-    terminal_fault: &Arc<TerminalFault>,
+    _terminal_fault: &Arc<TerminalFault>,
 ) {
     if let Some(current) = runtime.as_mut() {
         purge_expired_approvals(current);
@@ -2978,86 +3051,7 @@ fn drain_signals(
                         respond_secret_request(config, &client, &frame);
                     }
                     Some("approval/request") => {
-                        if current.pending_approvals.len() >= MAX_PENDING_APPROVALS {
-                            let _ = client.respond_error(
-                                frame.id(),
-                                -32_042,
-                                "approval already resolved",
-                                "APPROVAL_ALREADY_RESOLVED",
-                                false,
-                            );
-                            continue;
-                        }
-                        let Some(approval_id) = frame
-                            .params()
-                            .and_then(|params| params.get("approvalId"))
-                            .and_then(Value::as_str)
-                            .filter(|value| value.starts_with("appr_") && valid_id(value, 128))
-                        else {
-                            let _ = client.respond_error(
-                                frame.id(),
-                                -32_007,
-                                "invalid params",
-                                "INVALID_PARAMS",
-                                false,
-                            );
-                            continue;
-                        };
-                        if current.pending_approvals.contains_key(approval_id)
-                            || current.retired_approvals.contains(approval_id)
-                        {
-                            let _ = client.respond_error(
-                                frame.id(),
-                                -32_042,
-                                "approval already resolved",
-                                "APPROVAL_ALREADY_RESOLVED",
-                                false,
-                            );
-                            continue;
-                        }
-                        current.next_approval_sequence =
-                            current.next_approval_sequence.saturating_add(1);
-                        let event = match project_approval_request(
-                            &frame,
-                            &current.server_instance_id,
-                            current.next_approval_sequence,
-                        ) {
-                            Ok(event) => event,
-                            Err(_) => {
-                                let _ = client.respond_error(
-                                    frame.id(),
-                                    -32_007,
-                                    "invalid params",
-                                    "INVALID_PARAMS",
-                                    false,
-                                );
-                                continue;
-                            }
-                        };
-                        let Some(details) = pending_approval_from_event(&event, frame.id()) else {
-                            let _ = client.respond_error(
-                                frame.id(),
-                                -32_007,
-                                "invalid params",
-                                "INVALID_PARAMS",
-                                false,
-                            );
-                            continue;
-                        };
-                        current
-                            .pending_approvals
-                            .insert(approval_id.to_owned(), details);
-                        if sink(event).is_err() {
-                            retire_pending_approval(current, approval_id);
-                            let _ = client.respond_error(
-                                frame.id(),
-                                -32_080,
-                                "internal error",
-                                "INTERNAL_ERROR",
-                                false,
-                            );
-                            terminal_fault.publish(current.generation, TERMINAL_EVENT_DELIVERY);
-                        }
+                        let _ = register_approval_request(current, &frame);
                     }
                     _ => {
                         let _ = client.respond_error(
@@ -3069,6 +3063,20 @@ fn drain_signals(
                         );
                     }
                 }
+            }
+            BridgeSignal::ApprovalRequest {
+                generation,
+                frame,
+                registered,
+            } => {
+                let accepted = if let Some(current) = runtime.as_mut()
+                    && current.generation == generation
+                {
+                    register_approval_request(current, &frame)
+                } else {
+                    false
+                };
+                let _ = registered.send(accepted);
             }
             BridgeSignal::TurnTerminal {
                 generation,
@@ -3084,6 +3092,48 @@ fn drain_signals(
             }
         }
     }
+}
+
+/// Registers an approval request in the actor-owned correlation map and answers malformed input
+/// without creating a timeline event.  The caller sends the result through the one-shot barrier.
+fn register_approval_request(current: &mut RunningRuntime, frame: &RpcFrame) -> bool {
+    let Ok(client) = current.supervisor.client() else {
+        return false;
+    };
+    if current.pending_approvals.len() >= MAX_PENDING_APPROVALS {
+        let _ = client.respond_error(
+            frame.id(),
+            -32_042,
+            "approval already resolved",
+            "APPROVAL_ALREADY_RESOLVED",
+            false,
+        );
+        return false;
+    }
+    let Some((approval_id, details)) = pending_approval_from_request(frame) else {
+        let _ = client.respond_error(
+            frame.id(),
+            -32_007,
+            "invalid params",
+            "INVALID_PARAMS",
+            false,
+        );
+        return false;
+    };
+    if current.pending_approvals.contains_key(&approval_id)
+        || current.retired_approvals.contains(&approval_id)
+    {
+        let _ = client.respond_error(
+            frame.id(),
+            -32_042,
+            "approval already resolved",
+            "APPROVAL_ALREADY_RESOLVED",
+            false,
+        );
+        return false;
+    }
+    current.pending_approvals.insert(approval_id, details);
+    true
 }
 
 const MAX_PENDING_APPROVALS: usize = 1024;
@@ -3121,19 +3171,104 @@ fn retire_pending_approval(current: &mut RunningRuntime, approval_id: &str) {
     retire_approval(current, approval_id);
 }
 
-/// Converts the already sanitized event back into the private correlation
-/// record, avoiding a second parser for untrusted Java fields.
-fn pending_approval_from_event(value: &Value, request_id: &str) -> Option<PendingApproval> {
-    let approval = value.get("params")?.get("approval")?.as_object()?;
-    let thread_id = approval.get("threadId")?.as_str()?.to_owned();
-    let turn_id = approval.get("turnId")?.as_str()?.to_owned();
-    let expires_at = approval.get("expiresAt")?.as_str()?.to_owned();
-    Some(PendingApproval {
-        request_id: request_id.to_owned(),
-        thread_id,
-        turn_id,
-        expires_at,
-    })
+/// Parses the complete private approval request while keeping its request ID out of UI events.
+/// Java already published the durable approval/requested notification; this parser only creates
+/// the actor-owned business-to-request correlation needed to answer that private frame.
+fn pending_approval_from_request(frame: &RpcFrame) -> Option<(String, PendingApproval)> {
+    // The native bridge only correlates Java's private server namespace.  Rejecting any other
+    // valid JSON-RPC id here prevents malformed sidecar input from becoming a response channel.
+    if frame.method() != Some("approval/request")
+        || !frame.id().starts_with("s:")
+        || frame.id().len() <= 2
+        || !valid_id(frame.id(), 128)
+    {
+        return None;
+    }
+    let params = frame.params()?.as_object()?;
+    let approval_id = required_approval_id(params.get("approvalId")?, "appr_")?;
+    let thread_id = required_approval_id(params.get("threadId")?, "thr_")?;
+    let turn_id = required_approval_id(params.get("turnId")?, "turn_")?;
+    let _item_id = required_approval_id(params.get("itemId")?, "item_")?;
+    if !valid_approval_action(params.get("action")?)
+        || !params
+            .get("risk")
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "low" | "medium" | "high" | "critical"))
+        || !params
+            .get("accessMode")
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "read_only" | "workspace" | "full_access"))
+        || params
+            .get("expiresAt")
+            .and_then(Value::as_str)
+            .is_none_or(|value| canonical_timestamp(value).is_none())
+    {
+        return None;
+    }
+    Some((
+        approval_id,
+        PendingApproval {
+            request_id: frame.id().to_owned(),
+            thread_id,
+            turn_id,
+            expires_at: params.get("expiresAt")?.as_str()?.to_owned(),
+        },
+    ))
+}
+
+/// Accepts only the frozen identifier prefixes and the bounded ASCII identity alphabet.
+fn required_approval_id(value: &Value, prefix: &str) -> Option<String> {
+    let text = value.as_str()?;
+    (text.starts_with(prefix)
+        && text.len() > prefix.len()
+        && text.len() <= 128
+        && text[prefix.len()..].chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        }))
+    .then(|| text.to_owned())
+}
+
+/// Checks all action fields needed by the approval contract without retaining their payloads.
+fn valid_approval_action(value: &Value) -> bool {
+    let Some(action) = value.as_object() else {
+        return false;
+    };
+    if !action
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|value| {
+            matches!(
+                value,
+                "file_read" | "file_write" | "file_delete" | "shell" | "mcp_tool" | "external_tool"
+            )
+        })
+    {
+        return false;
+    }
+    for key in ["command", "cwd"] {
+        if let Some(value) = action.get(key)
+            && !value
+                .as_str()
+                .is_some_and(|text| text.len() <= 4096 && !text.chars().any(char::is_control))
+        {
+            return false;
+        }
+    }
+    if let Some(paths) = action.get("relativePaths") {
+        let Some(paths) = paths.as_array() else {
+            return false;
+        };
+        if paths.len() > 128
+            || paths.iter().any(|value| {
+                !value
+                    .as_str()
+                    .is_some_and(|text| text.len() <= 4096 && !text.chars().any(char::is_control))
+            })
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Retires approvals whose Java-provided expiry has passed and answers each
@@ -3768,6 +3903,61 @@ mod tests {
         assert!(!valid_frozen_turn_id("turn_:bad"));
         assert!(!valid_frozen_turn_id("turn_é"));
         assert!(!valid_frozen_turn_id(&format!("turn_a{}", "x".repeat(96))));
+    }
+
+    /// The private request parser records only business correlation and never manufactures a UI
+    /// notification; Java's approval/requested event remains the sole timeline source.
+    #[test]
+    fn approval_request_parser_requires_complete_params_and_hides_projection() {
+        let frame = RpcFrame::server_request(
+            "s:approval_1",
+            "approval/request",
+            json!({
+                "approvalId": "appr_1",
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "item_1",
+                "action": {"kind": "shell", "command": "echo hi", "cwd": "."},
+                "risk": "high",
+                "accessMode": "workspace",
+                "expiresAt": "2999-01-01T00:00:00Z"
+            }),
+        )
+        .expect("approval request");
+        let (approval_id, pending) = pending_approval_from_request(&frame).expect("parsed");
+        assert_eq!(approval_id, "appr_1");
+        assert_eq!(pending.request_id, "s:approval_1");
+        assert_eq!(pending.thread_id, "thr_1");
+        assert_eq!(pending.turn_id, "turn_1");
+
+        for malformed in [
+            json!({"approvalId": "appr_1"}),
+            json!({
+                "approvalId": "appr_1", "threadId": "thr_1", "turnId": "turn_1",
+                "itemId": "item_1", "action": {"kind": "unknown"}, "risk": "high",
+                "accessMode": "workspace", "expiresAt": "2999-01-01T00:00:00Z"
+            }),
+            json!({
+                "approvalId": "appr_1", "threadId": "thr_1", "turnId": "turn_1",
+                "itemId": "item_1", "action": {"kind": "shell", "command": "\u{0000}"},
+                "risk": "high", "accessMode": "workspace", "expiresAt": "2999-01-01T00:00:00Z"
+            }),
+        ] {
+            let invalid = RpcFrame::server_request("s:approval_bad", "approval/request", malformed)
+                .expect("frame envelope");
+            assert!(pending_approval_from_request(&invalid).is_none());
+        }
+        let invalid = RpcFrame::client_request(
+            "c:approval_1",
+            "approval/request",
+            json!({
+                "approvalId": "appr_1", "threadId": "thr_1", "turnId": "turn_1",
+                "itemId": "item_1", "action": {"kind": "shell"}, "risk": "high",
+                "accessMode": "workspace", "expiresAt": "2999-01-01T00:00:00Z"
+            }),
+        )
+        .expect("frame envelope");
+        assert!(pending_approval_from_request(&invalid).is_none());
     }
 
     /// A full server-request lane must not consume the reserved terminal

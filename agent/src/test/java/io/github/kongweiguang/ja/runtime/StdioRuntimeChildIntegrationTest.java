@@ -93,6 +93,234 @@ class StdioRuntimeChildIntegrationTest {
         assertFalse(diagnostic.contains("Fake response"));
     }
 
+    /** Verifies the real fake child round-trips one approval using only the private JSON-RPC id. */
+    @Test
+    void childApprovalFixtureRoundTripsPrivateRequestAndCleanShutdown() throws Exception {
+        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        Process process = startChild(java);
+        CompletableFuture<String> stderr = CompletableFuture.supplyAsync(() -> readAll(process));
+        BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
+                process.getOutputStream(), StandardCharsets.UTF_8));
+        BufferedReader output = new BufferedReader(new InputStreamReader(
+                process.getInputStream(), StandardCharsets.UTF_8));
+        try {
+            send(input, initializeFrame());
+            send(input, initializedFrame());
+            assertEquals("c:init", readJson(output).path("id").textValue());
+            assertEquals("ready", readJson(output).path("params").path("status").textValue());
+
+            send(input, turnStartFrame("c:approval", "thr_approval_child",
+                    DeterministicFakeTurnRuntime.APPROVAL_FIXTURE_INPUT));
+            JsonNode accepted = readJson(output);
+            assertEquals("c:approval", accepted.path("id").textValue());
+            String turnId = accepted.path("result").path("turnId").textValue();
+            JsonNode approvalStarted = null;
+            JsonNode requested = null;
+            long lastSequence = 0;
+            JsonNode approval = null;
+            List<String> preApprovalMethods = new ArrayList<>();
+            for (int index = 0; index < 8 && approval == null; index++) {
+                JsonNode frame = readJson(output);
+                preApprovalMethods.add(frame.path("method").textValue());
+                if ("approval/request".equals(frame.path("method").textValue())) {
+                    approval = frame;
+                } else {
+                    if (frame.path("params").has("seq")) {
+                        long sequence = frame.path("params").path("seq").longValue();
+                        assertTrue(sequence > lastSequence,
+                                "same-thread events must remain strictly increasing: " + frame);
+                        lastSequence = sequence;
+                    }
+                    if ("item/started".equals(frame.path("method").textValue())) {
+                        approvalStarted = frame;
+                    }
+                    if ("approval/requested".equals(frame.path("method").textValue())) {
+                        requested = frame;
+                    }
+                    assertFalse("turn/completed".equals(frame.path("method").textValue()),
+                            "fixture must wait for approval before completing: " + frame);
+                }
+            }
+            assertNotNull(requested, "durable approval/requested event was not emitted");
+            assertNotNull(approvalStarted, "approval item/started was not emitted");
+            assertEquals("approval", approvalStarted.path("params").path("item")
+                    .path("kind").textValue());
+            assertEquals("started", approvalStarted.path("params").path("item")
+                    .path("status").textValue());
+            assertEquals(requested.path("params").path("approval").path("itemId").textValue(),
+                    approvalStarted.path("params").path("item").path("itemId").textValue());
+            assertTrue(requested.path("id").isMissingNode(),
+                    "approval/requested must remain a notification");
+            assertNotNull(approval, "approval request was not emitted by fake fixture");
+            String requestId = approval.path("id").textValue();
+            assertTrue(requestId.startsWith("s:approval_"));
+            assertEquals("appr_fake_1", approval.path("params").path("approvalId").textValue());
+            assertEquals("shell", approval.path("params").path("action").path("kind").textValue());
+            assertEquals("echo JA-FAKE-APPROVAL",
+                    approval.path("params").path("action").path("command").textValue());
+            assertFalse(approval.path("params").has("requestId"));
+            assertEquals(approvalStarted.path("params").path("item").path("itemId").textValue(),
+                    approval.path("params").path("itemId").textValue());
+            assertTrue(preApprovalMethods.indexOf("item/started")
+                            < preApprovalMethods.indexOf("approval/requested"),
+                    "approval item must start before the durable request");
+            assertTrue(preApprovalMethods.indexOf("approval/requested")
+                            < preApprovalMethods.indexOf("approval/request"),
+                    "private approval request must follow the durable request");
+
+            // The response intentionally carries only the private request id; the business
+            // approval identity remains inside the native bridge in the production path.
+            send(input, approvalResponse(requestId, "allow_once"));
+            JsonNode finalItem = null;
+            JsonNode approvalCompleted = null;
+            JsonNode finalStarted = null;
+            JsonNode terminal = null;
+            JsonNode resolved = null;
+            int terminalCount = 0;
+            List<String> postDecisionMethods = new ArrayList<>();
+            for (int index = 0; index < 8 && terminal == null; index++) {
+                JsonNode frame = readJson(output);
+                postDecisionMethods.add(frame.path("method").textValue());
+                if (frame.path("params").has("seq")) {
+                    long sequence = frame.path("params").path("seq").longValue();
+                    assertTrue(sequence > lastSequence,
+                            "approval resolution and item events must continue the thread sequence");
+                    lastSequence = sequence;
+                }
+                if ("approval/resolved".equals(frame.path("method").textValue())) {
+                    resolved = frame;
+                }
+                if ("item/completed".equals(frame.path("method").textValue())) {
+                    if (approvalCompleted == null) {
+                        approvalCompleted = frame;
+                    } else {
+                        finalItem = frame;
+                    }
+                }
+                if ("item/started".equals(frame.path("method").textValue())) {
+                    finalStarted = frame;
+                }
+                if ("turn/completed".equals(frame.path("method").textValue())) {
+                    terminal = frame;
+                    terminalCount++;
+                }
+            }
+            assertNotNull(resolved, "durable approval/resolved event was not observed");
+            assertEquals(requested.path("params").path("seq").longValue() + 1,
+                    resolved.path("params").path("seq").longValue());
+            assertNotNull(approvalCompleted, "approval item/completed was not observed");
+            assertEquals(approvalStarted.path("params").path("item").path("itemId").textValue(),
+                    approvalCompleted.path("params").path("item").path("itemId").textValue());
+            assertEquals("approval", approvalCompleted.path("params").path("item")
+                    .path("kind").textValue());
+            assertEquals("completed", approvalCompleted.path("params").path("item")
+                    .path("status").textValue());
+            assertNotNull(finalStarted, "final response item/started was not observed");
+            assertEquals("agent_message", finalStarted.path("params").path("item")
+                    .path("kind").textValue());
+            assertTrue(finalStarted.path("params").path("item").path("itemId").textValue()
+                    .startsWith("item_fake_"));
+            assertNotNull(finalItem, "final response item/completed was not observed");
+            assertTrue(finalItem.path("params").path("item").path("itemId").textValue()
+                    .equals(finalStarted.path("params").path("item").path("itemId").textValue()));
+            assertNotNull(terminal, "approval fixture terminal was not observed");
+            assertEquals(1, terminalCount, "approval fixture must publish one terminal");
+            assertEquals(turnId, terminal.path("params").path("turn").path("turnId").textValue());
+            assertEquals("completed", terminal.path("params").path("terminalStatus").textValue());
+            assertEquals("Fake response: " + DeterministicFakeTurnRuntime.APPROVAL_FIXTURE_INPUT,
+                    finalItem.path("params").path("item").path("text").textValue());
+            assertTrue(postDecisionMethods.indexOf("approval/resolved")
+                            < postDecisionMethods.indexOf("item/completed"),
+                    "approval resolution must precede approval item completion");
+            assertTrue(postDecisionMethods.indexOf("item/completed")
+                            < postDecisionMethods.lastIndexOf("item/started"),
+                    "approval item completion must precede the final response item");
+            assertTrue(postDecisionMethods.lastIndexOf("item/started")
+                            < postDecisionMethods.lastIndexOf("item/completed"),
+                    "final response must complete after it starts");
+            assertTrue(postDecisionMethods.lastIndexOf("item/completed")
+                            < postDecisionMethods.indexOf("turn/completed"),
+                    "the terminal must be published after the final item");
+
+            send(input, "{\"jsonrpc\":\"2.0\",\"id\":\"c:stop\",\"method\":\"shutdown\",\"params\":{}}");
+            assertEquals("c:stop", readJson(output).path("id").textValue());
+        } finally {
+            input.close();
+            output.close();
+            awaitChildExitOrDestroy(process);
+        }
+        assertTrue(process.waitFor(5, TimeUnit.SECONDS));
+        String diagnostic = stderr.get(5, TimeUnit.SECONDS);
+        assertEquals(0, process.exitValue(), diagnostic);
+        assertFalse(diagnostic.contains("JA-FAKE-APPROVAL"));
+    }
+
+    /** Verifies shutdown interrupts a child waiting for approval and still reaches exit zero. */
+    @Test
+    void childShutdownWhileApprovalWaitsDoesNotHang() throws Exception {
+        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        Process process = startChild(java);
+        CompletableFuture<String> stderr = CompletableFuture.supplyAsync(() -> readAll(process));
+        BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
+                process.getOutputStream(), StandardCharsets.UTF_8));
+        BufferedReader output = new BufferedReader(new InputStreamReader(
+                process.getInputStream(), StandardCharsets.UTF_8));
+        try {
+            send(input, initializeFrame());
+            send(input, initializedFrame());
+            assertEquals("c:init", readJson(output).path("id").textValue());
+            assertEquals("ready", readJson(output).path("params").path("status").textValue());
+            send(input, turnStartFrame("c:approval-shutdown", "thr_approval_shutdown",
+                    DeterministicFakeTurnRuntime.APPROVAL_FIXTURE_INPUT));
+            assertEquals("c:approval-shutdown", readJson(output).path("id").textValue());
+            JsonNode approval = null;
+            for (int index = 0; index < 8 && approval == null; index++) {
+                JsonNode frame = readJson(output);
+                if ("approval/request".equals(frame.path("method").textValue())) {
+                    approval = frame;
+                } else {
+                    assertFalse("turn/completed".equals(frame.path("method").textValue()),
+                            "fixture must remain paused until shutdown: " + frame);
+                }
+            }
+            assertNotNull(approval, "approval request was not emitted before shutdown");
+            assertTrue(approval.path("id").textValue().startsWith("s:approval_"));
+
+            send(input, "{\"jsonrpc\":\"2.0\",\"id\":\"c:stop\",\"method\":\"shutdown\",\"params\":{}}");
+            boolean shutdownSeen = false;
+            boolean resolvedSeen = false;
+            JsonNode terminal = null;
+            int terminalCount = 0;
+            for (int index = 0; index < 8 && (!shutdownSeen || terminal == null); index++) {
+                JsonNode frame = readJson(output);
+                if ("c:stop".equals(frame.path("id").textValue())) {
+                    shutdownSeen = true;
+                    assertEquals("shutting_down", frame.path("result").path("status").textValue());
+                }
+                if ("approval/resolved".equals(frame.path("method").textValue())) {
+                    resolvedSeen = true;
+                }
+                if ("turn/completed".equals(frame.path("method").textValue())) {
+                    terminal = frame;
+                    terminalCount++;
+                }
+            }
+            assertTrue(shutdownSeen, "shutdown acknowledgement was not observed");
+            assertFalse(resolvedSeen, "shutdown without a decision must not fake approval/resolved");
+            assertNotNull(terminal, "waiting approval must publish a terminal on shutdown");
+            assertEquals(1, terminalCount, "shutdown must not duplicate the terminal");
+            assertEquals("aborted_by_runtime",
+                    terminal.path("params").path("terminalStatus").textValue());
+        } finally {
+            input.close();
+            output.close();
+            awaitChildExitOrDestroy(process);
+        }
+        assertTrue(process.waitFor(5, TimeUnit.SECONDS));
+        assertEquals(0, process.exitValue());
+        assertFalse(stderr.get(5, TimeUnit.SECONDS).contains("JA-FAKE-APPROVAL"));
+    }
+
     /** Verifies explicit fake data roots persist the history surface across two real App children. */
     @Test
     void childFakeHistoryPersistsOnlyWithExplicitDataDirectory() throws Exception {
@@ -735,6 +963,24 @@ class StdioRuntimeChildIntegrationTest {
                 "\"threadId\":" + JSON.writeValueAsString(threadId) +
                 ",\"input\":[{\"type\":\"text\",\"text\":" + JSON.writeValueAsString(text) + "}]," +
                 "\"accessMode\":\"workspace\",\"profileRevision\":\"profile_child\"}}";
+    }
+
+    /** Builds the minimal approval result so the child test proves private-id response correlation. */
+    private static String approvalResponse(String requestId, String decision) throws Exception {
+        return JSON.writeValueAsString(Map.of("jsonrpc", "2.0", "id", requestId,
+                "result", Map.of("decision", decision, "resolvedAt", "2026-08-18T00:00:00Z")));
+    }
+
+    /**
+     * Waits for a normally acknowledged child shutdown before using force, so an alive process
+     * observed immediately after the shutdown ACK is not mistaken for a leaked child.
+     */
+    private static void awaitChildExitOrDestroy(Process process) throws InterruptedException {
+        if (process.waitFor(5, TimeUnit.SECONDS)) {
+            return;
+        }
+        process.destroyForcibly();
+        process.waitFor(5, TimeUnit.SECONDS);
     }
 
     /** Writes one complete LF frame and flushes so the child reader can progress immediately. */

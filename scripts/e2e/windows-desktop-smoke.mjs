@@ -28,6 +28,9 @@ const closeDeadlineMs = 20_000;
 const pollMs = 1_000;
 const snapshotTimeoutMs = 5_000;
 const incompleteObservationLimit = 64;
+const approvalFixtureInput = "__JA_FAKE_APPROVAL_FIXTURE__";
+const approvalFixtureVisibleInput = "JA_FAKE_APPROVAL_FIXTURE";
+const approvalFixtureCommand = "echo JA-FAKE-APPROVAL";
 const frozenExitStageSequence = [
   "exit_requested_enter",
   "exit_requested_return",
@@ -1141,7 +1144,7 @@ async function removeRawTauriEventProbe(page) {
  * Reduces native callback payloads to method/identity facts that distinguish
  * delivery from projection without persisting prompts, paths, or secrets.
  */
-async function captureRawTauriEvents(page) {
+async function captureRawTauriEvents(page, directories) {
   try {
     const values = await page.evaluate(() => (
       Array.isArray(globalThis.__JA_E2E_TAURI_EVENTS__) ? globalThis.__JA_E2E_TAURI_EVENTS__ : []
@@ -1153,16 +1156,22 @@ async function captureRawTauriEvents(page) {
       const params = root.params !== null && typeof root.params === "object" ? root.params : {};
       const turn = params.turn !== null && typeof params.turn === "object" ? params.turn : {};
       const item = params.item !== null && typeof params.item === "object" ? params.item : {};
+      const approval = params.approval !== null && typeof params.approval === "object" ? params.approval : {};
+      const action = approval.action !== null && typeof approval.action === "object" ? approval.action : {};
       return {
         event: typeof envelope.event === "string" ? envelope.event : undefined,
         method: typeof root.method === "string" ? root.method : undefined,
-        threadId: typeof params.threadId === "string" ? params.threadId : undefined,
+        threadId: typeof params.threadId === "string" ? params.threadId : typeof approval.threadId === "string" ? approval.threadId : undefined,
         seq: Number.isSafeInteger(params.seq) ? params.seq : undefined,
         eventId: typeof params.eventId === "string" ? params.eventId : undefined,
         serverInstanceId: typeof params.serverInstanceId === "string" ? params.serverInstanceId : undefined,
-        turnId: typeof turn.turnId === "string" ? turn.turnId : typeof item.turnId === "string" ? item.turnId : undefined,
-        itemId: typeof item.itemId === "string" ? item.itemId : typeof params.itemId === "string" ? params.itemId : undefined,
+        turnId: typeof turn.turnId === "string" ? turn.turnId : typeof item.turnId === "string" ? item.turnId : typeof params.turnId === "string" ? params.turnId : typeof approval.turnId === "string" ? approval.turnId : undefined,
+        itemId: typeof item.itemId === "string" ? item.itemId : typeof params.itemId === "string" ? params.itemId : typeof approval.itemId === "string" ? approval.itemId : undefined,
         status: typeof turn.status === "string" ? turn.status : typeof item.status === "string" ? item.status : typeof params.status === "string" ? params.status : undefined,
+        approvalId: typeof approval.approvalId === "string" ? approval.approvalId : typeof params.approvalId === "string" ? params.approvalId : undefined,
+        approvalActionKind: typeof action.kind === "string" ? action.kind : undefined,
+        approvalCommand: typeof action.command === "string" ? redact(action.command, directories) : undefined,
+        decision: typeof params.decision === "string" ? params.decision : undefined,
       };
     });
   } catch {
@@ -1191,11 +1200,104 @@ async function captureUiEvidence(page, directories, parentSignal) {
       cancelButtonCount: await read(() => page.getByRole("button", { name: "取消", exact: true }).count(), -1),
       alerts: (await read(() => page.getByRole("alert").allTextContents(), [])).map((value) => redact(value, directories)),
       timeline: redact(await read(() => page.getByRole("region", { name: "对话时间线" }).innerText(), "<unavailable>"), directories),
-      tauriEvents: await read(() => captureRawTauriEvents(page), []),
+      tauriEvents: await read(() => captureRawTauriEvents(page, directories), []),
     };
   } finally {
     captureDeadline.cancel();
   }
+}
+
+/**
+ * Waits for one visible thread's user item and final response; using DOM state
+ * rather than a delay keeps the parallel proof tied to the actual projection.
+ * The optional visible input separates the exact wire fixture from Markdown's
+ * rendered text, which treats paired underscores as emphasis markers.
+ */
+async function waitForTurnFinal(page, input, deadline, signal, directories, visibleInput = input) {
+  throwIfAborted(signal);
+  const timeout = () => Math.max(1, deadline - Date.now());
+  await page.locator('.ja-chat-message[data-item-id^="item_user_"]').filter({ hasText: visibleInput }).waitFor({ state: "visible", timeout: timeout() });
+  await page.getByText(`Fake response: ${visibleInput}`, { exact: true }).waitFor({ state: "visible", timeout: timeout() });
+  await page.locator(".ja-chat-message").filter({ hasText: `Fake response: ${visibleInput}` }).waitFor({ state: "visible", timeout: timeout() });
+  return redact(await page.getByRole("region", { name: "对话时间线" }).innerText(), directories);
+}
+
+/**
+ * Switches between the two server-owned history rows without guessing titles;
+ * both fixture threads intentionally use the same default title.
+ */
+async function switchToOtherThread(page, deadline, signal) {
+  throwIfAborted(signal);
+  const buttons = page.getByRole("list", { name: "历史对话列表" }).locator("button");
+  const count = await buttons.count();
+  if (count !== 2) {
+    throw new Error(`双 Thread E2E 需要恰好两个历史按钮，实际为 ${count}`);
+  }
+  let currentIndex = -1;
+  for (let index = 0; index < count; index += 1) {
+    if (await buttons.nth(index).getAttribute("aria-current") === "page") {
+      currentIndex = index;
+      break;
+    }
+  }
+  if (currentIndex < 0) {
+    throw new Error("双 Thread E2E 未找到当前历史按钮");
+  }
+  const targetIndex = currentIndex === 0 ? 1 : 0;
+  await buttons.nth(targetIndex).click();
+  await page.waitForFunction((index) => {
+    const rows = Array.from(globalThis.document.querySelectorAll('[aria-label="历史对话列表"] button'));
+    return rows[index]?.getAttribute("aria-current") === "page";
+  }, targetIndex, { timeout: Math.max(1, deadline - Date.now()) });
+  return targetIndex;
+}
+
+/**
+ * Verifies the observable approval correlation and event order: A requests,
+ * B completes while A is pending, then A completes only after the UI decision.
+ * The private stdio response id is intentionally not projected to the WebView;
+ * the resolved decision is therefore proved by the accessible card state.
+ */
+function assertApprovalParallelEvidence(events) {
+  const requestIndex = events.findIndex((event) => event.method === "approval/requested"
+    && event.approvalId?.startsWith("appr_")
+    && event.approvalActionKind === "shell"
+    && event.approvalCommand === approvalFixtureCommand);
+  if (requestIndex < 0) {
+    throw new Error("未观察到 fake approval/requested 或其 shell 命令身份");
+  }
+  const request = events[requestIndex];
+  if (!request.threadId?.startsWith("thr_") || !request.turnId?.startsWith("turn_") || !request.itemId?.startsWith("item_")) {
+    throw new Error("approval/requested 缺少稳定业务身份");
+  }
+  const bCompletedIndex = events.findIndex((event, index) => index > requestIndex
+    && event.method === "turn/completed"
+    && event.status === "completed"
+    && event.threadId?.startsWith("thr_")
+    && event.threadId !== request.threadId);
+  if (bCompletedIndex < 0) {
+    throw new Error("未观察到 A approval pending 期间另一 Thread B 的 completed");
+  }
+  const aCompletedIndex = events.findIndex((event, index) => index > bCompletedIndex
+    && event.method === "turn/completed"
+    && event.status === "completed"
+    && event.threadId === request.threadId);
+  if (aCompletedIndex < 0) {
+    throw new Error("UI allow_once 后未观察到 A completed");
+  }
+  if (!(requestIndex < bCompletedIndex && bCompletedIndex < aCompletedIndex)) {
+    throw new Error("approval/Thread 事件顺序不满足 A pending -> B completed -> A completed");
+  }
+  return {
+    approvalId: request.approvalId,
+    threadA: request.threadId,
+    threadB: events[bCompletedIndex].threadId,
+    turnA: request.turnId,
+    itemA: request.itemId,
+    requestIndex,
+    bCompletedIndex,
+    aCompletedIndex,
+  };
 }
 
 /**
@@ -1584,16 +1686,24 @@ async function cleanupPhase(runId, phase, rootIdentity, observed, incompleteObse
  * restart assertion.  The final answer is verified by text, not by a
  * screenshot or a client-side fake adapter.
  */
-async function runFirstSession(page, runId, deadline, directories, recordAfterSend, recordIsolation, signal) {
+async function runFirstSession(page, runId, deadline, directories, recordAfterSend, recordIsolation, signal, recordStage) {
   throwIfAborted(signal);
+  const stage = (name) => recordStage?.(`first:${name}`);
+  stage("load");
   await page.waitForLoadState("domcontentloaded");
+  stage("project_button");
   await page.getByRole("button", { name: "选择项目", exact: true }).waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
   await page.getByRole("button", { name: "选择项目", exact: true }).click();
+  stage("coding_heading");
   await page.getByRole("heading", { name: "开始 coding" }).waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  stage("connected");
   await page.getByText("已连接", { exact: true }).waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  stage("history");
   await page.getByRole("list", { name: "历史对话列表" }).locator("[role=listitem]").first().waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  stage("isolation");
   recordIsolation(assertRuntimeIsolation(await processSnapshot(signal), directories));
   const input = `E2E turn ${runId}`;
+  stage("ordinary_send");
   await page.getByRole("textbox", { name: "消息" }).fill(input);
   await page.getByRole("button", { name: "发送" }).click();
   recordAfterSend(await captureUiEvidence(page, directories, signal));
@@ -1601,12 +1711,107 @@ async function runFirstSession(page, runId, deadline, directories, recordAfterSe
   const turnDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
   // The fake response metadata echoes the prompt, so a broad hasText locator
   // matches both cards; the user item prefix is the stable protocol projection.
+  stage("ordinary_user");
   await page.locator('.ja-chat-message[data-item-id^="item_user_"]').filter({ hasText: input }).waitFor({ state: "visible", timeout: Math.max(1, turnDeadline - Date.now()) });
+  stage("ordinary_final_wait");
   await page.getByText(`Fake response: ${input}`, { exact: true }).waitFor({ state: "visible", timeout: Math.max(1, turnDeadline - Date.now()) });
   await page.locator(".ja-chat-message").filter({ hasText: `Fake response: ${input}` }).waitFor({ state: "visible", timeout: Math.max(1, turnDeadline - Date.now()) });
+  stage("ordinary_completed");
   await page.getByText("工作过程", { exact: true }).waitFor({ state: "visible", timeout: Math.max(1, turnDeadline - Date.now()) }).catch(() => undefined);
   const timelineText = await page.getByRole("region", { name: "对话时间线" }).innerText();
-  return { input, timelineText: redact(timelineText, directories) };
+  const parallel = await runParallelApprovalFlow(page, runId, deadline, directories, signal, (name) => recordStage?.(`first:${name}`));
+  return { input, timelineText: redact(timelineText, directories), parallel };
+}
+
+/**
+ * Exercises two real UI-owned threads around one pending approval.  The flow
+ * deliberately waits on accessible DOM state, because fixed sleeps or hidden
+ * bridge calls could pass while the Rust business-id/private-request-id
+ * correlation is still broken.
+ */
+async function runParallelApprovalFlow(page, runId, deadline, directories, signal, recordStage) {
+  throwIfAborted(signal);
+  const stage = (name) => recordStage?.(`approval:${name}`);
+  const timeout = () => Math.max(1, deadline - Date.now());
+  // Admission must fail within the same bounded turn budget as the existing
+  // ordinary turn; the later human approval deliberately uses the run budget.
+  const admissionDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
+  const admissionTimeout = () => Math.max(1, admissionDeadline - Date.now());
+  const input = approvalFixtureInput;
+  // Markdown renders the sentinel's paired underscores as emphasis markers;
+  // wait for the stable visible text while the submitted wire input stays exact.
+  const userItem = page.locator('.ja-chat-message[data-item-id^="item_user_"]').filter({ hasText: approvalFixtureVisibleInput });
+  const approvalHeading = page.getByRole("heading", { name: "需要确认", exact: true });
+  const approvalCommand = page.getByText(approvalFixtureCommand, { exact: true });
+  stage("A_send");
+  await page.getByRole("textbox", { name: "消息" }).fill(input);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  stage("A_user");
+  await userItem.waitFor({ state: "visible", timeout: admissionTimeout() });
+  stage("A_approval");
+  await approvalHeading.waitFor({ state: "visible", timeout: admissionTimeout() });
+  await approvalCommand.waitFor({ state: "visible", timeout: admissionTimeout() });
+  if (await page.getByText(`Fake response: ${input}`, { exact: true }).count() !== 0) {
+    throw new Error("A Thread 在切换 B 前已经结束，未证明 pending approval 并行");
+  }
+  const pendingTimeline = redact(await page.getByRole("region", { name: "对话时间线" }).innerText(), directories);
+
+  const newConversation = page.getByRole("button", { name: "新对话", exact: true });
+  stage("B_create_wait");
+  await newConversation.waitFor({ state: "visible", timeout: timeout() });
+  await page.waitForFunction(() => {
+    const button = Array.from(globalThis.document.querySelectorAll("button")).find((item) => item.textContent?.trim() === "新对话");
+    return button instanceof globalThis.HTMLButtonElement && !button.disabled;
+  }, undefined, { timeout: timeout() });
+  await newConversation.click();
+  stage("B_created");
+  await page.waitForFunction(() => {
+    const rows = Array.from(globalThis.document.querySelectorAll('[aria-label="历史对话列表"] button'));
+    return rows.length === 2 && rows.filter((row) => row.getAttribute("aria-current") === "page").length === 1
+      && rows[1]?.getAttribute("aria-current") === "page";
+  }, undefined, { timeout: timeout() });
+  stage("B_selected");
+
+  const bInput = `E2E parallel B ${runId}`;
+  stage("B_send");
+  await page.getByRole("textbox", { name: "消息" }).fill(bInput);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  stage("B_final_wait");
+  const bTimeline = await waitForTurnFinal(page, bInput, Math.min(deadline, Date.now() + turnDeadlineMs), signal, directories);
+  stage("B_completed");
+  if (bTimeline.includes(approvalFixtureCommand)
+    || await page.getByRole("button", { name: /^(?:允许本次|仅本次允许)$/ }).count() !== 0) {
+    throw new Error("B Thread 显示了 A 的审批卡或命令");
+  }
+
+  stage("A_reselect_wait");
+  await switchToOtherThread(page, deadline, signal);
+  stage("A_reselected");
+  await approvalHeading.waitFor({ state: "visible", timeout: timeout() });
+  await approvalCommand.waitFor({ state: "visible", timeout: timeout() });
+  stage("A_card_restored");
+  const allowOnce = page.getByRole("button", { name: /^(?:允许本次|仅本次允许)$/ });
+  await allowOnce.waitFor({ state: "visible", timeout: timeout() });
+  stage("A_allow_once_click");
+  await allowOnce.click();
+  await page.getByText("已允许本次", { exact: true }).waitFor({ state: "visible", timeout: timeout() });
+  stage("A_allowed");
+  const aTimeline = await waitForTurnFinal(page, input, Math.min(deadline, Date.now() + turnDeadlineMs), signal, directories, approvalFixtureVisibleInput);
+  stage("A_completed");
+  const events = await captureRawTauriEvents(page, directories);
+  const correlation = assertApprovalParallelEvidence(events);
+  return {
+    input,
+    bInput,
+    pendingTimeline,
+    bTimeline,
+    aTimeline,
+    correlation,
+    // This is the user-visible proof of the response; approval/resolved is
+    // intentionally not a WebView event because Rust keeps that response
+    // private while routing it by the business approval id.
+    resolvedDecision: "allow_once",
+  };
 }
 
 /**
@@ -1737,7 +1942,14 @@ async function main() {
       let rootIdentity;
       let watcher;
       let cleanupFailure;
+      let phaseStage = `${phase}:launch`;
+      const recordStage = (value) => {
+        if (typeof value === "string" && value.length <= 64) {
+          phaseStage = value;
+        }
+      };
       try {
+        recordStage(`${phase}:root_identity`);
         rootIdentity = await waitForRootIdentity(
           rootPid,
           Math.min(runDeadline.deadline, Date.now() + 10_000),
@@ -1752,9 +1964,12 @@ async function main() {
         for (const [pid, entry] of initialTree) {
           observed.set(pid, entry);
         }
+        recordStage(`${phase}:watcher`);
         watcher = startProcessWatcher(rootIdentity, observed, incompleteObserved, runDeadline.signal);
         const sessionDeadline = runDeadline.deadline;
+        recordStage(`${phase}:cdp`);
         await waitForCdp(cdpPort, sessionDeadline, launch, runDeadline.signal);
+        recordStage(`${phase}:connect_cdp`);
         const browser = await raceWithSignal(
           () => chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`),
           runDeadline.signal,
@@ -1763,8 +1978,11 @@ async function main() {
         let page;
         let diagnostics;
         try {
+          recordStage(`${phase}:page`);
           page = await raceWithSignal(() => waitForPage(browser, sessionDeadline, runDeadline.signal), runDeadline.signal);
+          recordStage(`${phase}:event_probe`);
           await raceWithSignal(() => installRawTauriEventProbe(page), runDeadline.signal);
+          recordStage(`${phase}:diagnostics`);
           diagnostics = attachPageDiagnostics(page, directories);
           if (phase === "first") {
             let afterSend;
@@ -1773,9 +1991,9 @@ async function main() {
               afterSend = value;
             }, (value) => {
               isolation = value;
-            }, runDeadline.signal), runDeadline.signal);
+            }, runDeadline.signal, recordStage), runDeadline.signal);
             firstInput = first.input;
-            evidence.first = { timeline: first.timelineText, pageUrl: redact(page.url(), directories), pageTitle: redact(await page.title(), directories), afterSend, diagnostics, launcher: launcherOutputSummary(launch, directories), runtime: redact(directories.runtime, directories), isolation };
+            evidence.first = { timeline: first.timelineText, parallel: first.parallel, pageUrl: redact(page.url(), directories), pageTitle: redact(await page.title(), directories), afterSend, diagnostics, launcher: launcherOutputSummary(launch, directories), runtime: redact(directories.runtime, directories), isolation };
           } else {
             if (!firstInput) {
               throw new Error("重启断言缺少第一轮输入");
@@ -1787,6 +2005,7 @@ async function main() {
             evidence.second = { timeline, pageUrl: redact(page.url(), directories), pageTitle: redact(await page.title(), directories), diagnostics, launcher: launcherOutputSummary(launch, directories), runtime: redact(directories.runtime, directories), isolation };
           }
         } catch (error) {
+          evidence[phase].stage = phaseStage;
           if (page !== undefined) {
             evidence[phase].afterFailure = await captureUiEvidence(page, directories, runDeadline.signal);
             if (phase === "first" && evidence[phase].afterSend === undefined) {
@@ -1816,6 +2035,7 @@ async function main() {
           throw sessionError;
         }
       } finally {
+        evidence[phase].stage = phaseStage;
         try {
           cleanupFailure = await cleanupPhase(runId, phase, rootIdentity, observed, incompleteObserved, watcher, directories, evidence, runDeadline.signal);
         } finally {
@@ -1844,7 +2064,9 @@ async function main() {
       directories = { root: error.e2eRoot };
       cleanupRoot = error.e2eRoot;
     }
-    let reportError = error;
+    const currentStage = evidence.first.stage ?? evidence.second.stage ?? "setup";
+    const errorMessage = error instanceof Error ? error.message : String(error ?? "E2E 失败");
+    let reportError = new Error(`${errorMessage} [stage=${currentStage}]`, { cause: error });
     if (evidence.realRuntime.before !== undefined) {
       try {
         evidence.realRuntime.after = await captureRealRuntimeEvidence(baseEnv, directories);

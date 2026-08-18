@@ -156,6 +156,26 @@ function activeProfile(document: SettingsDocument | undefined): SettingsProfile 
   return document.profiles.find((profile) => profile.profileRevision === document.activeProfileRevision);
 }
 
+/**
+ * Reuses a thread projection only while it is owned by the current healthy
+ * sidecar generation. A snapshot is intentionally not used for this fast path:
+ * approval requests are private runtime state and a snapshot may contain only
+ * an item shell, so rereading would discard a still-actionable card rather than
+ * safely reviving it across a process boundary.
+ */
+function canReuseLoadedThreadProjection(threadId: string, workspaceId: string): boolean {
+  const state = useTimelineStore.getState();
+  const loadedThread = state.threads[threadId];
+  const runtime = state.runtime;
+  return state.handshake.phase === "ready"
+    && state.handshake.generation > 0
+    && state.serverInstanceId !== undefined
+    && runtime !== undefined
+    && (runtime.status === "ready" || runtime.status === "busy")
+    && loadedThread?.workspaceId === workspaceId
+    && state.resyncRequired[threadId] === undefined;
+}
+
 /** Builds the single canonical runtime input so UI cannot choose a second access policy. */
 function runtimeInput(project: JaProject, document: SettingsDocument): Parameters<NonNullable<ReturnType<typeof useJaConnection>["configureAndStart"]>>[0] {
   return {
@@ -634,6 +654,16 @@ export function useJaSession({
     setHistoryBusy(true);
     setHistoryError(undefined);
     try {
+      // The timeline store is the only live projection. Reusing a healthy
+      // same-generation thread keeps private approval requests clickable while
+      // still forcing a server snapshot for unloaded, mismatched, or resyncing
+      // projections.
+      if (canReuseLoadedThreadProjection(threadId, selected.workspaceId)) {
+        if (isCurrentHistoryRequest(intent, request, selected.workspaceId)) {
+          setCurrentThreadId(threadId);
+        }
+        return;
+      }
       const snapshot = await historyAdapter.threadRead({ threadId, view: "snapshot" });
       if (!isCurrentHistoryRequest(intent, request, selected.workspaceId)) {
         return;

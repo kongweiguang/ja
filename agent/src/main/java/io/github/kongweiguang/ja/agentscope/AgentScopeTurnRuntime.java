@@ -516,16 +516,10 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
             try {
                 List<TurnEvent> normalized = normalizer.normalize(event, run.normalized);
                 boolean terminalBatch = normalizer.isTerminal(run.normalized);
-                for (TurnEvent output : normalized) {
-                    if (!run.finished.get() && !run.cancelled.get()) {
-                        if (!terminalBatch && !admitOutput(run, output)) {
-                            run.resourceOverflow.set(true);
-                            streamFailed(run, epoch,
-                                    new IllegalStateException("event budget exceeded"));
-                            return;
-                        }
-                        run.publisher.accept(output);
-                    }
+                if (!publishRunEvents(run, normalized, terminalBatch)) {
+                    run.resourceOverflow.set(true);
+                    streamFailed(run, epoch, new IllegalStateException("event budget exceeded"));
+                    return;
                 }
                 if (event instanceof RequireUserConfirmEvent confirmation) {
                     registerApproval(run, confirmation);
@@ -534,6 +528,19 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                 streamFailed(run, epoch, exception);
             }
         }
+    }
+
+    /** Publishes one normalized batch through the existing admission gate without adding a queue. */
+    private boolean publishRunEvents(Run run, List<TurnEvent> events, boolean terminalBatch) {
+        for (TurnEvent output : events) {
+            if (!run.finished.get() && !run.cancelled.get()) {
+                if (!terminalBatch && !admitOutput(run, output)) {
+                    return false;
+                }
+                run.publisher.accept(output);
+            }
+        }
+        return true;
     }
 
     /** Keeps AgentScope permission-pause bookkeeping non-terminal until the host decision arrives. */
@@ -570,6 +577,12 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
             run.waitingApproval.set(true);
             approvals.put(approvalId, run);
             try {
+                // Persist and publish the business fact before exposing the private request. The
+                // same normalizer context supplies the thread sequence, while StdioRuntime's
+                // publisher performs the SQLite append before the frame reaches Rust.
+                if (!publishRunEvents(run, normalizer.approvalRequested(run.normalized, prompt), false)) {
+                    throw new IllegalStateException("approval requested event budget exceeded");
+                }
                 pending.cancelHandle = approvalSink.requestWithHandle(
                         prompt, decision -> resolveApproval(approvalId, decision));
                 // A sink may complete or cancel synchronously. Keep a handle that was returned
@@ -603,6 +616,7 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
             return;
         }
         PendingApproval pending;
+        boolean resolvedEventBudgetFailure = false;
         synchronized (run) {
             if (run.finished.get() || run.cancelled.get() || !run.waitingApproval.get()) {
                 return;
@@ -619,6 +633,17 @@ public final class AgentScopeTurnRuntime implements TurnRuntime {
                 return;
             }
             pending.decision = decision;
+            // Keep the decision fact ahead of resume/tool callbacks while this same run gate is
+            // held; cancellation cannot overtake a winner and create an out-of-order timeline.
+            if (!publishRunEvents(run, normalizer.approvalResolved(run.normalized, pending.prompt,
+                    decision), false)) {
+                resolvedEventBudgetFailure = true;
+            }
+        }
+        if (resolvedEventBudgetFailure) {
+            streamFailed(run, run.subscriptionEpoch.get(),
+                    new IllegalStateException("approval resolved event budget exceeded"));
+            return;
         }
         tryScheduleApprovalResume(run, pending);
     }

@@ -39,6 +39,7 @@ import io.github.kongweiguang.ja.domain.ThreadId;
 import io.github.kongweiguang.ja.domain.TurnId;
 import io.github.kongweiguang.ja.protocol.JsonNodes;
 import io.github.kongweiguang.ja.runtime.TurnEvent;
+import io.github.kongweiguang.ja.runtime.TurnRuntime;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -278,6 +279,73 @@ public final class EventNormalizer {
                     ItemKind.APPROVAL.name()));
             return item == null ? null : item.itemId;
         }
+    }
+
+    /**
+     * Creates the durable approval/requested fact from the same context sequence as all other
+     * turn events.  Keeping this in the normalizer lets the SQLite history adapter replace the
+     * provisional sequence atomically before the private transport request is sent.
+     */
+    List<TurnEvent> approvalRequested(Context context, TurnRuntime.ApprovalPrompt prompt) {
+        Objects.requireNonNull(context, "context");
+        Objects.requireNonNull(prompt, "prompt");
+        synchronized (context) {
+            ObjectNode params = base(context);
+            params.set("approval", approvalSummary(prompt));
+            return enforceEventBudget(context, List.of(new TurnEvent("approval/requested", params)),
+                    false);
+        }
+    }
+
+    /**
+     * Emits one durable approval/resolved fact after the decision gate wins and before AgentScope
+     * receives the resume message, so the UI cannot observe tool output before the decision.
+     */
+    List<TurnEvent> approvalResolved(Context context, TurnRuntime.ApprovalPrompt prompt,
+                                     TurnRuntime.ApprovalDecision decision) {
+        Objects.requireNonNull(context, "context");
+        Objects.requireNonNull(prompt, "prompt");
+        Objects.requireNonNull(decision, "decision");
+        if (!List.of("allow_once", "allow_session", "deny", "expired", "disconnected")
+                .contains(decision.decision())) {
+            throw new IllegalArgumentException("invalid approval decision");
+        }
+        synchronized (context) {
+            ObjectNode params = base(context);
+            params.put("approvalId", bounded(prompt.approvalId()));
+            params.put("decision", decision.decision());
+            params.put("resolvedAt", decision.resolvedAt().toString());
+            return enforceEventBudget(context, List.of(new TurnEvent("approval/resolved", params)),
+                    false);
+        }
+    }
+
+    /** Serializes only the bounded approval summary accepted by the frozen event schema. */
+    private ObjectNode approvalSummary(TurnRuntime.ApprovalPrompt prompt) {
+        ObjectNode approval = JsonNodes.object();
+        approval.put("approvalId", bounded(prompt.approvalId()));
+        approval.put("threadId", bounded(prompt.threadId()));
+        approval.put("turnId", bounded(prompt.turnId()));
+        approval.put("itemId", bounded(prompt.itemId()));
+        ObjectNode action = JsonNodes.object();
+        action.put("kind", bounded(prompt.actionKind()));
+        if (prompt.command() != null && !prompt.command().isBlank()) {
+            action.put("command", bounded(prompt.command()));
+        }
+        if (prompt.cwd() != null && !prompt.cwd().isBlank()) {
+            action.put("cwd", bounded(prompt.cwd()));
+        }
+        if (!prompt.relativePaths().isEmpty()) {
+            ArrayNode paths = JsonNodes.array();
+            prompt.relativePaths().stream().limit(128).map(EventNormalizer::bounded)
+                    .forEach(paths::add);
+            action.set("relativePaths", paths);
+        }
+        approval.set("action", action);
+        approval.put("risk", bounded(prompt.risk()));
+        approval.put("accessMode", bounded(prompt.accessMode()));
+        approval.put("expiresAt", prompt.expiresAt().toString());
+        return approval;
     }
 
     /** Suppresses provider duplicate starts because the runtime owns the boundary. */

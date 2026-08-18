@@ -173,9 +173,18 @@ interface WorkspaceProps {
 /** Connects the existing timeline/composer features to one configured thread. */
 function Workspace({ session }: WorkspaceProps): ReactElement {
   const { boot, submitTurn, cancelTurn, approvalRespond } = useJaConnection();
-  const [pendingTurnId, setPendingTurnId] = useState<string>();
-  const submitGuard = useRef(false);
+  // A pending turn belongs to its thread, so switching threads must not make
+  // an unrelated composer wait for another thread's accepted turn to settle.
+  const [pendingTurnIds, setPendingTurnIds] = useState<Record<string, string>>({});
+  // The native adapter also deduplicates by thread, but this UI guard closes
+  // the rapid double-submit window before a request reaches that adapter.
+  const submitGuards = useRef<Set<string>>(new Set());
+  // Drafts are product state, so keep them by thread instead of relying on a
+  // remounted Composer's transient local state when the user switches views.
+  const [draftsByThread, setDraftsByThread] = useState<Record<string, string>>({});
   const threadId = session.currentThreadId ?? "";
+  const pendingTurnId = threadId === "" ? undefined : pendingTurnIds[threadId];
+  const draftText = threadId === "" ? "" : draftsByThread[threadId] ?? "";
   const items = useTimelineStore(useShallow((state) => threadId === "" ? [] : selectItemsForThread(threadId)(state)));
   const turns = useTimelineStore(useShallow((state) => threadId === "" ? [] : Object.values(state.turns).filter((turn) => turn.threadId === threadId)));
   const approvals = useTimelineStore(useShallow((state) => threadId === "" ? [] : selectApprovals(state).filter((approval) => approval.threadId === threadId)));
@@ -187,20 +196,35 @@ function Workspace({ session }: WorkspaceProps): ReactElement {
   const models = profile === undefined ? [] : [{ id: profile.profileRevision, label: `${profile.name} · ${profile.model}` }];
 
   useEffect(() => {
-    if (pendingTurnId === undefined) {
+    if (Object.keys(pendingTurnIds).length === 0) {
       return;
     }
-    const turn = useTimelineStore.getState().turns[pendingTurnId];
-    if (turn !== undefined && ["completed", "interrupted", "failed", "aborted_by_runtime"].includes(turn.status)) {
-      setPendingTurnId(undefined);
+    const completedThreadIds = Object.entries(pendingTurnIds)
+      .filter(([, turnId]) => {
+        const turn = useTimelineStore.getState().turns[turnId];
+        return turn !== undefined && ["completed", "interrupted", "failed", "aborted_by_runtime"].includes(turn.status);
+      })
+      .map(([threadId]) => threadId);
+    if (completedThreadIds.length > 0) {
+      setPendingTurnIds((current) => {
+        const next = { ...current };
+        for (const completedThreadId of completedThreadIds) {
+          delete next[completedThreadId];
+        }
+        return next;
+      });
     }
-  }, [pendingTurnId, turns]);
+  }, [pendingTurnIds, threadId, turns]);
 
-  /** Submits only the active profile's access mode, ignoring presentation-only composer toggles. */
+  /** Submits only the active profile's access mode, retaining the originating thread across late promises. */
   const send = useCallback(async ({ text, model }: ComposerSubmit): Promise<void> => {
-    if (threadId === "" || profile === undefined || submitGuard.current || pendingTurnId !== undefined) {
+    const requestThreadId = threadId;
+    if (requestThreadId === "" || profile === undefined || submitGuards.current.has(requestThreadId) || pendingTurnIds[requestThreadId] !== undefined) {
       return;
     }
+    // Capture the exact parent-owned draft before the await so a later edit on
+    // this thread cannot be mistaken for the submitted request on acceptance.
+    const submittedDraft = draftsByThread[requestThreadId] ?? text;
     // The Composer exposes the active profile revision as its only model
     // value. Reject a stale or future value instead of starting a turn with
     // an unbound model and making the selection appear to work.
@@ -208,22 +232,32 @@ function Workspace({ session }: WorkspaceProps): ReactElement {
     if (requestedProfileRevision !== profile.profileRevision) {
       throw new Error("模型切换尚未接入，请先更新活动模型");
     }
-    submitGuard.current = true;
+    submitGuards.current.add(requestThreadId);
     try {
-      const accepted = await submitTurn({ threadId, accessMode: profile.accessMode, profileRevision: requestedProfileRevision, input: [{ type: "text", text }] });
-      setPendingTurnId(accepted.turnId);
+      const accepted = await submitTurn({ threadId: requestThreadId, accessMode: profile.accessMode, profileRevision: requestedProfileRevision, input: [{ type: "text", text }] });
+      setPendingTurnIds((current) => ({ ...current, [requestThreadId]: accepted.turnId }));
+      setDraftsByThread((current) => current[requestThreadId] === submittedDraft ? { ...current, [requestThreadId]: "" } : current);
     } finally {
-      submitGuard.current = false;
+      submitGuards.current.delete(requestThreadId);
     }
-  }, [pendingTurnId, profile, submitTurn, threadId]);
+  }, [draftsByThread, pendingTurnIds, profile, submitTurn, threadId]);
 
-  /** Cancels only the current thread's active turn; terminal state remains event-authoritative. */
-  const cancel = useCallback(async (): Promise<void> => {
-    const turnId = activeTurn?.turnId ?? pendingTurnId;
-    if (threadId === "" || turnId === undefined) {
+  /** Stores only the visible thread's draft so switching threads never overwrites another draft. */
+  const updateDraft = useCallback((nextText: string): void => {
+    if (threadId === "") {
       return;
     }
-    await cancelTurn({ threadId, turnId, reason: "用户取消" });
+    setDraftsByThread((current) => ({ ...current, [threadId]: nextText }));
+  }, [threadId]);
+
+  /** Cancels only the thread captured when the user clicked, keeping a later switch from changing identity. */
+  const cancel = useCallback(async (): Promise<void> => {
+    const turnId = activeTurn?.turnId ?? pendingTurnId;
+    const requestThreadId = threadId;
+    if (requestThreadId === "" || turnId === undefined) {
+      return;
+    }
+    await cancelTurn({ threadId: requestThreadId, turnId, reason: "用户取消" });
   }, [activeTurn?.turnId, cancelTurn, pendingTurnId, threadId]);
 
   /** Sends approval through the typed RuntimeHost method without exposing request ids. */
@@ -253,7 +287,8 @@ function Workspace({ session }: WorkspaceProps): ReactElement {
       {session.projectError === undefined ? null : <p className="ja-inline-error" role="alert">{session.projectError}</p>}
       {session.historyError === undefined ? null : <p className="ja-inline-error" role="alert">{session.historyError}</p>}
       <ChatTimeline items={items} turns={turns as Turn[]} approvals={approvals} approvalDecisions={approvalDecisions} onApprovalDecision={(approval, decision) => void approve(approval, decision)} />
-      <Composer accessMode={profile?.accessMode ?? "workspace"} model={profile?.profileRevision} models={models} activeTurn={activeTurn !== undefined || pendingTurnId !== undefined} disabled={composerDisabled} onSend={send} onCancel={cancel} />
+      {/* Remount transient composer state per thread so A's in-flight submit/cancel cannot disable B. */}
+      <Composer key={threadId} text={draftText} onTextChange={updateDraft} accessMode={profile?.accessMode ?? "workspace"} model={profile?.profileRevision} models={models} activeTurn={activeTurn !== undefined || pendingTurnId !== undefined} disabled={composerDisabled} onSend={send} onCancel={cancel} />
     </section>
   );
 }

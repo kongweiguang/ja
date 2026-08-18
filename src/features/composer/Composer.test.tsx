@@ -4,8 +4,15 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState, type ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Composer, type ComposerSubmit } from "./Composer";
+
+/** Hosts a parent-owned draft to verify Composer's controlled compatibility path. */
+function ControlledDraftHarness(): ReactElement {
+  const [text, setText] = useState("已有草稿");
+  return <Composer accessMode="workspace" text={text} onTextChange={setText} onSend={() => undefined} />;
+}
 
 describe("Composer", () => {
   afterEach(() => cleanup());
@@ -45,5 +52,15 @@ describe("Composer", () => {
     expect(input).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "取消" }));
     expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("supports parent-owned draft text", async () => {
+    const user = userEvent.setup();
+    render(<ControlledDraftHarness />);
+
+    const input = screen.getByRole("textbox", { name: "消息" });
+    expect(input).toHaveValue("已有草稿");
+    await user.type(input, "继续");
+    expect(input).toHaveValue("已有草稿继续");
   });
 });

@@ -9,7 +9,7 @@ import { useJaSession, type SettingsAdapter } from "./useJaSession";
 import type { RuntimeHostAdapter, RuntimeStatus } from "@/ipc/runtime";
 import type { LoadedSettings, SettingsDocument } from "@/ipc/settings";
 import type { HistoryAdapter, HistoryThread } from "@/ipc/history";
-import { useTimelineStore } from "@/stores/timelineStore";
+import { selectApprovals, useTimelineStore } from "@/stores/timelineStore";
 
 /** Supplies the browser media-query surface required by ThemeProvider in jsdom. */
 function installMatchMedia(): void {
@@ -68,6 +68,31 @@ function snapshot(item: HistoryThread) {
   return { serverInstanceId: "srv_fixture", thread: item, items: [], snapshotSeq: 0 };
 }
 
+/** Builds one live approval event so selection tests can prove the card is not lost by a reread. */
+function approvalRequestedEvent(threadId: string): Record<string, unknown> {
+  return {
+    jsonrpc: "2.0",
+    method: "approval/requested",
+    params: {
+      serverInstanceId: "srv_fixture",
+      threadId,
+      seq: 1,
+      eventId: "evt_approval_a",
+      occurredAt: "2026-08-18T00:00:01+08:00",
+      approval: {
+        approvalId: "appr_a",
+        threadId,
+        turnId: "turn_a",
+        itemId: "item_a",
+        action: { kind: "shell", command: "pnpm test", cwd: "C:\\dev\\demo" },
+        risk: "medium",
+        accessMode: "workspace",
+        expiresAt: "2099-08-18T00:00:01+08:00",
+      },
+    },
+  };
+}
+
 /** Creates a controlled promise so cancellation tests can resolve a late native result explicitly. */
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -121,7 +146,6 @@ describe("useJaSession history lifecycle", () => {
     const first = thread("ws_fixture", "thr_first", "第一段对话");
     const second = thread("ws_fixture", "thr_second", "第二段对话");
     let selectionSecondResolve: ((value: ReturnType<typeof snapshot>) => void) | undefined;
-    let selectionFirstResolve: ((value: ReturnType<typeof snapshot>) => void) | undefined;
     let firstReads = 0;
     const history: HistoryAdapter = {
       workspaceList: vi.fn(async () => ({ workspaces: [] })),
@@ -135,24 +159,31 @@ describe("useJaSession history lifecycle", () => {
         if (threadId === second.threadId) {
           return new Promise<ReturnType<typeof snapshot>>((resolve) => { selectionSecondResolve = resolve; });
         }
-        return new Promise<ReturnType<typeof snapshot>>((resolve) => { selectionFirstResolve = resolve; });
+        return snapshot(thread(selectedWorkspace, first.threadId, first.title));
       }),
     };
     const { result } = renderHook(() => useJaSession({ settingsAdapter: settingsAdapter(), projectPicker: { pick: vi.fn(async () => "C:\\dev\\demo") }, historyAdapter: history }), { wrapper: wrapper(runtime) });
     await waitFor(() => expect(result.current.activeProfile).toBeDefined());
     await act(async () => { await result.current.chooseProject(); });
     expect(result.current.currentThreadId).toBe(first.threadId);
+    expect(useTimelineStore.getState().applyEvent(approvalRequestedEvent(first.threadId))).toBe("applied");
 
+    let selectionSecond: Promise<void> | undefined;
+    let selectionFirst: Promise<void> | undefined;
     act(() => {
-      void result.current.selectConversation(second.threadId);
-      void result.current.selectConversation(first.threadId);
+      selectionSecond = result.current.selectConversation(second.threadId);
+      selectionFirst = result.current.selectConversation(first.threadId);
     });
-    await waitFor(() => expect(selectionFirstResolve).toBeDefined());
-    await act(async () => { selectionFirstResolve?.(snapshot(thread(selectedWorkspace, first.threadId, first.title))); });
+    await act(async () => { await selectionFirst; });
     await waitFor(() => expect(result.current.currentThreadId).toBe(first.threadId));
+    expect(history.threadRead).toHaveBeenCalledTimes(2);
+    expect(selectApprovals(useTimelineStore.getState()).filter((approval) => approval.threadId === first.threadId)).toHaveLength(1);
+    expect(selectApprovals(useTimelineStore.getState()).filter((approval) => approval.threadId === second.threadId)).toHaveLength(0);
     await act(async () => { selectionSecondResolve?.(snapshot(thread(selectedWorkspace, second.threadId, second.title))); });
+    await act(async () => { await selectionSecond; });
     expect(result.current.currentThreadId).toBe(first.threadId);
     expect(useTimelineStore.getState().threads[second.threadId]).toBeUndefined();
+    expect(selectApprovals(useTimelineStore.getState()).some((approval) => approval.approvalId === "appr_a")).toBe(true);
   });
 
   it("drops a pending snapshot after the hook unmounts", async () => {
@@ -311,7 +342,7 @@ describe("useJaSession history lifecycle", () => {
     expect(useTimelineStore.getState().handshake.phase).toBe("disconnected");
   });
 
-  it("reads and applies every created thread before selecting it", async () => {
+  it("reuses a healthy created thread when selecting it again", async () => {
     const runtime = runtimeAdapter();
     const order: string[] = [];
     let selectedWorkspace = "";
@@ -340,8 +371,49 @@ describe("useJaSession history lifecycle", () => {
     await act(async () => { await result.current.newConversation(); });
     await act(async () => { await result.current.selectConversation("thr_created_1"); });
 
-    expect(order).toEqual(["list", "create", "read", "create", "read", "read"]);
+    expect(order).toEqual(["list", "create", "read", "create", "read"]);
     expect(result.current.currentThreadId).toBe("thr_created_1");
     expect(useTimelineStore.getState().lastOutcome).toBe("applied");
+  });
+
+  it("rereads a loaded thread after its live projection requests resync", async () => {
+    const runtime = runtimeAdapter();
+    const first = thread("ws_fixture", "thr_first", "第一段对话");
+    let selectedWorkspace = "";
+    const history: HistoryAdapter = {
+      workspaceList: vi.fn(async () => ({ workspaces: [] })),
+      threadList: vi.fn(async ({ workspaceId }) => {
+        selectedWorkspace = workspaceId;
+        return { threads: [thread(workspaceId, first.threadId, first.title)] };
+      }),
+      threadCreate: vi.fn(async ({ workspaceId }) => ({ thread: thread(workspaceId, "thr_created", "新对话") })),
+      threadRead: vi.fn(async ({ threadId }) => snapshot(thread(selectedWorkspace, threadId, first.title))),
+    };
+    const { result } = renderHook(() => useJaSession({
+      settingsAdapter: settingsAdapter(),
+      projectPicker: { pick: vi.fn(async () => "C:\\dev\\resync") },
+      historyAdapter: history,
+    }), { wrapper: wrapper(runtime) });
+    await waitFor(() => expect(result.current.activeProfile).toBeDefined());
+    await act(async () => { await result.current.chooseProject(); });
+    expect(history.threadRead).toHaveBeenCalledTimes(1);
+
+    expect(useTimelineStore.getState().applyEvent({
+      jsonrpc: "2.0",
+      method: "turn/started",
+      params: {
+        serverInstanceId: "srv_fixture",
+        threadId: first.threadId,
+        seq: 2,
+        eventId: "evt_gap",
+        occurredAt: "2026-08-18T00:00:02+08:00",
+        turn: { turnId: "turn_gap", threadId: first.threadId, status: "running", accessMode: "workspace" },
+      },
+    })).toBe("gap");
+    expect(useTimelineStore.getState().resyncRequired[first.threadId]).toBe("gap");
+
+    await act(async () => { await result.current.selectConversation(first.threadId); });
+    expect(history.threadRead).toHaveBeenCalledTimes(2);
+    expect(useTimelineStore.getState().resyncRequired[first.threadId]).toBeUndefined();
   });
 });

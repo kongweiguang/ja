@@ -25,6 +25,9 @@ export interface ComposerSubmit {
 export interface ComposerProps {
   accessMode: ComposerAccessMode;
   model?: string;
+  /** Parent-owned draft text; omit this prop to keep the legacy local state behavior. */
+  text?: string;
+  onTextChange?: (text: string) => void;
   models?: readonly ComposerModelOption[];
   activeTurn?: boolean;
   disabled?: boolean;
@@ -53,6 +56,8 @@ function accessModeLabel(mode: ComposerAccessMode): string {
 export function Composer({
   accessMode,
   model,
+  text: controlledText,
+  onTextChange,
   models = [],
   activeTurn = false,
   disabled = false,
@@ -62,17 +67,28 @@ export function Composer({
   onCancel,
   className,
 }: ComposerProps): ReactElement {
-  const [text, setText] = useState("");
+  const [uncontrolledText, setUncontrolledText] = useState("");
   const [localSending, setLocalSending] = useState(false);
   const [localCancelling, setLocalCancelling] = useState(false);
   const [error, setError] = useState<string>();
   const sendRef = useRef(false);
   const cancelRef = useRef(false);
+  const isControlled = controlledText !== undefined;
+  const text = controlledText ?? uncontrolledText;
   const hasActiveTurn = activeTurn || localSending;
   const canSend = text.trim().length > 0 && !disabled && !hasActiveTurn && !localCancelling;
   const canCancel = activeTurn && !disabled && !localCancelling && onCancel !== undefined;
 
-  /** Serializes send intent so a rapid keyboard/click pair creates one turn. */
+  /** Routes edits to the parent-owned draft when controlled, while preserving the legacy local state path. */
+  const updateText = (nextText: string): void => {
+    if (isControlled) {
+      onTextChange?.(nextText);
+      return;
+    }
+    setUncontrolledText(nextText);
+  };
+
+  /** Serializes send intent so a rapid keyboard/click pair creates one turn; controlled parents clear their own draft. */
   const submit = async (): Promise<void> => {
     if (!canSend || sendRef.current) {
       return;
@@ -82,7 +98,9 @@ export function Composer({
     setError(undefined);
     try {
       await onSend({ text: text.trim(), accessMode, ...(model?.trim() ? { model: model.trim() } : {}) });
-      setText("");
+      if (!isControlled) {
+        setUncontrolledText("");
+      }
     } catch {
       setError("发送失败，请检查运行时连接后重试。");
     } finally {
@@ -131,7 +149,7 @@ export function Composer({
         maxLength={1_048_576}
         rows={3}
         disabled={disabled || hasActiveTurn || localCancelling}
-        onChange={(event) => setText(event.target.value)}
+        onChange={(event) => updateText(event.target.value)}
         onKeyDown={handleKeyDown}
       />
       <div className="ja-composer__controls">
