@@ -21,10 +21,10 @@ button, textarea { font: inherit; }
 .ja-status-dot.is-failed, .ja-status-dot.is-degraded, .ja-status-dot.is-recovery_required { background: var(--ja-danger); }
 .ja-status-dot.is-connecting { background: var(--ja-warning); }
 
-.ja-layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 14rem minmax(0, 1fr) 15rem; }
+.ja-layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 14rem minmax(0, 1fr) minmax(22rem, 28rem); }
 .ja-sidebar, .ja-inspector { display: flex; min-width: 0; flex-direction: column; padding: 0.9rem; background: var(--ja-surface); }
 .ja-sidebar { border-right: 1px solid var(--ja-border); }
-.ja-inspector { border-left: 1px solid var(--ja-border); }
+.ja-inspector { min-height: 0; overflow: hidden; border-left: 1px solid var(--ja-border); padding: 0; }
 .ja-navigation { display: grid; gap: 0.25rem; margin-top: 1rem; }
 .ja-nav-button { width: 100%; justify-content: flex-start; }
 .ja-sidebar-history { display: grid; gap: 0.4rem; margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--ja-border); }
@@ -54,14 +54,6 @@ button, textarea { font: inherit; }
 .ja-recovery-card p:not(.ja-kicker):not(.ja-inline-error) { margin: 0.4rem 0 0; color: var(--ja-foreground-muted); font-size: 0.82rem; line-height: 1.5; }
 .ja-recovery-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.8rem; }
 .ja-settings-notice { color: var(--ja-foreground-muted); font-size: 0.78rem; line-height: 1.5; }
-
-.ja-inspector-heading { margin-bottom: 0.8rem; color: var(--ja-foreground-muted); font-size: 0.76rem; font-weight: 700; }
-.ja-inspector-next { color: var(--ja-accent); font-size: 0.65rem; font-weight: 500; }
-.ja-inspector-tabs { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 0.65rem; }
-.ja-inspector-list { display: grid; gap: 0.2rem; }
-.ja-inspector-trigger { display: inline-flex; align-items: center; gap: 0.45rem; padding: 0.5rem 0.55rem; border: 0; border-radius: var(--ja-radius-sm); color: var(--ja-foreground-muted); background: transparent; cursor: pointer; text-align: left; }
-.ja-inspector-trigger:hover, .ja-inspector-trigger[data-state="active"] { color: var(--ja-foreground); background: var(--ja-surface-muted); }
-.ja-inspector-content { padding: 0.65rem; border: 1px dashed var(--ja-border); border-radius: var(--ja-radius-sm); color: var(--ja-foreground-muted); font-size: 0.76rem; line-height: 1.5; }
 
 /* The existing Settings/Timeline/Composer features own their detailed layout. */
 .ja-settings-view > .ja-settings { min-height: 0; flex: 1; }

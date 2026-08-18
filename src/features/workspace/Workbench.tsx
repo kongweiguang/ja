@@ -31,16 +31,38 @@ export interface WorkbenchFileProps {
   revision?: string | number;
 }
 
+export interface WorkbenchFileState {
+  loading?: boolean;
+  error?: string;
+  message?: string;
+  onRetry?: () => void;
+}
+
+export interface WorkbenchDiffState {
+  loading?: boolean;
+  error?: string;
+  onRetry?: () => void;
+}
+
+export type WorkbenchTerminalProps = TerminalPanelProps & {
+  loading?: boolean;
+  error?: string;
+  onRetry?: () => void;
+};
+
 export interface WorkbenchProps {
   initialTab?: WorkbenchTab;
   selectedTab?: WorkbenchTab;
   onTabChange?: (tab: WorkbenchTab) => void;
   files?: FileTreeProps;
   fileViewer?: WorkbenchFileProps;
+  fileState?: WorkbenchFileState;
   search?: SearchPanelProps;
   diff?: WorkbenchDiffProps;
+  rawPatch?: WorkbenchFileProps;
+  diffState?: WorkbenchDiffState;
   git?: GitPanelProps;
-  terminal?: TerminalPanelProps;
+  terminal?: WorkbenchTerminalProps;
   preview?: PreviewPanelProps;
 }
 
@@ -65,7 +87,7 @@ const DEFAULT_TAB: WorkbenchTab = "files";
  * Keeps tab changes controlled by the shell while retaining an uncontrolled
  * default for standalone component tests and gradual App integration.
  */
-export function Workbench({ initialTab = DEFAULT_TAB, selectedTab: controlledTab, onTabChange, files, fileViewer, search, diff, git, terminal, preview }: WorkbenchProps): ReactElement {
+export function Workbench({ initialTab = DEFAULT_TAB, selectedTab: controlledTab, onTabChange, files, fileViewer, fileState, search, diff, rawPatch, diffState, git, terminal, preview }: WorkbenchProps): ReactElement {
   const [uncontrolledTab, setUncontrolledTab] = useState<WorkbenchTab>(initialTab);
   const selectedTab = controlledTab ?? uncontrolledTab;
   const setTab = (value: string): void => {
@@ -87,15 +109,12 @@ export function Workbench({ initialTab = DEFAULT_TAB, selectedTab: controlledTab
       <Tabs.Content className="ja-workbench-content" value="files">
         <section className="ja-workbench-panel" aria-label="Files">
           <PanelHeader title="Files" subtitle="只读工作区" />
-          {fileViewer === undefined ? (
-            <FileTree {...(files ?? { nodes: [] })} />
-          ) : (
-            <div className="ja-workbench-panel-scroll">
-              <Suspense fallback={<FeatureLoading label="正在加载文件查看器…" />}>
-                <CodeViewer {...fileViewer} />
-              </Suspense>
+          <div style={{ display: "flex", minHeight: 0, flex: 1, flexDirection: "column" }}>
+            <div style={{ minHeight: 0, flex: fileViewer === undefined && fileState === undefined ? 1 : "0 1 42%" }}>
+              <FileTree {...(files ?? { nodes: [] })} />
             </div>
-          )}
+            {fileState?.loading === true ? <FeatureLoading label="正在读取文件…" /> : fileState?.error !== undefined ? <FeatureError label={fileState.error} onRetry={fileState.onRetry} /> : fileState?.message !== undefined ? <FeatureEmpty label={fileState.message} /> : fileViewer === undefined ? null : <div className="ja-workbench-panel-scroll"><Suspense fallback={<FeatureLoading label="正在加载文件查看器…" />}><CodeViewer {...fileViewer} /></Suspense></div>}
+          </div>
         </section>
       </Tabs.Content>
 
@@ -109,7 +128,7 @@ export function Workbench({ initialTab = DEFAULT_TAB, selectedTab: controlledTab
       <Tabs.Content className="ja-workbench-content" value="diff">
         <section className="ja-workbench-panel" aria-label="Diff">
           <PanelHeader title="Diff" subtitle="只读变更" />
-          {diff === undefined ? <FeatureEmpty label="没有选择 Diff。" /> : <Suspense fallback={<FeatureLoading label="正在加载 Diff…" />}><DiffViewer {...diff} /></Suspense>}
+          {diffState?.loading === true ? <FeatureLoading label="正在加载 Diff…" /> : diffState?.error !== undefined ? <FeatureError label={diffState.error} onRetry={diffState.onRetry} /> : rawPatch !== undefined ? <div className="ja-workbench-panel-scroll"><Suspense fallback={<FeatureLoading label="正在加载 Diff…" />}><CodeViewer {...rawPatch} language="diff" /></Suspense></div> : diff === undefined ? <FeatureEmpty label="没有选择 Diff。" /> : <Suspense fallback={<FeatureLoading label="正在加载 Diff…" />}><DiffViewer {...diff} /></Suspense>}
         </section>
       </Tabs.Content>
 
@@ -124,6 +143,7 @@ export function Workbench({ initialTab = DEFAULT_TAB, selectedTab: controlledTab
         <section className="ja-workbench-panel" aria-label="Terminal">
           <PanelHeader title="Terminal" subtitle="Rust PTY 连接" />
           <Suspense fallback={<FeatureLoading label="正在加载 Terminal…" />}><TerminalPanel {...terminal} /></Suspense>
+          {terminal?.loading === true ? <FeatureLoading label="正在连接 Terminal…" /> : terminal?.error === undefined ? null : <FeatureError label={terminal.error} onRetry={terminal.onRetry} />}
         </section>
       </Tabs.Content>
 
@@ -159,4 +179,9 @@ function FeatureLoading({ label }: { label: string }): ReactElement {
  */
 function FeatureEmpty({ label }: { label: string }): ReactElement {
   return <div className="ja-feature-state" role="status">{label}</div>;
+}
+
+/** Keeps retry actions inside the existing feature-state primitive. */
+function FeatureError({ label, onRetry }: { label: string; onRetry?: () => void }): ReactElement {
+  return <div className="ja-feature-state ja-feature-error" role="alert"><p>{label}</p>{onRetry === undefined ? null : <button type="button" onClick={onRetry}>重试</button>}</div>;
 }

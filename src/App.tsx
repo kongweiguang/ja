@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
-import * as Tabs from "@radix-ui/react-tabs";
-import { Files, FolderOpen, GitBranch, MonitorPlay, PanelRight, Plus, Settings2, SquareTerminal } from "lucide-react";
+import { FolderOpen, PanelRight, Plus, Settings2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import { AppProviders } from "./app/AppProviders";
 import { useJaConnection } from "./app/ConnectionProvider";
 import { useJaSession, type ProjectPicker, type SettingsAdapter } from "./app/useJaSession";
+import { useJaWorkbench, type JaWorkbenchAdapters } from "./app/useJaWorkbench";
 import { Button } from "./components/primitives/Button";
 import { Settings } from "./features/settings";
 import { Composer, type ComposerSubmit } from "./features/composer";
 import { ChatTimeline } from "./features/timeline";
+import { Workbench } from "./features/workspace";
 import type { ApprovalSummary, Turn } from "./ipc/runtimeEvents";
 import { selectApprovalDecisions, selectApprovals, selectItemsForThread, useTimelineStore } from "./stores/timelineStore";
 import { useShallow } from "zustand/react/shallow";
@@ -103,25 +104,15 @@ function Sidebar({ hasProfile, projectName, threadId, projectBusy, onNewConversa
   );
 }
 
-/** Presents right-side integration slots without claiming that data providers are connected. */
-function Inspector(): ReactElement {
-  return (
-    <aside className="ja-inspector" aria-label="工作区面板">
-      <div className="ja-inspector-heading"><span>工作区</span><span className="ja-inspector-next">逐项接入</span></div>
-      <Tabs.Root className="ja-inspector-tabs" defaultValue="files" orientation="vertical">
-        <Tabs.List className="ja-inspector-list" aria-label="工作区面板">
-          <Tabs.Trigger className="ja-inspector-trigger" value="files"><Files data-icon="inline-start" />文件</Tabs.Trigger>
-          <Tabs.Trigger className="ja-inspector-trigger" value="diff"><GitBranch data-icon="inline-start" />Diff / Git</Tabs.Trigger>
-          <Tabs.Trigger className="ja-inspector-trigger" value="terminal"><SquareTerminal data-icon="inline-start" />终端</Tabs.Trigger>
-          <Tabs.Trigger className="ja-inspector-trigger" value="preview"><MonitorPlay data-icon="inline-start" />预览</Tabs.Trigger>
-        </Tabs.List>
-        <Tabs.Content className="ja-inspector-content" value="files">文件浏览将在下一串行接入。</Tabs.Content>
-        <Tabs.Content className="ja-inspector-content" value="diff">Diff / Git 将在下一串行接入。</Tabs.Content>
-        <Tabs.Content className="ja-inspector-content" value="terminal">终端将在下一串行接入。</Tabs.Content>
-        <Tabs.Content className="ja-inspector-content" value="preview">Preview 将在下一串行接入。</Tabs.Content>
-      </Tabs.Root>
-    </aside>
-  );
+interface WorkbenchHostProps {
+  project: NonNullable<ReturnType<typeof useJaSession>["project"]>;
+  adapters?: JaWorkbenchAdapters;
+}
+
+/** Mounts the real Workbench only after project configuration succeeds. */
+function WorkbenchHost({ project, adapters }: WorkbenchHostProps): ReactElement {
+  const projection = useJaWorkbench(project, adapters);
+  return <aside className="ja-inspector" aria-label="工作区面板"><Workbench {...projection} /></aside>;
 }
 
 interface SettingsViewProps {
@@ -239,10 +230,11 @@ interface AppProps {
   runtime?: Parameters<typeof AppProviders>[0]["runtime"];
   settingsAdapter?: SettingsAdapter;
   projectPicker?: ProjectPicker;
+  workbenchAdapters?: JaWorkbenchAdapters;
 }
 
 /** Keeps native dependency injection at the composition boundary for real and jsdom runtimes. */
-function JaApplication({ settingsAdapter, projectPicker }: Pick<AppProps, "settingsAdapter" | "projectPicker">): ReactElement {
+function JaApplication({ settingsAdapter, projectPicker, workbenchAdapters }: Pick<AppProps, "settingsAdapter" | "projectPicker" | "workbenchAdapters">): ReactElement {
   const session = useJaSession({ settingsAdapter, projectPicker });
   const { boot } = useJaConnection();
   const required = session.activeProfile === undefined;
@@ -253,7 +245,7 @@ function JaApplication({ settingsAdapter, projectPicker }: Pick<AppProps, "setti
       <div className="ja-layout">
         <Sidebar hasProfile={!required} projectName={session.project?.displayName} threadId={session.currentThreadId} projectBusy={session.projectBusy} onNewConversation={session.newConversation} onChooseProject={() => void session.chooseProject()} onOpenSettings={() => session.setView("settings")} onOpenWorkspace={() => session.setView("workspace")} settingsOnly={settingsOnly} />
         <main className="ja-main">{session.settingsLoading ? <section className="ja-loading-state" role="status">正在读取本地设置…</section> : session.settingsError !== undefined ? <section className="ja-error-state" role="alert"><h1>设置暂时不可用</h1><p>{session.settingsError}</p><Button type="button" variant="secondary" onClick={() => void session.reloadSettings()}>重新读取</Button></section> : settingsOnly ? <SettingsView session={session} required={required} /> : <Workspace session={session} />}</main>
-        {settingsOnly ? null : <Inspector />}
+        {settingsOnly || session.project === undefined ? null : <WorkbenchHost key={session.project.workspaceId} project={session.project} adapters={workbenchAdapters} />}
       </div>
     </div>
   );
