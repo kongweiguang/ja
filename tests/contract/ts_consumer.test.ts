@@ -36,6 +36,9 @@ function corpusFiles(root: string): string[] {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) {
+        if (entry.name === "schema-reserved") {
+          continue;
+        }
         visit(path);
       } else if (entry.isFile() && (path.endsWith(".json") || path.endsWith(".jsonl"))) {
         result.push(path);
@@ -346,14 +349,16 @@ function consumePropertyCorpus(): [number, number, string] {
 it("consumes the frozen corpus and bounded property corpus through production parsers", async () => {
   expect(GOLDEN.length).toBeGreaterThan(0);
   expect(PROPERTY.length).toBeGreaterThan(0);
+  const runtimeCorpus = corpusFiles(GOLDEN);
+  expect(runtimeCorpus.some((path) => relative(GOLDEN, path).split(/[\\/]/).includes("schema-reserved"))).toBe(false);
   expect(corpusDigest(GOLDEN)).toBe(EXPECTED_DIGEST);
   const validRoot = join(GOLDEN, "valid");
-  const validFrames = corpusFiles(GOLDEN)
+  const validFrames = runtimeCorpus
     .filter((path) => !path.split(/[\\/]/).includes("invalid") && !path.endsWith("major-incompatible.json"))
     .map(parseProductionDocuments);
-  expect(validFrames.reduce((count, file) => count + file.frames.length, 0)).toBe(54);
+  expect(validFrames.reduce((count, file) => count + file.frames.length, 0)).toBe(51);
   const methodResults = validFrames.reduce((count, file) => count + file.methodResults, 0);
-  expect(methodResults).toBe(16);
+  expect(methodResults).toBe(15);
   replayValidHandshake(documents(join(validRoot, "handshake.jsonl")));
   const invalidCases = documents(join(GOLDEN, "invalid", "handshake-challenge.jsonl"));
   expect(invalidCases).toHaveLength(23);
@@ -367,5 +372,5 @@ it("consumes the frozen corpus and bounded property corpus through production pa
   expect(property[1]).toBe(100);
   expect(property[2]).toBe(EXPECTED_PROPERTY_DIGEST);
   // This marker is intentionally the only success output consumed by run.py.
-  console.log(`TS_CONTRACT_OK digest=${EXPECTED_DIGEST} validFrames=54 methodResults=${methodResults} parseFrames=${parseFrames} propertyValid=${property[0]} propertyInvalid=${property[1]} propertyDigest=${property[2]}`);
+  console.log(`TS_CONTRACT_OK digest=${EXPECTED_DIGEST} validFrames=51 methodResults=${methodResults} parseFrames=${parseFrames} propertyValid=${property[0]} propertyInvalid=${property[1]} propertyDigest=${property[2]} reservedExcluded=true`);
 });

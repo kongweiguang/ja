@@ -47,10 +47,12 @@ JSON-RPC response 没有 `method` 字段，因此根 Schema 的 response envelop
 | `turn/start` | `turnStartResult` | `accepted`、`turnId`、`queued`；可选 status |
 | `turn/cancel` | `turnCancelResult` | `accepted`、`turnId`、`status=interrupting/interrupted` |
 
-`thread/read` 的 `snapshotSeq` 是同一只读事务里的截止序号；它与
-`thread/subscribe.fromSeq` 一起形成 snapshot→live 无缺口流程。`turn/start` 与
-`turn/cancel` 的 response 都只是 ACK/排队结果；Turn terminal
-事实只能由 `turn/completed` notification 表达。
+`thread/read` 的 `snapshotSeq` 是同一只读事务里的截止序号。在完整冻结 v1 语义中，
+它可以与 `thread/subscribe.fromSeq` 一起形成 snapshot→live 无缺口流程；但 JA Preview
+当前没有 `thread/subscribe`，也不返回 `events`/`nextSeq`，因此这些字段只是保留的
+schema 扩展位，不能写成当前能力。Preview 的 `thread/list` 不返回 `nextCursor`，
+`workspace/list` 也只返回单页。`turn/start` 与 `turn/cancel` 的 response 都只是
+ACK/排队结果；Turn terminal 事实只能由 `turn/completed` notification 表达。
 
 ## Profile 与 Model
 

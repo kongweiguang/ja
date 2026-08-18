@@ -33,8 +33,11 @@ MAX_ARTIFACT_SNAPSHOT_ENTRIES = 100_000
 MAX_DESCENDANT_PIDS = 1_024
 PROPERTY_SEED = 20260816
 EXPECTED = {
-    "validFrames": 54,
-    "methodResults": 16,
+    "validFrames": 51,
+    "methodResults": 15,
+    "reservedFiles": 1,
+    "reservedFrames": 3,
+    "reservedResultEnvelopes": 1,
     "handshakeValidFrames": 6,
     "handshakeInvalidCases": 23,
     "parseFrames": 47,
@@ -42,8 +45,8 @@ EXPECTED = {
 
 
 def expected_rust_contract_tests() -> int:
-    """Keep the shared marker aligned after one cross-platform addition and two Windows-only additions skipped on Unix."""
-    return 61 if os.name == "nt" else 55
+    """Keep the shared marker aligned with the Windows process-contract suite and its six Unix skips."""
+    return 65 if os.name == "nt" else 59
 
 
 def rust_test_artifact_exists(target_root: Path | None = None) -> bool:
@@ -88,8 +91,19 @@ def corpus_files(root: Path) -> list[Path]:
     return sorted(
         path
         for path in root.rglob("*")
-        if path.is_file() and path.suffix in {".json", ".jsonl"}
+        if path.is_file()
+        and path.suffix in {".json", ".jsonl"}
+        and "schema-reserved" not in path.relative_to(root).parts
     )
+
+
+def assert_runtime_corpus_excludes_reserved(root: Path) -> None:
+    """Keep the reserved schema fixture present while proving it cannot enter runtime digest inputs."""
+    reserved = root / "schema-reserved"
+    if not reserved.is_dir():
+        raise GateFailure("FAIL stage=corpus classification=reserved_fixture_missing")
+    if any("schema-reserved" in path.relative_to(root).parts for path in corpus_files(root)):
+        raise GateFailure("FAIL stage=corpus classification=reserved_fixture_included")
 
 
 def corpus_digest(root: Path) -> str:
@@ -648,6 +662,7 @@ def property_digest(path: Path) -> str:
 
 def load_expected_counts() -> None:
     """Verify the frozen reference validator reports the exact corpus counts before adapters run."""
+    assert_runtime_corpus_excludes_reserved(GOLDEN)
     result = run_command(
         "reference",
         [
@@ -669,6 +684,11 @@ def load_expected_counts() -> None:
     require_marker(
         "reference",
         output,
+        rf"SCHEMA_RESERVED_OK files={EXPECTED['reservedFiles']} frames={EXPECTED['reservedFrames']} resultEnvelopes={EXPECTED['reservedResultEnvelopes']}",
+    )
+    require_marker(
+        "reference",
+        output,
         rf"HANDSHAKE_OK validFrames={EXPECTED['handshakeValidFrames']} invalidCases={EXPECTED['handshakeInvalidCases']}",
     )
     require_marker("reference", output, rf"PARSE_ONLY_OK invalidOrMajorFrames={EXPECTED['parseFrames']}")
@@ -676,6 +696,8 @@ def load_expected_counts() -> None:
     print(
         "REFERENCE_OK "
         f"validFrames={EXPECTED['validFrames']} methodResults={EXPECTED['methodResults']} "
+        f"reservedFiles={EXPECTED['reservedFiles']} reservedFrames={EXPECTED['reservedFrames']} "
+        f"reservedResultEnvelopes={EXPECTED['reservedResultEnvelopes']} "
         f"handshakeInvalidCases={EXPECTED['handshakeInvalidCases']} parseFrames={EXPECTED['parseFrames']}"
     )
 
@@ -913,7 +935,7 @@ def run_java(property_path: Path, digest: str, classification_digest: str, temp:
         [tool("mvn"), "-B", "-ntp", "-f", str(pom_file), "clean", "verify"],
         ROOT,
     )
-    require_marker("java-build", build_result.stdout + build_result.stderr, r"Tests run:\s*223, Failures:\s*0, Errors:\s*0")
+    require_marker("java-build", build_result.stdout + build_result.stderr, r"Tests run:\s*236, Failures:\s*0, Errors:\s*0")
     classpath_file = temp / "java-classpath.txt"
     run_command(
         "java-classpath",
@@ -959,7 +981,7 @@ def run_java(property_path: Path, digest: str, classification_digest: str, temp:
     require_marker(
         "java-adapter",
         result.stdout + result.stderr,
-        rf"JAVA_CONTRACT_OK digest={digest} validFrames={EXPECTED['validFrames']} methodResults={EXPECTED['methodResults']} parseFrames={EXPECTED['parseFrames']} propertyValid=100 propertyInvalid=100 propertyDigest={classification_digest}",
+        rf"JAVA_CONTRACT_OK digest={digest} validFrames={EXPECTED['validFrames']} methodResults={EXPECTED['methodResults']} parseFrames={EXPECTED['parseFrames']} propertyValid=100 propertyInvalid=100 propertyDigest={classification_digest} reservedExcluded=true",
     )
     java_filters = (
         ("full-duplex", "io.github.kongweiguang.ja.protocol.JsonlCodecTest#acceptsOnlyTheCorrectRequestAndResponseDirectionMatrix"),
@@ -1365,7 +1387,7 @@ def run_rust(property_path: Path, digest: str, classification_digest: str, temp:
     require_marker(
         "rust-adapter",
         result.stdout + result.stderr,
-        rf"RUST_CONTRACT_OK digest={digest} validFrames={EXPECTED['validFrames']} methodResults={EXPECTED['methodResults']} parseFrames={EXPECTED['parseFrames']} propertyValid=100 propertyInvalid=100 propertyDigest={classification_digest}",
+        rf"RUST_CONTRACT_OK digest={digest} validFrames={EXPECTED['validFrames']} methodResults={EXPECTED['methodResults']} parseFrames={EXPECTED['parseFrames']} propertyValid=100 propertyInvalid=100 propertyDigest={classification_digest} reservedExcluded=true",
     )
     print(f"RUST_OK digest={digest}")
 
@@ -1414,8 +1436,8 @@ def run_typescript(property_path: Path, digest: str, classification_digest: str,
         ROOT,
         env=suite_env,
     )
-    require_marker("typescript-suite", suite.stdout + suite.stderr, r"Tests\s+149 passed\s+\(149\)")
-    print("TS_SUITE_OK tests=149")
+    require_marker("typescript-suite", suite.stdout + suite.stderr, r"Tests\s+212 passed\s+\(212\)")
+    print("TS_SUITE_OK tests=212")
     ts_filters = (
         ("nested-pending", "tracks server request pending IDs and rejects duplicate, unknown, and late responses"),
         ("cancel-race", "linearizes slow disconnect and reconnect so stale listeners cannot win"),
@@ -1443,7 +1465,7 @@ def run_typescript(property_path: Path, digest: str, classification_digest: str,
         require_marker(
             f"typescript-filter-{filter_id}",
             filtered.stdout + filtered.stderr,
-            r"Tests\s+1 passed(?:\s+\|\s+[0-9]+\s+skipped)?\s+\(149\)",
+            r"Tests\s+1 passed(?:\s+\|\s+[0-9]+\s+skipped)?\s+\(212\)",
         )
         print(f"TS_FILTER_OK id={filter_id}")
     contract_env = env.copy()
@@ -1468,7 +1490,7 @@ def run_typescript(property_path: Path, digest: str, classification_digest: str,
     require_marker(
         "typescript-adapter",
         result.stdout + result.stderr,
-        rf"TS_CONTRACT_OK digest={digest} validFrames={EXPECTED['validFrames']} methodResults={EXPECTED['methodResults']} parseFrames={EXPECTED['parseFrames']} propertyValid=100 propertyInvalid=100 propertyDigest={classification_digest}",
+        rf"TS_CONTRACT_OK digest={digest} validFrames={EXPECTED['validFrames']} methodResults={EXPECTED['methodResults']} parseFrames={EXPECTED['parseFrames']} propertyValid=100 propertyInvalid=100 propertyDigest={classification_digest} reservedExcluded=true",
     )
     print(f"TS_OK digest={digest}")
 

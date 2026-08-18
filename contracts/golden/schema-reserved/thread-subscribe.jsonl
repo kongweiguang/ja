@@ -1,0 +1,3 @@
+{"jsonrpc":"2.0","id":"c:subscribe-1","method":"thread/subscribe","params":{"threadId":"thr_fixture","fromSeq":5,"subscriptionId":"sub_fixture"}}
+{"jsonrpc":"2.0","id":"c:subscribe-1","result":{"accepted":true,"subscriptionId":"sub_fixture","fromSeq":5}}
+{"jsonrpc":"2.0","method":"item/delta","params":{"serverInstanceId":"srv_fixture","threadId":"thr_fixture","seq":6,"eventId":"evt_live6","occurredAt":"2026-08-16T00:00:06Z","itemId":"item_fixture","delta":" live"}}

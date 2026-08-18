@@ -20,7 +20,8 @@ response envelope 本身没有 `method`，因此根 Schema 只验证通用
 | `valid/handshake.jsonl` | starting → challenge → ready、stopped 后 generation 换 token |
 | `valid/errors.jsonl` | `HANDSHAKE_FAILED` 稳定 code/jaCode/retryable 映射 |
 | `approval/` | Java→Rust nested approval request 与标准 response；重复响应只用于语义测试 |
-| `snapshot-live/` | snapshot response 的 `snapshotSeq` 与后续 live event |
+| `snapshot-live/` | 当前是两帧 snapshot-only response；live/subscribe 不在 Preview fixture 中伪装成已实现 |
+| `schema-reserved/` | 仅验证冻结 schema 可解析的保留能力样例；不代表 Preview capability |
 | `secret/` | dummy credential resolve、内存注入 response、clear runtime notice；没有真实 secret |
 | `mcp-skill/` | Skill import/enable、stdio/HTTP MCP save、auth、mcp/test、tools/read |
 | `limits/` | 全部有限 queue/frame/delta/inline-output/deadline 能力 |
@@ -48,7 +49,7 @@ mapping 用 request id 关联 response 进行二次 result 校验。PowerShell
 challenge 原值作为 JSON object key/value 都拒绝，包括 error 外层 meta、runtime notice、
 diagnostics/result/provider/tool failure 扩展。
 
-当前 valid fixture 为 54 帧，invalid/major 为 47 帧；MCP 专用覆盖为 16 个 schema-invalid
+当前运行态 valid fixture 为 51 帧，method-specific result 为 15 个，invalid/major 为 47 帧；`schema-reserved/` 另有 1 个文件、3 帧，仅做 root schema 校验（含 1 个 result envelope），不进入运行态 digest 或 method result 计数；MCP 专用覆盖为 16 个 schema-invalid
 case，握手专用覆盖为 6 个 valid 帧和
 23 个 invalid cases，包含缺 token、格式错误、非 ready 携带 token、ready 缺失/错误、
 重复 initialized、重复 ready、旧 generation token、ready-before-initialized、无 initialized

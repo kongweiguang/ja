@@ -1,5 +1,2 @@
-{"jsonrpc":"2.0","id":"c:snapshot-1","method":"thread/read","params":{"threadId":"thr_fixture","view":"snapshot","limit":100}}
-{"jsonrpc":"2.0","id":"c:snapshot-1","result":{"serverInstanceId":"srv_fixture","thread":{"threadId":"thr_fixture","workspaceId":"ws_fixture","title":"Fixture thread","status":"running","lastSeq":5,"activeTurnId":"turn_fixture"},"items":[{"itemId":"item_fixture","turnId":"turn_fixture","kind":"agent_message","status":"in_progress","title":"Fixture live item","text":"hello"}],"snapshotSeq":5}}
-{"jsonrpc":"2.0","id":"c:subscribe-1","method":"thread/subscribe","params":{"threadId":"thr_fixture","fromSeq":5,"subscriptionId":"sub_fixture"}}
-{"jsonrpc":"2.0","id":"c:subscribe-1","result":{"accepted":true,"subscriptionId":"sub_fixture","fromSeq":5}}
-{"jsonrpc":"2.0","method":"item/delta","params":{"serverInstanceId":"srv_fixture","threadId":"thr_fixture","seq":6,"eventId":"evt_live6","occurredAt":"2026-08-16T00:00:06Z","itemId":"item_fixture","delta":" live"}}
+{"jsonrpc":"2.0","id":"c:snapshot-1","method":"thread/read","params":{"threadId":"thr_fixture","view":"snapshot"}}
+{"jsonrpc":"2.0","id":"c:snapshot-1","result":{"serverInstanceId":"srv_fixture","thread":{"threadId":"thr_fixture","workspaceId":"ws_fixture","title":"Fixture thread","status":"idle","lastSeq":5},"items":[{"itemId":"item_fixture","turnId":"turn_fixture","kind":"agent_message","status":"completed","title":"Fixture message","text":"hello"}],"snapshotSeq":5}}

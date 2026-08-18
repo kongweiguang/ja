@@ -7,7 +7,8 @@
 每个事件的 `params` 都带 `serverInstanceId`、`threadId`、`seq`、`eventId` 和
 `occurredAt`。Java 在 SQLite 事务内为权威事件分配 seq 并提交后，才把事件放入有界
 outbound queue。`eventId` 去重和 `(serverInstanceId, threadId, seq)` 顺序检查都由
-Rust/React 执行；缺口必须走 snapshot/resync，不能猜测补齐。
+Rust/React 执行；JA Preview 没有事件回放或 Thread 订阅，发现缺口时只能重新读取
+snapshot，不能猜测补齐。
 
 ## Runtime 事件
 
@@ -68,12 +69,18 @@ Approval 领域事件不是第二个应答协议。Rust 必须以 `approvalId` �
 
 ## Snapshot 与 live 事件顺序
 
-1. Rust 为 Thread 注册 sink 与 bounded buffer，再发送 `thread/read`。
-2. Java 在单一只读事务返回 `snapshot`、`snapshotSeq` 和当前 serverInstanceId。
-3. Rust 丢弃 buffer 中 `seq <= snapshotSeq` 的重复事件。
-4. Rust 按 seq 连续排空 `seq > snapshotSeq`，出现缺口就重新 snapshot。
-5. 排空完成后切换 live；后续 reducer 按 eventId/seq 幂等。
+冻结 v1 schema 允许未来实现“注册 sink → `thread/read` → 按 `snapshotSeq` 排空 → live”
+的订阅流程，但 JA Preview 当前不实现 `thread/subscribe`/`thread/unsubscribe`，也不
+保存可按 `afterSeq` 读取的 event log。
 
-snapshot 不被事件替代；事件也不保证包含完整历史。UI reload、sidecar restart、慢消费
-或超限恢复都必须能以 snapshot + live 重建权威时间线。订阅取消不改变 Java 状态，
-且 listener、channel、后台任务和子进程必须清理。
+Preview 的恢复流程是：
+
+1. Rust 请求 `thread/read(view=snapshot)`，Java 在一次只读事务返回当前 `snapshot`、
+   `snapshotSeq` 和 `serverInstanceId`。
+2. 当前连接上的 Turn live notification 可以继续更新 UI；已提交的用户/Agent item
+   会在后续 snapshot 中出现。
+3. 若连接断开、sidecar 重启、事件缺口或队列过载，Rust 放弃缺口后的增量并重新请求
+   snapshot；不能自行生成缺失事件。
+
+当前 snapshot 不由事件替代，live 事件也不承诺可回放。后续若实现订阅或 replay，必须
+通过 capability/minor 演进明确启用，并保留 `eventId`/`seq` 幂等规则。

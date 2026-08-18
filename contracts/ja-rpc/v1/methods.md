@@ -45,8 +45,28 @@ client 到 Java/AgentScope server，`S→C` 是反向 request；notification 不
 | `thread/delete` | C→S | `threadId` | 软删除，可恢复；不删用户 Workspace |
 | `thread/purge` | C→S | `threadId` | 明确确认后只永久删除 JA 自有会话数据 |
 
-同一 Thread 的 Turn 串行，不同 Thread 可并行；`thread/read` 返回已提交状态。snapshot 后的 live 订阅必须遵循 protocol.md 的 buffer→snapshot→排空→
-live 流程。
+同一 Thread 的 Turn 串行，不同 Thread 可并行；`thread/read` 返回已提交状态。完整冻结
+v1 若启用 snapshot 后的 live 订阅，必须遵循 protocol.md 的 buffer→snapshot→排空→live
+流程；当前 Preview 的实际边界见下文。
+
+### JA Preview 的 history 实现 profile
+
+上面的表是冻结 v1 的方法目录和保留字段，不等同于当前 Preview 的 capability 广告。
+当前 Preview 只实现下面四个 history 方法；其余 history 方法（包括
+`thread/subscribe`/`thread/unsubscribe`、归档、删除和 purge）仍保留在 v1 schema
+和演进空间中，但当前 sidecar 不广告、也不会执行。
+
+| 方法 | Preview 当前行为 |
+| --- | --- |
+| `workspace/list` | 返回当前配置的 workspace 单页，最多 500 行；不返回 `nextCursor`，没有 continuation。 |
+| `thread/create` | 为指定 workspace 服务端分配 `threadId`，返回当前 Thread snapshot；当前不产生可回放的 `thread/changed` 历史事件。 |
+| `thread/list` | 按更新时间返回一个有界单页；`limit` 可为 1–500，省略时使用 500；`cursor` 必须省略或为空，不返回 `nextCursor`。 |
+| `thread/read` | 只接受省略 `view` 或 `view=snapshot`；`afterSeq`、`limit` 会返回 `INVALID_PARAMS`；结果只含当前 `items` 和 `snapshotSeq`，不返回历史 `events`/`nextSeq`。 |
+
+Preview 没有 `thread/subscribe` 和持久 event log。Turn 运行期间仍可在当前连接上收到
+live notification；断线或错过 notification 后，客户端只能重新读取 snapshot，不能请求
+按 `afterSeq` 回放。后续实现订阅或事件回放时，必须通过 capability 与 minor 演进明确广告，
+不能把上述 Preview 行为悄悄改变为另一种语义。
 
 ## Turn 与 Agent 控制
 

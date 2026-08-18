@@ -69,6 +69,7 @@ NON_READY_STATUSES = {"starting", "degraded", "shutting_down", "stopped", "crash
 HANDSHAKE_VALID_FIXTURE = BASE / "valid" / "handshake.jsonl"
 HANDSHAKE_INVALID_FIXTURE = BASE / "invalid" / "handshake-challenge.jsonl"
 MCP_INVALID_FIXTURE = BASE / "invalid" / "mcp.jsonl"
+SCHEMA_RESERVED_DIR = BASE / "schema-reserved"
 ERRORS_DOC = BASE.parent / "ja-rpc" / "v1" / "errors.md"
 ERROR_ROW = re.compile(r"^\|\s*(-?\d+)\s+\|\s+`([A-Z][A-Z0-9_]*)`\s+\|\s+(是|否)\s+\|")
 
@@ -341,7 +342,12 @@ def validate_valid_fixtures(
     frame_count = 0
     result_count = 0
     for path in sorted(BASE.rglob("*.json*")):
-        if path.name == "validate.py" or "invalid" in path.parts or path.name == "major-incompatible.json":
+        if (
+            path.name == "validate.py"
+            or "invalid" in path.parts
+            or path.name == "major-incompatible.json"
+            or SCHEMA_RESERVED_DIR in path.parents
+        ):
             continue
         pending: dict[str, str] = {}
         documents = load_documents(path)
@@ -380,6 +386,30 @@ def validate_valid_fixtures(
             validate_handshake_sequence(handshake_frames, str(path))
             validate_handshake_redaction_sequence(handshake_frames, str(path))
     return frame_count, result_count
+
+
+def validate_schema_reserved_fixtures(validator: Draft202012Validator) -> tuple[int, int, int]:
+    """校验保留样例的 JSON parse/root schema，但不把它当作 Preview method result。"""
+    if not SCHEMA_RESERVED_DIR.is_dir():
+        raise ValueError(f"missing schema-reserved fixture directory: {SCHEMA_RESERVED_DIR}")
+    files = sorted(
+        path
+        for path in SCHEMA_RESERVED_DIR.rglob("*.json*")
+        if path.is_file()
+    )
+    if not files:
+        raise ValueError("schema-reserved fixture directory is empty")
+    frame_count = 0
+    result_envelopes = 0
+    for path in files:
+        for index, document in enumerate(load_documents(path), start=1):
+            errors = list(validator.iter_errors(document))
+            if errors:
+                raise ValueError(f"{path}:{index}: {errors[0].message}")
+            frame_count += 1
+            if "result" in document and "id" in document:
+                result_envelopes += 1
+    return len(files), frame_count, result_envelopes
 
 
 def validate_parse_only_fixtures() -> int:
@@ -441,12 +471,17 @@ def main() -> int:
     validator = Draft202012Validator(schema, format_checker=FormatChecker())
     catalog = load_error_catalog()
     frame_count, result_count = validate_valid_fixtures(validator, catalog)
+    reserved_files, reserved_frames, reserved_results = validate_schema_reserved_fixtures(validator)
     handshake_valid_count, handshake_invalid_count = validate_handshake_cases(validator, catalog)
     mcp_invalid_count = validate_mcp_constraint_cases(validator)
     parse_count = validate_parse_only_fixtures()
     markdown_count = validate_markdown_headers()
     validate_no_path_or_secret_leaks()
     print(f"SCHEMA_OK refs={reference_count} validFrames={frame_count} methodResults={result_count}")
+    print(
+        "SCHEMA_RESERVED_OK "
+        f"files={reserved_files} frames={reserved_frames} resultEnvelopes={reserved_results}"
+    )
     print(
         "HANDSHAKE_OK "
         f"validFrames={handshake_valid_count} invalidCases={handshake_invalid_count} "

@@ -163,11 +163,23 @@ interrupting -> interrupted | aborted_by_runtime
 completed/failed/cancelled`；`item/completed` 是完整可展示快照，delta 可以合并、丢弃或
 短暂缓存，但不能替代最终快照。隐藏 chain-of-thought 不属于可发送的 Item 内容。
 
-### Snapshot/live 无缺口
+### Snapshot/live 与 JA Preview 边界
 
-`thread/read` 返回一个只读 snapshot 和 `snapshotSeq`；可选 `afterSeq` 仅用于回放已持久
-事件。`thread/subscribe` 在同一 connection 上登记订阅和 `fromSeq`，随后接收 live
-notification。Rust 必须先创建本地 sink/缓冲，再发 snapshot request：
+冻结 v1 schema 保留了可选 `afterSeq`、`events`、`nextSeq` 和
+`thread/subscribe.fromSeq`，用于未来的 snapshot→live 无缺口流程。该流程不是当前
+Preview 的能力承诺。
+
+JA Preview 的 `thread/read` 只返回当前只读 snapshot 和 `snapshotSeq`：`view` 只能省略
+或为 `snapshot`，`afterSeq` 与 `limit` 会被拒绝；结果不含历史 `events` 或 `nextSeq`。
+Preview 也没有 `thread/subscribe`、`thread/unsubscribe` 或持久 event log，因此 Rust
+只能在当前 connection 上消费 Turn 的 live notification；断线、重启或错过事件时，
+重新请求 snapshot 是唯一恢复方式，不能按序号回放。
+
+Preview 的 `thread/list` 是一个有界单页（最多 500 行），不产生 `nextCursor`；
+`workspace/list` 同样不分页。上限和当前实现一起保证 UI 历史恢复简单可预测，后续若增加
+分页、订阅或回放，必须通过 capability/minor 演进增加明确的实现 profile。
+
+当前 Preview 不执行下面的冻结流程；这些字段和步骤仅保留给未来的 minor 演进：
 
 ```text
 注册 sink + bounded buffer
@@ -177,7 +189,7 @@ notification。Rust 必须先创建本地 sink/缓冲，再发 snapshot request�
   -> 切到 live
 ```
 
-关键事件在 SQLite 事务中分配 seq 并提交后才能进入 outbound queue。若提交后、发送前
+冻结流程中的关键事件在 SQLite 事务中分配 seq 并提交后才能进入 outbound queue。若提交后、发送前
 崩溃，重启实例通过 snapshot 找回。队列满时不能丢弃或改写关键事件为成功；必须发
 `runtime/overload`/`RESYNC_REQUIRED` 语义，客户端重新 snapshot。reducer 应按 `eventId`
 和 `seq` 幂等。

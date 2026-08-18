@@ -45,14 +45,15 @@ public final class JavaCorpusProbe {
     public static void main(String[] arguments) {
         try {
             Path golden = Path.of(arguments[0]).toAbsolutePath();
+            assertRuntimeCorpusExcludesReserved(golden);
             String digest = digest(golden);
             assertCondition(digest.equals(System.getenv(EXPECTED_DIGEST_ENV)), "corpus digest mismatch");
             int[] valid = consumeValidCorpus(golden);
             int parseFrames = consumeParseCorpus(golden);
             PropertyResult property = consumePropertyCorpus(Path.of(Objects.requireNonNull(
                     System.getenv(PROPERTY_PATH_ENV), "property path")));
-            assertCondition(valid[0] == 54, "valid frame count mismatch");
-            assertCondition(valid[1] == 16, "method result count mismatch");
+            assertCondition(valid[0] == 51, "valid frame count mismatch");
+            assertCondition(valid[1] == 15, "method result count mismatch");
             assertCondition(parseFrames == 47, "parse frame count mismatch");
             assertCondition(property.valid() == 100 && property.invalid() == 100, "property count mismatch");
             assertCondition(property.digest().equals(System.getenv(PROPERTY_DIGEST_ENV)), "property digest mismatch");
@@ -62,13 +63,14 @@ public final class JavaCorpusProbe {
                     + " parseFrames=" + parseFrames
                     + " propertyValid=" + property.valid()
                     + " propertyInvalid=" + property.invalid()
-                    + " propertyDigest=" + property.digest());
+                    + " propertyDigest=" + property.digest()
+                    + " reservedExcluded=true");
         } catch (Throwable failure) {
             // Keep the adapter itself safe: raw exception text could contain fixture tokens or paths.
             String classification = null;
             for (Throwable current = failure; current != null && classification == null; current = current.getCause()) {
                 String message = current.getMessage();
-                if (message != null && message.matches("(?:valid_frame|valid_handshake|invalid_case|parse_case|property)_\\d+|valid frame count mismatch|method result count mismatch|parse frame count mismatch|property count mismatch|invalid handshake count mismatch|corpus digest mismatch")) {
+                if (message != null && message.matches("(?:valid_frame|valid_handshake|invalid_case|parse_case|property)_\\d+|valid frame count mismatch|method result count mismatch|parse frame count mismatch|property count mismatch|invalid handshake count mismatch|corpus digest mismatch|reserved fixture (?:missing|included)")) {
                     classification = message;
                 }
             }
@@ -608,9 +610,27 @@ public final class JavaCorpusProbe {
         try (var stream = Files.walk(root)) {
             return stream.filter(Files::isRegularFile)
                     .filter(path -> path.toString().endsWith(".json") || path.toString().endsWith(".jsonl"))
+                    .filter(path -> !isSchemaReserved(path, root))
                     .sorted(Comparator.comparing(path -> root.relativize(path).toString().replace('\\', '/')))
                     .toList();
         }
+    }
+
+    /** Keeps schema-only reserved samples out of runtime parsing and digest inputs while requiring the fixture to remain present. */
+    private static void assertRuntimeCorpusExcludesReserved(Path root) throws IOException {
+        Path reserved = root.resolve("schema-reserved");
+        assertCondition(Files.isDirectory(reserved), "reserved fixture missing");
+        assertCondition(jsonFiles(root).stream().noneMatch(path -> isSchemaReserved(path, root)), "reserved fixture included");
+    }
+
+    /** Identifies the reserved schema-only subtree without excluding similarly named user fixture files. */
+    private static boolean isSchemaReserved(Path path, Path root) {
+        for (Path component : root.relativize(path)) {
+            if (component.toString().equals("schema-reserved")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Hashes names and bytes exactly like the cross-platform runner to prove corpus identity. */

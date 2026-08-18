@@ -42,6 +42,7 @@ fn run() -> Result<(), ()> {
     if env::var_os("JA_RUST_SUPERVISOR_REPLAY_ONLY").is_some() {
         return run_supervisor_replay_only(&golden);
     }
+    assert_runtime_corpus_excludes_reserved(&golden)?;
     let property = PathBuf::from(env::var(PROPERTY_PATH_ENV).map_err(|_| ())?);
     let digest = corpus_digest(&golden).map_err(|_| ())?;
     if env::var(EXPECTED_DIGEST_ENV).map_err(|_| ())? != digest {
@@ -56,8 +57,8 @@ fn run() -> Result<(), ()> {
         return Err(());
     }
     check_framing_boundaries()?;
-    if valid_frames != 54
-        || method_results != 16
+    if valid_frames != 51
+        || method_results != 15
         || parse_frames != 47
         || property_valid != 100
         || property_invalid != 100
@@ -66,7 +67,7 @@ fn run() -> Result<(), ()> {
         return Err(());
     }
     println!(
-        "RUST_CONTRACT_OK digest={digest} validFrames={valid_frames} methodResults={method_results} parseFrames={parse_frames} propertyValid={property_valid} propertyInvalid={property_invalid} propertyDigest={property_digest}"
+        "RUST_CONTRACT_OK digest={digest} validFrames={valid_frames} methodResults={method_results} parseFrames={parse_frames} propertyValid={property_valid} propertyInvalid={property_invalid} propertyDigest={property_digest} reservedExcluded=true"
     );
     Ok(())
 }
@@ -122,12 +123,37 @@ fn collect_json_files(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), std:
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
         if path.is_dir() {
+            if path.file_name().and_then(|name| name.to_str()) == Some("schema-reserved") {
+                continue;
+            }
             collect_json_files(&path, output)?;
         } else if path.extension().is_some_and(|extension| extension == "json" || extension == "jsonl") {
             output.push(path);
         }
     }
     Ok(())
+}
+
+/// Requires the reserved schema-only subtree to exist while proving recursive runtime collection skips it.
+fn assert_runtime_corpus_excludes_reserved(root: &Path) -> Result<(), ()> {
+    let reserved = root.join("schema-reserved");
+    if !reserved.is_dir() {
+        return Err(());
+    }
+    let mut files = Vec::new();
+    collect_json_files(root, &mut files).map_err(|_| ())?;
+    if files.iter().any(|path| is_schema_reserved(path, root)) {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Identifies the reserved schema-only subtree without filtering unrelated fixture names.
+fn is_schema_reserved(path: &Path, root: &Path) -> bool {
+    path
+        .strip_prefix(root)
+        .map(|relative| relative.components().any(|component| component.as_os_str() == "schema-reserved"))
+        .unwrap_or(false)
 }
 
 /// Reads JSONL one line at a time so a consumer cannot silently skip an individual frame.
