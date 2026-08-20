@@ -1099,7 +1099,16 @@ async function installRawTauriEventProbe(page) {
     }, 10);
     globalThis.setTimeout(() => globalThis.clearInterval(timer), 5_000);
   });
-  await page.reload({ waitUntil: "domcontentloaded" });
+  // Tauri's Vite/WebView2 bridge can commit the reload while the dev server keeps
+  // the document's DOMContentLoaded lifecycle open for HMR. Waiting for that event
+  // makes the probe fail before the page is usable, so use the committed navigation
+  // plus a bounded readyState check instead of weakening the later UI assertions.
+  await page.reload({ waitUntil: "commit", timeout: 30_000 });
+  await page.waitForFunction(
+    () => globalThis.document.readyState === "interactive" || globalThis.document.readyState === "complete",
+    undefined,
+    { timeout: 30_000 },
+  );
   await page.evaluate(async () => {
     const internals = globalThis.__TAURI_INTERNALS__;
     if (internals === undefined
@@ -1690,7 +1699,11 @@ async function runFirstSession(page, runId, deadline, directories, recordAfterSe
   throwIfAborted(signal);
   const stage = (name) => recordStage?.(`first:${name}`);
   stage("load");
-  await page.waitForLoadState("domcontentloaded");
+  await page.waitForFunction(
+    () => globalThis.document.readyState === "interactive" || globalThis.document.readyState === "complete",
+    undefined,
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
   stage("project_button");
   await page.getByRole("button", { name: "选择项目", exact: true }).waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
   await page.getByRole("button", { name: "选择项目", exact: true }).click();
@@ -1820,7 +1833,11 @@ async function runParallelApprovalFlow(page, runId, deadline, directories, signa
  */
 async function runRestartSession(page, firstInput, deadline, directories, recordIsolation, signal) {
   throwIfAborted(signal);
-  await page.waitForLoadState("domcontentloaded");
+  await page.waitForFunction(
+    () => globalThis.document.readyState === "interactive" || globalThis.document.readyState === "complete",
+    undefined,
+    { timeout: Math.max(1, deadline - Date.now()) },
+  );
   await page.getByRole("button", { name: "选择项目", exact: true }).waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
   await page.getByRole("button", { name: "选择项目", exact: true }).click();
   await page.getByRole("heading", { name: "开始 coding" }).waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
