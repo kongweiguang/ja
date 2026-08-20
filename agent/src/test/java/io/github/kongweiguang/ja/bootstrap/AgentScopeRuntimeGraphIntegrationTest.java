@@ -27,6 +27,7 @@ import reactor.core.publisher.Flux;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.IOException;
 import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
 import java.io.InputStreamReader;
@@ -284,6 +285,84 @@ final class AgentScopeRuntimeGraphIntegrationTest {
         assertTrue(awaitProcessExit(pid), "MCP stdio child remained after graph close");
     }
 
+    /**
+     * Rejects a profile/tools.json server-name overlap before profile transport startup, proving
+     * the atomic guard prevents either source from creating a conflicting child process.
+     */
+    @Test
+    void graphRejectsProfileToolsConfigNameConflictBeforeStartingChild(@TempDir Path temp)
+            throws Exception {
+        Path workspace = Files.createDirectory(temp.resolve("workspace-mcp-conflict"));
+        Path data = Files.createDirectory(temp.resolve("data-mcp-conflict"));
+        Path pidFile = temp.resolve("mcp-conflict.pid");
+        Files.writeString(workspace.resolve("tools.json"),
+                "{\"mcpServers\":{\"mcp_graph_conflict\":{}}}", StandardCharsets.UTF_8);
+        McpServerDefinition definition = new McpServerDefinition(
+                "mcp_graph_conflict", "graph conflict", "stdio", javaExecutable(),
+                "2024-11-05", List.of("-cp", absoluteClasspath(),
+                        "io.github.kongweiguang.ja.mcp.McpRuntimeTest$StdioFixture",
+                        pidFile.toString()), Map.of(), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> AgentScopeRuntimeGraph.open(workspace, data,
+                        new ServerInstanceId("srv_mcp_conflict"), "profile_mcp_conflict",
+                        "trusted", "full_access", new ToolModel(), List.of(),
+                        List.of(new AgentScopeRuntimeGraph.McpActivation(definition, null))));
+        assertEquals("mcp_server_unavailable", failure.getMessage());
+        assertFalse(Files.exists(pidFile), "conflicting profile MCP must not start a child");
+    }
+
+    /**
+     * Proves distinct profile and tools.json servers both use AgentScope registration and are
+     * reaped by the normal graph close path, including the JaSandboxFilesystem config read.
+     */
+    @Test
+    void graphRunsDistinctProfileAndToolsConfigServersAndReapsBoth(@TempDir Path temp)
+            throws Exception {
+        Path workspace = Files.createDirectory(temp.resolve("workspace-mcp-distinct"));
+        Path data = Files.createDirectory(temp.resolve("data-mcp-distinct"));
+        Path profilePid = temp.resolve("mcp-profile.pid");
+        Path toolsPid = temp.resolve("mcp-tools.pid");
+        String java = javaExecutable();
+        String classpath = absoluteClasspath();
+        Files.writeString(workspace.resolve("tools.json"), JSON.writeValueAsString(Map.of(
+                "mcpServers", Map.of("mcp_tools_fixture", Map.of(
+                        "transport", "stdio",
+                        "command", java,
+                        "args", List.of("-cp", classpath,
+                                "io.github.kongweiguang.ja.mcp.McpRuntimeTest$StdioFixture",
+                                toolsPid.toString(), "tools-config"))))),
+                StandardCharsets.UTF_8);
+        McpServerDefinition definition = new McpServerDefinition(
+                "mcp_profile_fixture", "profile fixture", "stdio", java,
+                "2024-11-05", List.of("-cp", classpath,
+                        "io.github.kongweiguang.ja.mcp.McpRuntimeTest$StdioFixture",
+                        profilePid.toString(), "profile"), Map.of(), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true);
+
+        long profileProcess;
+        long toolsProcess;
+        AgentScopeRuntimeGraph graph = AgentScopeRuntimeGraph.open(workspace, data,
+                new ServerInstanceId("srv_mcp_distinct"), "profile_mcp_distinct", "trusted",
+                "full_access", new ToolModel(), List.of(),
+                List.of(new AgentScopeRuntimeGraph.McpActivation(definition, null)));
+        try {
+            assertTrue(awaitFile(profilePid), "profile MCP did not start");
+            assertTrue(awaitFile(toolsPid), "tools.json MCP was not loaded through the sandbox");
+            profileProcess = Long.parseLong(Files.readString(profilePid));
+            toolsProcess = Long.parseLong(Files.readString(toolsPid));
+            assertTrue(ProcessHandle.of(profileProcess).map(ProcessHandle::isAlive).orElse(false),
+                    "profile MCP was not retained by AgentScope");
+            assertTrue(ProcessHandle.of(toolsProcess).map(ProcessHandle::isAlive).orElse(false),
+                    "tools.json MCP was not retained by AgentScope");
+        } finally {
+            graph.close();
+        }
+        assertTrue(awaitProcessExit(profileProcess), "profile MCP child remained after graph close");
+        assertTrue(awaitProcessExit(toolsProcess), "tools.json MCP child remained after graph close");
+    }
+
     /** Runs a bounded patch turn and returns the fixture for a mode-specific file assertion. */
     private static Path runPermissionProbe(Path temp, String accessMode, ProbeKind kind)
             throws Exception {
@@ -425,6 +504,17 @@ final class AgentScopeRuntimeGraphIntegrationTest {
     private static boolean awaitProcessExit(long pid) throws InterruptedException {
         for (int attempt = 0; attempt < 100; attempt++) {
             if (!ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false)) {
+                return true;
+            }
+            Thread.sleep(20);
+        }
+        return false;
+    }
+
+    /** Waits for an MCP fixture to publish its PID before assertions inspect child lifecycle. */
+    private static boolean awaitFile(Path path) throws IOException, InterruptedException {
+        for (int attempt = 0; attempt < 150; attempt++) {
+            if (Files.isRegularFile(path) && Files.size(path) > 0) {
                 return true;
             }
             Thread.sleep(20);

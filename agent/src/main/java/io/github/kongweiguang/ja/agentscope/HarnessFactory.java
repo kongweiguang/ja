@@ -19,6 +19,8 @@ import io.github.kongweiguang.ja.tools.JaSandboxFilesystem;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Collection;
 import java.util.Objects;
 
 /**
@@ -69,7 +71,7 @@ public final class HarnessFactory {
      */
     public HarnessFactory(Config config, AbstractSandboxFilesystem filesystem, Path workspace,
                            JaSkillSources skillSources, AgentStateStore stateStore) {
-        this(config, filesystem, workspace, skillSources, stateStore, new Toolkit());
+        this(config, filesystem, workspace, skillSources, stateStore, new JaHarnessToolkit());
     }
 
     /**
@@ -116,6 +118,14 @@ public final class HarnessFactory {
     /** Returns the safe default configuration used by the first JA engine. */
     public static Config defaults() {
         return Config.defaults();
+    }
+
+    /**
+     * Creates the graph-owned Toolkit subtype that preserves AgentScope MCP lifecycle state
+     * across Harness build copies; callers should share this instance with the MCP runtime.
+     */
+    public static Toolkit newToolkit() {
+        return new JaHarnessToolkit();
     }
 
     /**
@@ -240,6 +250,39 @@ public final class HarnessFactory {
         return new HarnessEngineAdapter(create(model));
     }
 
+    /**
+     * Closes MCP clients that AgentScope registered while building the Harness-owned Toolkit.
+     *
+     * <p>The graph-owned Toolkit adapter keeps AgentScope's MCP lifecycle map attached while
+     * Harness construction performs its normal build steps. Keeping this tiny composition cleanup
+     * here prevents upstream {@code tools.json} stdio transports from outliving the Harness
+     * without creating a second MCP registry.</p>
+     */
+    public void closeToolsConfigMcpClients(Collection<String> serverNames) {
+        HarnessAgent current = agent;
+        if (current == null || serverNames == null || serverNames.isEmpty()) {
+            return;
+        }
+        RuntimeException failure = null;
+        for (String serverName : serverNames) {
+            if (serverName == null || serverName.isBlank()) {
+                continue;
+            }
+            try {
+                current.getToolkit().removeMcpClient(serverName).block(Duration.ofSeconds(3));
+            } catch (RuntimeException exception) {
+                if (failure == null) {
+                    failure = new IllegalStateException("mcp_tools_config_close_failed", exception);
+                } else {
+                    failure.addSuppressed(exception);
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
     /** Immutable composition values for the AgentScope Harness build. */
     public record Config(String agentName, String agentId, String systemPrompt,
                          int maxIters, int maxContextTokens) {
@@ -276,6 +319,28 @@ public final class HarnessFactory {
                 throw new IllegalArgumentException(field + " is blank or too long");
             }
             return normalized;
+        }
+    }
+
+    /**
+     * Keeps the one Harness toolkit instance shared across AgentScope's two build-time copies.
+     *
+     * <p>AgentScope's default {@link Toolkit#copy()} deliberately copies tool registrations but
+     * not the private MCP-client lifecycle map.  Harness registers {@code tools.json} servers
+     * after the first copy and {@code ReActAgent.Builder} copies once more, so using the default
+     * copy would leave those upstream stdio clients unreachable during shutdown.  JA has one
+     * Harness per graph and disables subagent creation, therefore sharing this single toolkit is
+     * the smallest adapter that preserves AgentScope's tool/skill/permission implementation and
+     * makes its existing MCP close API authoritative; it is not a second registry.</p>
+     */
+    private static final class JaHarnessToolkit extends Toolkit {
+        /**
+         * Returns this graph-owned toolkit so MCP registrations and their lifecycle manager stay
+         * attached to the Toolkit that the Harness ultimately exposes.
+         */
+        @Override
+        public Toolkit copy() {
+            return this;
         }
     }
 }

@@ -9,15 +9,23 @@ import io.agentscope.core.tool.Toolkit;
 import io.agentscope.core.tool.mcp.McpClientBuilder;
 import io.agentscope.core.tool.mcp.McpClientWrapper;
 import io.agentscope.core.tool.mcp.McpSyncClientWrapper;
+import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
 import io.agentscope.harness.agent.tools.McpServerConfig;
+import io.agentscope.harness.agent.tools.ToolsConfig;
+import io.agentscope.harness.agent.tools.ToolsConfigLoader;
+import io.agentscope.harness.agent.workspace.WorkspaceManager;
 import io.modelcontextprotocol.client.McpClient;
 import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.spec.McpSchema;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -88,6 +96,46 @@ public final class McpRuntime implements AutoCloseable {
     /** Exposes the upstream Toolkit so Harness owns MCP tool discovery and calls. */
     public Toolkit toolkit() {
         return toolkit;
+    }
+
+    /**
+     * Rejects a profile/tools.json server-name overlap before either AgentScope transport starts.
+     *
+     * <p>The workspace config is parsed by AgentScope's own {@link ToolsConfigLoader}; this
+     * method only projects its server-name keys for the composition-root atomicity check. A
+     * null filesystem intentionally preserves the upstream local-disk fallback and is useful for
+     * callers that only have a normal workspace path. The existing stable MCP-unavailable error
+     * keeps the wire contract small while ensuring no conflicting child can be started. The
+     * returned names let the composition root close the clients that AgentScope registers on its
+     * Harness-owned Toolkit; the graph-owned adapter keeps the upstream lifecycle map reachable
+     * through normal Toolkit close semantics.</p>
+     *
+     * @return the server names loaded from {@code tools.json}, or an empty set when it is absent
+     */
+    public static Set<String> rejectProfileToolsConfigNameConflicts(
+            Path workspace, AbstractFilesystem filesystem, Collection<String> profileServerNames) {
+        Objects.requireNonNull(workspace, "workspace");
+        Set<String> profileNames = new LinkedHashSet<>();
+        for (String name : profileServerNames == null ? List.<String>of() : profileServerNames) {
+            if (name != null && !name.isBlank()) {
+                profileNames.add(name);
+            }
+        }
+        try (WorkspaceManager workspaceManager = new WorkspaceManager(
+                workspace, filesystem, null, null)) {
+            Set<String> configuredNames = ToolsConfigLoader.load(workspaceManager)
+                    .map(ToolsConfig::getMcpServers)
+                    .map(Map::keySet)
+                    .orElseGet(Set::of);
+            if (!profileNames.isEmpty()) {
+                for (String name : configuredNames) {
+                    if (profileNames.contains(name)) {
+                        throw new IllegalStateException("mcp_server_unavailable");
+                    }
+                }
+            }
+            return Set.copyOf(configuredNames);
+        }
     }
 
     /**

@@ -33,6 +33,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.UUID;
@@ -49,6 +50,7 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
     private final AgentScopeTurnRuntime turns;
     private final McpRuntime mcpRuntime;
     private final Toolkit toolkit;
+    private final Set<String> toolsConfigServerNames;
     private final ServerInstanceId serverInstanceId;
     private final String wireProfileRevision;
     private final String workspaceTrust;
@@ -60,6 +62,7 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
                                    JaSkillSources skillSources,
                                    HarnessFactory factory, AgentScopeTurnRuntime turns,
                                    McpRuntime mcpRuntime, Toolkit toolkit,
+                                   Set<String> toolsConfigServerNames,
                                    ServerInstanceId serverInstanceId,
                                    String wireProfileRevision, String workspaceTrust,
                                    String profileAccessMode, boolean ownsPersistence) {
@@ -70,6 +73,7 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
         this.turns = turns;
         this.mcpRuntime = mcpRuntime;
         this.toolkit = toolkit;
+        this.toolsConfigServerNames = Set.copyOf(toolsConfigServerNames);
         this.serverInstanceId = serverInstanceId;
         this.wireProfileRevision = wireProfileRevision;
         this.workspaceTrust = workspaceTrust;
@@ -137,7 +141,8 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
      * Opens one generation after freezing selected MCP definitions and
      * connecting every server on the shared AgentScope Toolkit.  A Harness is
      * created only after all clients are READY, so one failed server cannot
-     * leave a half-registered agent graph visible to the host.
+     * leave a half-registered agent graph visible to the host.  Profile and
+     * workspace tools.json names are checked before either source starts.
      */
     public static AgentScopeRuntimeGraph open(Path workspace, Path dataDirectory,
                                               ServerInstanceId serverInstanceId,
@@ -189,8 +194,12 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
             // Validate and activate selected revisions before the Harness graph is built; the
             // AgentScope repositories remain live and own parsing, merge precedence, and loading.
             skillSources.freeze(skillRevisions == null ? List.of() : skillRevisions);
-            Toolkit toolkit = new Toolkit();
+            Toolkit toolkit = HarnessFactory.newToolkit();
             List<McpActivation> frozenMcp = freezeMcpActivations(mcpActivations);
+            Set<String> toolsConfigServerNames = McpRuntime
+                    .rejectProfileToolsConfigNameConflicts(root, filesystem,
+                            frozenMcp.stream().map(activation -> activation.definition().revision())
+                                    .toList());
             Map<String, String> secretMarkers = new HashMap<>();
             try {
                 for (McpActivation activation : frozenMcp) {
@@ -219,7 +228,7 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
                 AgentScopeTurnRuntime turns = new AgentScopeTurnRuntime(
                         factory.createEngine(model), serverInstanceId);
                 return new AgentScopeRuntimeGraph(persistence, filesystem, skillSources, factory, turns,
-                        mcpRuntime, toolkit, serverInstanceId, wireProfileRevision,
+                        mcpRuntime, toolkit, toolsConfigServerNames, serverInstanceId, wireProfileRevision,
                         workspaceTrust, profileAccessMode, existingPersistence == null);
             } finally {
                 // The official MCP transports have consumed credentials; no failure path may
@@ -464,6 +473,15 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
             turns.close();
         } catch (RuntimeException exception) {
             failure = exception;
+        }
+        try {
+            factory.closeToolsConfigMcpClients(toolsConfigServerNames);
+        } catch (RuntimeException exception) {
+            if (failure == null) {
+                failure = exception;
+            } else {
+                failure.addSuppressed(exception);
+            }
         }
         failure = closeResource(mcpRuntime, failure);
         failure = closeResource(filesystem, failure);
