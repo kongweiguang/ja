@@ -8,6 +8,19 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { FileTree } from "./FileTree";
 import { Workbench } from "./Workbench";
 
+// Workbench owns lazy loading; TerminalPanel owns xterm's canvas/PTY setup
+// and is covered by its focused suite, so this shell test keeps jsdom focused
+// on tab routing without requiring a canvas implementation.
+vi.mock("../terminal/TerminalPanel", () => ({
+  TerminalPanel: ({ ariaLabel = "工作区终端" }: { ariaLabel?: string }) => <div role="application" aria-label={ariaLabel} />,
+}));
+vi.mock("../editor/CodeViewer", () => ({
+  CodeViewer: ({ filePath }: { filePath: string }) => <div aria-label={`只读文件 ${filePath}`} />,
+}));
+vi.mock("../editor/DiffViewer", () => ({
+  DiffViewer: ({ filePath }: { filePath: string }) => <div aria-label={`只读 Diff ${filePath}`} />,
+}));
+
 afterEach(() => cleanup());
 
 describe("Workbench shell", () => {
@@ -40,6 +53,40 @@ describe("Workbench shell", () => {
     expect(screen.getByText("main")).toBeInTheDocument();
     expect(screen.getByText("src/App.tsx")).toBeInTheDocument();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  /** Exercise every right-pane entry point so a tab can never silently lose
+   * its panel wiring while the individual feature owns its own behavior. */
+  it("switches Files, Diff, Terminal, and Preview through accessible tabs", async () => {
+    const user = userEvent.setup();
+    render(<Workbench
+      diff={{ filePath: "src/App.tsx", original: "const before = true;", modified: "const after = true;" }}
+      terminal={{ initialText: "ready\n" }}
+      preview={{ url: "https://example.com/docs" }}
+    />);
+
+    const tablist = screen.getByRole("tablist", { name: "工作台面板" });
+    expect(tablist).toBeInTheDocument();
+    for (const tabName of ["Files", "Diff", "Terminal", "Preview"] as const) {
+      const tab = screen.getByRole("tab", { name: tabName });
+      expect(tab).toHaveAttribute("aria-controls");
+      await user.click(tab);
+      const panel = await screen.findByRole("tabpanel", { name: tabName });
+      expect(panel).toBeVisible();
+      expect(tab).toHaveAttribute("aria-selected", "true");
+      if (tabName === "Diff") {
+        expect(await screen.findByLabelText("只读 Diff src/App.tsx")).toBeVisible();
+      }
+      if (tabName === "Terminal") {
+        expect(await screen.findByRole("application", { name: "工作区终端" })).toBeVisible();
+      }
+      if (tabName === "Preview") {
+        expect(screen.getByText("https://example.com")).toBeVisible();
+      }
+    }
+
+    await user.click(screen.getByRole("tab", { name: "Files" }));
+    expect(screen.getByRole("tabpanel", { name: "Files" })).toBeVisible();
   });
 });
 

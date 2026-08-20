@@ -115,6 +115,36 @@ describe("ChatTimeline", () => {
     await waitFor(() => expect(scroll).toHaveProperty("scrollTop", 100));
   });
 
+  /** Pinning to the bottom is the only case where a streamed row should move
+   * the viewport; the virtualizer remains responsible for the actual offset. */
+  it("follows streamed text in the final row while the user is already at the bottom", async () => {
+    const items = [
+      baseItem({ itemId: "item_1", text: "第一段" }),
+      baseItem({ itemId: "item_2", final: true, text: "第二段" }),
+    ];
+    const { container, rerender } = render(<ChatTimeline items={items} />);
+    const scroll = container.querySelector(".ja-chat-timeline__scroll");
+    expect(scroll).not.toBeNull();
+    if (scroll === null) return;
+
+    const scrollTo = vi.fn();
+    Object.defineProperties(scroll, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 400 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+      scrollTo: { configurable: true, value: scrollTo },
+    });
+    fireEvent.scroll(scroll);
+    scrollTo.mockClear();
+    rerender(<ChatTimeline items={items.map((item, index) => index === 1 ? { ...item, text: "流式尾部" } : item)} />);
+
+    await waitFor(() => expect(scrollTo).toHaveBeenCalled());
+    // Let TanStack Virtual flush its debounced measurement before cleanup;
+    // otherwise React 19 can receive one late observer notification after
+    // jsdom has already torn down the window.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+
   it("opens safe https links only through the typed callback", async () => {
     const user = userEvent.setup();
     const onOpenLink = vi.fn();

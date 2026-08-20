@@ -95,6 +95,18 @@ describe("JA Settings feature", () => {
     expect(payload).not.toHaveProperty("stream");
   });
 
+  /** Save failures must remain actionable without presenting a local-only
+   * profile as persisted; the sidecar remains the source of truth. */
+  it("surfaces model save failures and keeps the draft available", async () => {
+    const user = userEvent.setup();
+    const onSaveProfile = vi.fn(async () => { throw new Error("offline"); });
+    render(<Settings snapshot={fixture} ports={{ onSaveProfile }} />);
+    await user.click(screen.getByRole("button", { name: "保存模型" }));
+    expect(await screen.findByText("保存失败，请检查 sidecar 状态后重试。", { exact: false })).toBeVisible();
+    expect(screen.getByLabelText("模型名称")).toHaveValue("claude-sonnet-4-20250514");
+    expect(screen.getByRole("button", { name: "保存模型" })).toBeEnabled();
+  });
+
   it("rejects unsafe credential and URL values with linked accessible errors", async () => {
     const user = userEvent.setup();
     const onSaveProfile = vi.fn(async (profile: ModelProfileSave) => { void profile; });
@@ -138,6 +150,22 @@ describe("JA Settings feature", () => {
     expect(await within(review as HTMLElement).findByText("加载失败")).toBeInTheDocument();
   });
 
+  /** A failed enable request must not drift the optimistic switch away from
+   * the persisted AgentScope skill projection. */
+  it("surfaces skill toggle failures and retains the previous enabled state", async () => {
+    const user = userEvent.setup();
+    const onToggleSkill = vi.fn(async () => { throw new Error("offline"); });
+    render(<Settings snapshot={fixture} ports={{ onToggleSkill }} />);
+    await user.click(screen.getByRole("tab", { name: "Skills" }));
+    const review = screen.getByRole("heading", { name: "Review checklist" }).closest("article");
+    expect(review).not.toBeNull();
+    const toggle = within(review as HTMLElement).getByRole("switch", { name: "已启用" });
+    await user.click(toggle);
+    expect(onToggleSkill).toHaveBeenCalledWith("skill_user_review", false);
+    expect(await screen.findByText("Skill 状态修改失败。", { exact: false })).toBeVisible();
+    expect(toggle).toBeChecked();
+  });
+
   it("uses RHF submitting state and maps MCP without timeout/header/retry fields", async () => {
     const user = userEvent.setup();
     let resolveSave: (() => void) | undefined;
@@ -154,6 +182,22 @@ describe("JA Settings feature", () => {
     expect(onSaveMcp.mock.calls[0]?.[0]).not.toHaveProperty("timeoutMs");
     expect(onSaveMcp.mock.calls[0]?.[0]).not.toHaveProperty("customHeaderName");
     resolveSave?.();
+  });
+
+  /** MCP health errors should change only the runtime projection and leave
+   * the saved server entry available for a retry. */
+  it("surfaces MCP test failures and marks the server unhealthy", async () => {
+    const user = userEvent.setup();
+    const onTestMcp = vi.fn(async () => { throw new Error("offline"); });
+    render(<Settings snapshot={fixture} ports={{ onTestMcp }} />);
+    await user.click(screen.getByRole("tab", { name: "MCP Tools" }));
+    const server = screen.getByRole("heading", { name: "Local docs" }).closest("article");
+    expect(server).not.toBeNull();
+    await user.click(within(server as HTMLElement).getByRole("button", { name: "测试" }));
+    expect(onTestMcp).toHaveBeenCalledWith("mcp_local_docs");
+    expect(await screen.findByText("Local docs 测试失败。", { exact: false })).toBeVisible();
+    expect(within(server as HTMLElement).getByText("错误")).toBeVisible();
+    expect(within(server as HTMLElement).getByText("测试失败。", { exact: false })).toBeVisible();
   });
 
   it("validates Streamable HTTP URL and stdio secret markers", async () => {
