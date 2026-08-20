@@ -1,0 +1,303 @@
+# @author kongweiguang
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: JA Native Agent matrix
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/native-agent.yml"
+      - "agent/**"
+      - "scripts/native/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/native-agent.yml"
+      - "agent/**"
+      - "scripts/native/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ja-native-agent-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-agent:
+    name: Native Agent (${{ matrix.platform }} / ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            arch: x86_64
+            targetTriple: x86_64-pc-windows-msvc
+            runner: windows-2022
+            nikSuffix: windows-amd64
+            nikSha256: 8F8DBA29A26B0436C8A8A599F9C1A9C46929C417790C85788C2CD99DAF212B7A
+          - platform: macos
+            arch: x86_64
+            targetTriple: x86_64-apple-darwin
+            runner: macos-26-intel
+            nikSuffix: macos-amd64
+            nikSha256: 0BC3B9B18ED89275FA3992D25863310734EEED0C79673210708C44369B835310
+          - platform: macos
+            arch: arm64
+            targetTriple: aarch64-apple-darwin
+            runner: macos-26
+            nikSuffix: macos-aarch64
+            nikSha256: 8C74D049FA2B83A6A23F6981293EC956E7195C5FF546B8EB0DD20DF0BD92A99B
+    env:
+      NIK_VERSION: 25.0.3+2
+      NIK_JAVA_VERSION: 25.0.3+12
+      NIK_URL: https://download.bell-sw.com/vm/25.0.3/bellsoft-liberica-vm-openjdk25.0.3%2B12-25.0.3%2B2-${{ matrix.nikSuffix }}.zip
+      NIK_SHA256: ${{ matrix.nikSha256 }}
+
+    steps:
+      - name: Checkout exact event commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Verify source commit and native contract (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw 'checkout commit differs from event commit' }
+          if (-not (Select-String -LiteralPath 'agent/pom.xml' -Pattern '<buildArg>--no-fallback</buildArg>' -Quiet)) { throw 'Native Image fallback is not explicitly disabled' }
+          $evidence = Join-Path $env:RUNNER_TEMP 'ja-native-evidence'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          "JA_NATIVE_EVIDENCE=$evidence" | Add-Content -Path $env:GITHUB_ENV
+          python --version
+
+      - name: Verify source commit and native contract (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          grep -Fq '<buildArg>--no-fallback</buildArg>' agent/pom.xml
+          evidence="$RUNNER_TEMP/ja-native-evidence"
+          mkdir -p "$evidence"
+          printf 'JA_NATIVE_EVIDENCE=%s\n' "$evidence" >> "$GITHUB_ENV"
+          python3 --version
+          test "$(uname -m)" = "${{ matrix.arch }}"
+
+      - name: Install pinned Liberica NIK (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'liberica-nik.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'liberica-nik'
+          Invoke-WebRequest -Uri $env:NIK_URL -OutFile $archive
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($actual -ne $env:NIK_SHA256) { throw "NIK checksum mismatch: $actual" }
+          if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
+          $nik = Get-ChildItem -LiteralPath $extract -Directory -Recurse |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'bin/native-image.cmd') } |
+            Select-Object -First 1
+          if ($null -eq $nik) { throw 'Liberica NIK native-image.cmd was not found' }
+          "JAVA_HOME=$($nik.FullName)" | Add-Content -Path $env:GITHUB_ENV
+          "NIK_HOME=$($nik.FullName)" | Add-Content -Path $env:GITHUB_ENV
+          $nik.FullName + '\bin' | Add-Content -Path $env:GITHUB_PATH
+
+      - name: Install pinned Liberica NIK (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/liberica-nik.zip"
+          extract="$RUNNER_TEMP/liberica-nik"
+          curl --fail --location --retry 3 --retry-delay 2 --proto '=https' --tlsv1.2 "$NIK_URL" -o "$archive"
+          printf '%s  %s\n' "$NIK_SHA256" "$archive" | shasum -a 256 --check
+          rm -rf "$extract"
+          mkdir -p "$extract"
+          unzip -q "$archive" -d "$extract"
+          nik_home="$(find "$extract" -path '*/Contents/Home/bin/native-image' -print -quit | sed 's#/bin/native-image$##')"
+          test -n "$nik_home"
+          test -x "$nik_home/bin/java"
+          test -x "$nik_home/bin/native-image"
+          printf 'JAVA_HOME=%s\n' "$nik_home" >> "$GITHUB_ENV"
+          printf 'NIK_HOME=%s\n' "$nik_home" >> "$GITHUB_ENV"
+          printf '%s/bin\n' "$nik_home" >> "$GITHUB_PATH"
+
+      - name: Verify pinned toolchain (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((Get-Command native-image.cmd).Source -notlike "$env:NIK_HOME*") { throw 'native-image is not from pinned NIK' }
+          java -version 2>&1 | Tee-Object -FilePath (Join-Path $env:JA_NATIVE_EVIDENCE 'java-version.txt')
+          native-image.cmd --version | Tee-Object -FilePath (Join-Path $env:JA_NATIVE_EVIDENCE 'native-image-version.txt')
+          mvn.cmd --version | Tee-Object -FilePath (Join-Path $env:JA_NATIVE_EVIDENCE 'maven-version.txt')
+          Select-String -LiteralPath (Join-Path $env:JA_NATIVE_EVIDENCE 'java-version.txt') -Pattern '25.0.3' -Quiet
+          Select-String -LiteralPath (Join-Path $env:JA_NATIVE_EVIDENCE 'native-image-version.txt') -Pattern '25.0.3' -Quiet
+
+      - name: Verify pinned toolchain (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(command -v native-image)" = "$NIK_HOME/bin/native-image"
+          java -version 2>&1 | tee "$JA_NATIVE_EVIDENCE/java-version.txt"
+          native-image --version | tee "$JA_NATIVE_EVIDENCE/native-image-version.txt"
+          mvn --version | tee "$JA_NATIVE_EVIDENCE/maven-version.txt"
+          grep -Fq '25.0.3' "$JA_NATIVE_EVIDENCE/java-version.txt"
+          grep -Fq '25.0.3' "$JA_NATIVE_EVIDENCE/native-image-version.txt"
+
+      - name: Run Java unit tests (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: mvn.cmd -B -ntp -f agent/pom.xml test
+
+      - name: Run Java unit tests (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: mvn -B -ntp -f agent/pom.xml test
+
+      - name: Generate CycloneDX SBOM (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: mvn.cmd -B -ntp -f agent/pom.xml org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom -DskipTests -DoutputFormat=json -DoutputName=ja-agent -DoutputDirectory="$env:JA_NATIVE_EVIDENCE"
+
+      - name: Generate CycloneDX SBOM (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: mvn -B -ntp -f agent/pom.xml org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom -DskipTests -DoutputFormat=json -DoutputName=ja-agent -DoutputDirectory="$JA_NATIVE_EVIDENCE"
+
+      - name: Build Native Image agent (Windows)
+        if: matrix.platform == 'windows'
+        shell: cmd
+        run: |
+          @echo on
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL exit /b 1
+          call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -arch=x64
+          call mvn.cmd -B -ntp -f agent/pom.xml -Pnative -DskipTests package
+          if not exist agent\target\ja.exe exit /b 1
+          dumpbin /headers agent\target\ja.exe | findstr /I /C:"machine (x64)"
+
+      - name: Build Native Image agent (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mvn -B -ntp -f agent/pom.xml -Pnative -DskipTests package
+          test -x agent/target/ja
+          file agent/target/ja | tee "$JA_NATIVE_EVIDENCE/file.txt"
+          grep -Fq '${{ matrix.arch }}' "$JA_NATIVE_EVIDENCE/file.txt"
+          otool -L agent/target/ja | tee "$JA_NATIVE_EVIDENCE/otool.txt"
+          if grep -Eiq 'java|jre|jdk' "$JA_NATIVE_EVIDENCE/otool.txt"; then
+            echo 'Native Image executable links to a JVM runtime' >&2
+            exit 1
+          fi
+
+      - name: Run real production startup/shutdown smoke (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $data = Join-Path $env:RUNNER_TEMP 'JA Native Agent\unicode 空格 data'
+          python -B scripts/native/run-sidecar-smoke.py --executable agent/target/ja.exe --data-dir $data --output (Join-Path $env:JA_NATIVE_EVIDENCE 'smoke.json')
+
+      - name: Run real production startup/shutdown smoke (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          data="$RUNNER_TEMP/JA Native Agent/unicode 空格 data"
+          python3 -B scripts/native/run-sidecar-smoke.py --executable agent/target/ja --data-dir "$data" --output "$JA_NATIVE_EVIDENCE/smoke.json"
+
+      - name: Write checksum and build report (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -B scripts/native/make-build-report.py --artifact agent/target/ja.exe --sbom (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-agent.json') --smoke (Join-Path $env:JA_NATIVE_EVIDENCE 'smoke.json') --output (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') --checksum-output (Join-Path $env:JA_NATIVE_EVIDENCE 'ja.exe.sha256') --platform windows --arch x86_64 --runner windows-2022 --source-commit $env:GITHUB_SHA --nik-version $env:NIK_VERSION --nik-java-version $env:NIK_JAVA_VERSION --nik-sha256 $env:NIK_SHA256 --no-fallback
+
+      - name: Write checksum and build report (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/native/make-build-report.py --artifact agent/target/ja --sbom "$JA_NATIVE_EVIDENCE/ja-agent.json" --smoke "$JA_NATIVE_EVIDENCE/smoke.json" --output "$JA_NATIVE_EVIDENCE/build-report.json" --checksum-output "$JA_NATIVE_EVIDENCE/ja.sha256" --platform macos --arch '${{ matrix.arch }}' --runner '${{ matrix.runner }}' --source-commit "$GITHUB_SHA" --nik-version "$NIK_VERSION" --nik-java-version "$NIK_JAVA_VERSION" --nik-sha256 "$NIK_SHA256" --no-fallback
+
+      - name: Stage Tauri sidecar resource (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
+          python -B scripts/native/stage-sidecar.py --artifact agent/target/ja.exe --output-dir $stage --target-triple '${{ matrix.targetTriple }}' --platform windows --arch '${{ matrix.arch }}' --source-commit $env:GITHUB_SHA --build-report (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json')
+
+      - name: Stage Tauri sidecar resource (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/ja-native-stage"
+          python3 -B scripts/native/stage-sidecar.py --artifact agent/target/ja --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$GITHUB_SHA" --build-report "$JA_NATIVE_EVIDENCE/build-report.json"
+
+      - name: Reject secret markers in bounded evidence (Windows)
+        if: always() && matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path -LiteralPath $env:JA_NATIVE_EVIDENCE) {
+            $matches = Get-ChildItem -LiteralPath $env:JA_NATIVE_EVIDENCE -File -Recurse |
+              Select-String -Pattern 'api[_ -]?key|bearer|sk-[a-z0-9]|github_token'
+            if ($null -ne $matches) { throw 'native evidence contains a credential marker' }
+          }
+
+      - name: Reject secret markers in bounded evidence (macOS)
+        if: always() && matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d "$JA_NATIVE_EVIDENCE" ] && grep -Eiq 'api[_ -]?key|bearer|sk-[a-z0-9]|github_token' "$JA_NATIVE_EVIDENCE"; then
+            echo 'native evidence contains a credential marker' >&2
+            exit 1
+          fi
+
+      - name: Publish build summary (Windows)
+        if: always() && matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json')) {
+            Get-Content -Raw (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          } else {
+            'Native build report was not produced.' | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Publish build summary (macOS)
+        if: always() && matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "$JA_NATIVE_EVIDENCE/build-report.json" ]; then
+            cat "$JA_NATIVE_EVIDENCE/build-report.json" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Native build report was not produced.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload native build evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ja-native-agent-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            agent/target/ja
+            agent/target/ja.exe
+            ${{ runner.temp }}/ja-native-evidence
+            ${{ runner.temp }}/ja-native-stage
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 7
