@@ -363,6 +363,24 @@ jobs:
           }
           if (Test-Path -LiteralPath $target) { throw 'generated Windows sidecar cleanup failed' }
 
+      - name: Run unsigned Windows installer install/launch/uninstall smoke
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Reuse the checked-in installer harness so the CI evidence covers the real
+          # NSIS output, not only the bundle directory.  Signing remains a separate gate.
+          $installers = @(Get-ChildItem -LiteralPath 'src-tauri/target/release/bundle/nsis' -Filter '*.exe' -File | Sort-Object Name)
+          if ($installers.Count -ne 1) { throw "Expected one NSIS installer, found $($installers.Count)" }
+          $output = Join-Path $env:JA_NATIVE_EVIDENCE 'installer-smoke.json'
+          & pwsh -NoProfile -File 'scripts/native/run-windows-installer-smoke.ps1' `
+            -Installer $installers[0].FullName `
+            -Output $output `
+            -SourceCommit $env:GITHUB_SHA `
+            -RequireUnsigned
+          if ($LASTEXITCODE -ne 0) { throw "Windows installer smoke failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw 'installer smoke evidence is missing' }
+
       - name: Run unsigned Tauri DMG bundle smoke (macOS)
         if: matrix.platform == 'macos'
         shell: bash
