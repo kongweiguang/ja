@@ -9,6 +9,7 @@ on:
       - ".github/workflows/native-agent.yml"
       - "agent/**"
       - "scripts/native/**"
+      - "scripts/release/**"
       - "src-tauri/**"
       - "src/**"
       - "public/**"
@@ -20,10 +21,13 @@ on:
       - "tsconfig*.json"
   push:
     branches: [main]
+    tags:
+      - 'v*'
     paths:
       - ".github/workflows/native-agent.yml"
       - "agent/**"
       - "scripts/native/**"
+      - "scripts/release/**"
       - "src-tauri/**"
       - "src/**"
       - "public/**"
@@ -34,6 +38,12 @@ on:
       - "vite.config.*"
       - "tsconfig*.json"
   workflow_dispatch:
+    inputs:
+      release:
+        description: 'Require real Windows signing and macOS notarization credentials'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -76,6 +86,9 @@ jobs:
             nikSuffix: macos-aarch64
             nikSha256: 8C74D049FA2B83A6A23F6981293EC956E7195C5FF546B8EB0DD20DF0BD92A99B
     env:
+      # Tags and an explicitly requested dispatch are the only release paths. A release path
+      # must pass the credential gates below; ordinary main/PR runs remain unsigned smoke.
+      JA_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release == true) }}
       NIK_VERSION: 25.0.3+2
       NIK_JAVA_VERSION: 25.0.3+12
       NIK_URL: https://download.bell-sw.com/vm/25.0.3/bellsoft-liberica-vm-openjdk25.0.3%2B12-25.0.3%2B2-${{ matrix.nikSuffix }}.zip
@@ -112,6 +125,42 @@ jobs:
           printf 'JA_NATIVE_EVIDENCE=%s\n' "$evidence" >> "$GITHUB_ENV"
           python3 --version
           test "$(uname -m)" = "${{ matrix.arch }}"
+
+      - name: Prepare Windows release signing (fail closed)
+        if: matrix.platform == 'windows' && env.JA_RELEASE == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:RUNNER_TEMP 'ja-windows-signing'
+          pwsh -NoProfile -File scripts/release/prepare-windows-signing.ps1 `
+            -OutputDirectory $output `
+            -EnvironmentFile $env:GITHUB_ENV
+          if ($LASTEXITCODE -ne 0) { throw "Windows signing preparation failed: exit=$LASTEXITCODE" }
+
+      - name: Require macOS release signing and notarization credentials (fail closed)
+        if: matrix.platform == 'macos' && env.JA_RELEASE == 'true'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "Missing required macOS release secret: $name" >&2
+              exit 1
+            fi
+          done
+          printf 'JA_MACOS_RELEASE_SIGNING=1\n' >> "$GITHUB_ENV"
 
       - name: Install pinned pnpm
         uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
@@ -335,7 +384,7 @@ jobs:
           python3 -B scripts/native/stage-sidecar.py --artifact agent/target/ja --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$GITHUB_SHA" --build-report "$JA_NATIVE_EVIDENCE/build-report.json"
 
       - name: Run unsigned Tauri NSIS bundle smoke (Windows)
-        if: matrix.platform == 'windows'
+        if: matrix.platform == 'windows' && env.JA_RELEASE != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -363,8 +412,64 @@ jobs:
           }
           if (Test-Path -LiteralPath $target) { throw 'generated Windows sidecar cleanup failed' }
 
+      - name: Build signed Tauri NSIS bundle (Windows)
+        if: matrix.platform == 'windows' && env.JA_RELEASE == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
+          $source = Join-Path $stage 'sidecars/ja-agent-${{ matrix.targetTriple }}.exe'
+          $sourceManifest = Join-Path $stage 'sidecar-manifest.json'
+          $sidecars = Join-Path $PWD 'src-tauri/sidecars'
+          $target = Join-Path $sidecars 'ja-agent-${{ matrix.targetTriple }}.exe'
+          $evidence = Join-Path $env:RUNNER_TEMP 'ja-tauri-bundle-evidence'
+          New-Item -ItemType Directory -Force -Path $sidecars,$evidence | Out-Null
+          try {
+            if (-not (Test-Path -LiteralPath $source)) { throw 'staged Windows sidecar is missing' }
+            if (-not (Test-Path -LiteralPath $sourceManifest)) { throw 'staged sidecar manifest is missing' }
+            if (Test-Path -LiteralPath $target) { throw 'src-tauri/sidecars already contains the target sidecar' }
+            if ([string]::IsNullOrWhiteSpace($env:JA_TAURI_SIGNING_CONFIG)) { throw 'Tauri signing overlay is missing' }
+            Copy-Item -LiteralPath $source -Destination $target
+            '{"noSign":false,"signingStatus":"required","notarizationStatus":"not-applicable","command":"pnpm exec tauri build --ci --config <ephemeral-overlay> --bundles nsis"}' | Set-Content -LiteralPath (Join-Path $evidence 'bundle-contract.json') -Encoding utf8NoBOM
+            pnpm exec tauri build --ci --config $env:JA_TAURI_SIGNING_CONFIG --bundles nsis
+            if ($LASTEXITCODE -ne 0) { throw "Signed Tauri NSIS bundle failed with exit code $LASTEXITCODE" }
+
+            $files = @(Get-ChildItem -LiteralPath 'src-tauri/target/release/bundle/nsis' -File -Recurse | Where-Object { $_.Extension -ieq '.exe' } | Sort-Object FullName)
+            if ($files.Count -eq 0) { throw 'Signed NSIS bundle contains no executable files' }
+            $entries = @(
+              foreach ($file in $files) {
+                $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+                if ($signature.Status -ne 'Valid') { throw "Unsigned or invalid executable in release bundle: $($file.Name) status=$($signature.Status)" }
+                & $env:TAURI_WINDOWS_SIGNTOOL_PATH verify /pa /all /tw $file.FullName 1>$null 2>$null
+                if ($LASTEXITCODE -ne 0) { throw "Authenticode timestamp verification failed: $($file.Name)" }
+                [ordered]@{
+                  fileName = $file.Name
+                  relativePath = [IO.Path]::GetRelativePath((Resolve-Path 'src-tauri/target/release/bundle/nsis').Path, $file.FullName)
+                  sizeBytes = [int64] $file.Length
+                  sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                  signingStatus = [string] $signature.Status
+                }
+              }
+            )
+            $report = [ordered]@{
+              schemaVersion = 1
+              product = 'JA'
+              sourceCommit = $env:GITHUB_SHA
+              target = [ordered]@{ platform = 'windows'; arch = '${{ matrix.arch }}'; bundle = 'nsis' }
+              build = [ordered]@{ noSign = $false; signingStatus = 'valid'; timestampVerification = 'passed'; notarizationStatus = 'not-applicable' }
+              sidecarManifest = $sourceManifest
+              artifacts = $entries
+            }
+            $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $evidence 'signed-bundle-manifest.json') -Encoding utf8NoBOM
+          } finally {
+            foreach ($path in @($target)) {
+              if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+            }
+          }
+          if (Test-Path -LiteralPath $target) { throw 'generated Windows sidecar cleanup failed' }
+
       - name: Run unsigned Windows installer install/launch/uninstall smoke
-        if: matrix.platform == 'windows'
+        if: matrix.platform == 'windows' && env.JA_RELEASE != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -381,8 +486,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Windows installer smoke failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw 'installer smoke evidence is missing' }
 
+      - name: Run signed Windows installer install/launch/uninstall smoke
+        if: matrix.platform == 'windows' && env.JA_RELEASE == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installers = @(Get-ChildItem -LiteralPath 'src-tauri/target/release/bundle/nsis' -Filter '*.exe' -File | Sort-Object Name)
+          if ($installers.Count -ne 1) { throw "Expected one NSIS installer, found $($installers.Count)" }
+          $output = Join-Path $env:JA_NATIVE_EVIDENCE 'installer-smoke.json'
+          & pwsh -NoProfile -File 'scripts/native/run-windows-installer-smoke.ps1' `
+            -Installer $installers[0].FullName `
+            -Output $output `
+            -SourceCommit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Signed Windows installer smoke failed with exit code $LASTEXITCODE" }
+          $record = Get-Content -Raw -LiteralPath $output | ConvertFrom-Json
+          if ($record.installer.signingStatus -ne 'Valid') { throw 'Signed installer smoke did not observe a valid Authenticode installer' }
+          foreach ($status in @($record.signing.installedBinaries)) {
+            if ($status -ne 'Valid') { throw "Installed executable is not Authenticode-valid: $status" }
+          }
+
       - name: Run unsigned Tauri DMG bundle smoke (macOS)
-        if: matrix.platform == 'macos'
+        if: matrix.platform == 'macos' && env.JA_RELEASE != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -408,6 +532,81 @@ jobs:
           trap - EXIT
           test ! -e "$target"
 
+      - name: Build and notarize signed Tauri DMG (macOS)
+        if: matrix.platform == 'macos' && env.JA_RELEASE == 'true'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/ja-native-stage"
+          source="$stage/sidecars/ja-agent-${{ matrix.targetTriple }}"
+          source_manifest="$stage/sidecar-manifest.json"
+          sidecars="src-tauri/sidecars"
+          target="$sidecars/ja-agent-${{ matrix.targetTriple }}"
+          evidence="$RUNNER_TEMP/ja-tauri-bundle-evidence"
+          mkdir -p "$sidecars" "$evidence"
+          cleanup() { rm -f -- "$target"; }
+          trap cleanup EXIT
+          test -f "$source"
+          test -f "$source_manifest"
+          test ! -e "$target"
+          cp -- "$source" "$target"
+          printf '%s\n' '{"noSign":false,"signingStatus":"required","notarizationStatus":"required","command":"pnpm exec tauri build --ci --bundles dmg"}' > "$evidence/bundle-contract.json"
+          pnpm exec tauri build --ci --bundles dmg
+          dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "$dmg"
+          xcrun stapler validate "$dmg"
+          mount_point="$RUNNER_TEMP/ja-release-dmg-mount"
+          rm -rf -- "$mount_point"
+          mkdir -p "$mount_point"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg" >/dev/null
+          detach() { hdiutil detach "$mount_point" >/dev/null || true; }
+          trap 'detach; cleanup' EXIT
+          app="$(find "$mount_point" -maxdepth 2 -type d -name '*.app' -print -quit)"
+          test -n "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          sidecar_root="$app/Contents/Resources/sidecars"
+          test -d "$sidecar_root"
+          while IFS= read -r -d '' sidecar; do
+            codesign --verify --deep --strict --verbose=2 "$sidecar"
+          done < <(find "$sidecar_root" -type f -print0)
+          spctl --assess --type execute --verbose=2 "$app"
+          python3 - "$evidence/signed-bundle-manifest.json" "$dmg" "$source_manifest" "$GITHUB_SHA" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          def digest(path: pathlib.Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          output, dmg, manifest, commit = map(pathlib.Path, sys.argv[1:])
+          report = {
+              'schemaVersion': 1,
+              'product': 'JA',
+              'sourceCommit': str(commit),
+              'target': {'platform': 'macos', 'arch': '${{ matrix.arch }}', 'bundle': 'dmg'},
+              'build': {'noSign': False, 'signingStatus': 'valid', 'notarizationStatus': 'stapled-and-validated'},
+              'sidecarManifest': str(manifest),
+              'artifacts': [{'fileName': dmg.name, 'sizeBytes': dmg.stat().st_size, 'sha256': digest(dmg), 'signingStatus': 'valid'}],
+          }
+          output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          PY
+          detach
+          trap - EXIT
+          cleanup
+          test ! -e "$target"
+
       - name: Reject secret markers in bounded evidence (Windows)
         if: always() && matrix.platform == 'windows'
         shell: pwsh
@@ -428,6 +627,21 @@ jobs:
             echo 'native evidence contains a credential marker' >&2
             exit 1
           fi
+
+      - name: Cleanup Windows signing material
+        if: always() && matrix.platform == 'windows' && env.JA_RELEASE == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if (-not [string]::IsNullOrWhiteSpace($env:JA_WINDOWS_CERT_THUMBPRINT)) {
+            Get-ChildItem -LiteralPath ("Cert:\CurrentUser\My\" + $env:JA_WINDOWS_CERT_THUMBPRINT) -ErrorAction SilentlyContinue |
+              Remove-Item -Force -ErrorAction SilentlyContinue
+          }
+          foreach ($path in @($env:JA_WINDOWS_CERT_PFX, $env:JA_TAURI_SIGNING_CONFIG)) {
+            if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path -LiteralPath $path)) {
+              Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            }
+          }
 
       - name: Publish build summary (Windows)
         if: always() && matrix.platform == 'windows'
@@ -450,27 +664,40 @@ jobs:
             echo 'Native build report was not produced.' >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Publish unsigned Tauri bundle summary (Windows)
+      - name: Publish Tauri bundle summary (Windows)
         if: always() && matrix.platform == 'windows'
         shell: pwsh
         run: |
-          $manifest = Join-Path $env:RUNNER_TEMP 'ja-tauri-bundle-evidence/tauri-bundle-manifest.json'
+          $name = if ($env:JA_RELEASE -eq 'true') { 'signed-bundle-manifest.json' } else { 'tauri-bundle-manifest.json' }
+          $manifest = Join-Path $env:RUNNER_TEMP ("ja-tauri-bundle-evidence/" + $name)
           if (Test-Path -LiteralPath $manifest) {
             Get-Content -Raw $manifest | Add-Content -Path $env:GITHUB_STEP_SUMMARY
           } else {
-            'Tauri bundle smoke did not produce a manifest; signing/notarization remain unverified.' | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            if ($env:JA_RELEASE -eq 'true') {
+              'Signed Tauri bundle evidence was not produced; release signing gate failed or was incomplete.' | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            } else {
+              'Unsigned Tauri bundle smoke did not produce a manifest; signing/notarization remain unverified.' | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            }
           }
 
-      - name: Publish unsigned Tauri bundle summary (macOS)
+      - name: Publish Tauri bundle summary (macOS)
         if: always() && matrix.platform == 'macos'
         shell: bash
         run: |
           set -euo pipefail
-          manifest="$RUNNER_TEMP/ja-tauri-bundle-evidence/tauri-bundle-manifest.json"
+          if [ "${JA_RELEASE:-false}" = 'true' ]; then
+            manifest="$RUNNER_TEMP/ja-tauri-bundle-evidence/signed-bundle-manifest.json"
+          else
+            manifest="$RUNNER_TEMP/ja-tauri-bundle-evidence/tauri-bundle-manifest.json"
+          fi
           if [ -f "$manifest" ]; then
             cat "$manifest" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo 'Tauri bundle smoke did not produce a manifest; signing/notarization remain unverified.' >> "$GITHUB_STEP_SUMMARY"
+            if [ "${JA_RELEASE:-false}" = 'true' ]; then
+              echo 'Signed Tauri bundle evidence was not produced; release signing gate failed or was incomplete.' >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo 'Unsigned Tauri bundle smoke did not produce a manifest; signing/notarization remain unverified.' >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
 
       - name: Upload native build evidence
