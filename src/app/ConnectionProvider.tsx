@@ -29,6 +29,10 @@ import {
   type TurnCancelResult,
   type TurnAccepted,
   type TurnStartInput,
+  type RuntimeQuery,
+  type RuntimeSettingsMethod,
+  type RuntimeSettingsParams,
+  type RuntimeSettingsResult,
 } from "@/ipc/runtime";
 import { useTimelineStore } from "@/stores/timelineStore";
 import type { BootState } from "./bootState";
@@ -43,6 +47,8 @@ export interface JaConnectionContextValue {
   submitTurn: (input: TurnStartInput) => Promise<TurnAccepted>;
   cancelTurn: (input: TurnCancelInput) => Promise<TurnCancelResult>;
   approvalRespond: (input: ApprovalResponseInput) => Promise<void>;
+  /** Reads the fixed Skills/MCP settings surface through the current Ready generation. */
+  queryRuntime: RuntimeQuery;
   acknowledgeRecovery: (reason: RecoveryReason) => Promise<RuntimeRecoveryState>;
 }
 
@@ -463,6 +469,41 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
     });
   }, [enqueueOperation, runtime]);
 
+  /**
+   * Serializes a settings query with lifecycle operations and rejects it when
+   * the Ready generation changes. This keeps an old MCP/Skills projection from
+   * being applied after a sidecar reconfigure without creating a second RPC
+   * registry in the frontend.
+   */
+  const queryRuntime: RuntimeQuery = useCallback(<M extends RuntimeSettingsMethod,>(
+    method: M,
+    params: RuntimeSettingsParams<M>,
+  ) => {
+    const generation = runtimeStateRef.current?.generation;
+    if (generation === undefined || generation <= 0 || bootRef.current.status !== "ready") {
+      return Promise.reject(new RuntimeHostError("RUNTIME_NOT_READY", "运行时尚未完成配置", true));
+    }
+    const query = runtime.query;
+    if (query === undefined) {
+      return Promise.reject(new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true));
+    }
+    // Params only contain bounded revisions for this surface; the key avoids
+    // duplicate clicks while never retaining endpoint or secret values.
+    const queryKey = `runtimeQuery:${method}:${JSON.stringify(params)}`;
+    const pending = enqueueOperation<RuntimeSettingsResult<M>>(
+      queryKey,
+      () => query.call(runtime, method, params) as Promise<RuntimeSettingsResult<M>>,
+    );
+    return pending.promise.then((result) => {
+      if (runtimeStateRef.current?.generation !== generation || bootRef.current.status !== "ready") {
+        throw new RuntimeHostError("RUNTIME_NOT_READY", "运行时状态已变化，请重试", true);
+      }
+      return result;
+    }).catch((error: unknown) => {
+      throw safeError(error);
+    });
+  }, [enqueueOperation, runtime]);
+
   /** Acknowledges exactly the recovery revision that the user saw. */
   const acknowledgeRecovery = useCallback((reason: RecoveryReason): Promise<RuntimeRecoveryState> => {
     const lifecycleEpoch = lifecycleEpochRef.current;
@@ -652,8 +693,9 @@ export function ConnectionProvider({ runtime: providedRuntime, children }: Conne
     submitTurn,
     cancelTurn,
     approvalRespond,
+    queryRuntime,
     acknowledgeRecovery,
-  }), [acknowledgeRecovery, approvalRespond, boot, cancelTurn, configureAndStart, lastEvent, recovery, runtimeState, stop, submitTurn]);
+  }), [acknowledgeRecovery, approvalRespond, boot, cancelTurn, configureAndStart, lastEvent, queryRuntime, recovery, runtimeState, stop, submitTurn]);
   return <JaConnectionContext.Provider value={value}>{children}</JaConnectionContext.Provider>;
 }
 

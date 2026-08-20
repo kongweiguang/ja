@@ -160,6 +160,21 @@ describe("RuntimeHost typed adapter", () => {
     });
   });
 
+  it("routes only the fixed Skills/MCP settings query methods", async () => {
+    const invoke = vi.fn(async (command: string) => {
+      if (command !== JA_RUNTIME_COMMANDS.query) return readyStatus;
+      return { skills: [{ skillRevision: "skill_fixture", name: "coding", scope: "builtin", enabled: true, status: "healthy" }] };
+    });
+    const bridge: RuntimeNativeBridge = {
+      invoke: invoke as RuntimeNativeBridge["invoke"],
+      listen: vi.fn(async () => () => undefined),
+    };
+    const adapter = new TauriRuntimeHostAdapter(bridge);
+    await expect(adapter.query?.("skill/list", {})).resolves.toMatchObject({ skills: [{ skillRevision: "skill_fixture" }] });
+    expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.query, { input: { method: "skill/list", params: {} } });
+    await expect(adapter.query?.("mcp/test", { mcpRevision: "C:\\private" } as never)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+  });
+
   it("rejects unknown configure fields and malformed native cancel results", async () => {
     const invoke = vi.fn(async (command: string) => {
       if (command === JA_RUNTIME_COMMANDS.turnCancel) {

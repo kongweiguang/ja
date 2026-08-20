@@ -15,6 +15,7 @@ use super::config::{
 };
 use super::history::HistoryMethod;
 use super::projection::{emit_frame, emit_status, frame_to_value};
+use super::settings_query::SettingsQueryMethod;
 use crate::agent_process::codec::RpcFrame;
 use crate::agent_process::{AgentClient, EventPump, Session, SessionEvent, SidecarSupervisor};
 use crate::settings::{CredentialPurpose, CredentialRef, CredentialVault, SecretError};
@@ -405,6 +406,11 @@ enum BridgeCommand {
     },
     History {
         method: HistoryMethod,
+        params: Value,
+        reply: Reply<Value>,
+    },
+    SettingsQuery {
+        method: SettingsQueryMethod,
         params: Value,
         reply: Reply<Value>,
     },
@@ -1312,6 +1318,20 @@ impl RuntimeBridge {
         })
     }
 
+    /// Sends one fixed Skills/MCP query through the same bounded actor lane as
+    /// history; mcp/test may answer only its purpose-bound secret request.
+    pub(crate) fn settings_query(
+        &self,
+        method: SettingsQueryMethod,
+        params: Value,
+    ) -> Result<Value, RuntimeCommandError> {
+        self.call(|reply| BridgeCommand::SettingsQuery {
+            method,
+            params,
+            reply,
+        })
+    }
+
     /// Enqueues a no-I/O probe through the production bounded command lane;
     /// its test-only shape cannot block on an unconsumed reply while proving
     /// the exact capacity boundary.
@@ -1836,6 +1856,19 @@ fn actor_loop(
                 reply,
             }) => {
                 let _ = reply.send(history_request_runtime(
+                    &context.config,
+                    &mut runtime,
+                    method,
+                    params,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::SettingsQuery {
+                method,
+                params,
+                reply,
+            }) => {
+                let _ = reply.send(settings_query_runtime(
                     &context.config,
                     &mut runtime,
                     method,
@@ -2594,6 +2627,60 @@ fn history_request_runtime(
         .supervisor
         .request(method.wire_name(), params, timeout)
         .map_err(|error| RuntimeCommandError::from_process(&error))?;
+    let value = frame_to_value(&response).map_err(|_| RuntimeCommandError::unavailable())?;
+    if let Some(error) = value.get("error") {
+        return Err(command_error_from_rpc(error));
+    }
+    value
+        .get("result")
+        .cloned()
+        .filter(Value::is_object)
+        .ok_or_else(RuntimeCommandError::unavailable)
+}
+
+/// Sends one allow-listed Skills/MCP request. The mcp/test branch keeps the
+/// existing secret resolver available while rejecting every other nested
+/// server request, so settings never become a generic RPC bridge.
+fn settings_query_runtime(
+    config: &LaunchConfig,
+    runtime: &mut Option<RunningRuntime>,
+    method: SettingsQueryMethod,
+    params: Value,
+    exit_control: &ExitControl,
+) -> Result<Value, RuntimeCommandError> {
+    let current = runtime
+        .as_mut()
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    if let Some(session) = current.supervisor.session_for_cancellation() {
+        exit_control.attach_session(session);
+    }
+    let _session_cancellation_guard = SessionCancellationGuard::new(exit_control);
+    let timeout = operation_timeout(config.request_timeout, exit_control)?;
+    let response = if method.needs_server_request_handler() {
+        current.supervisor.request_with_server_request_handler(
+            method.wire_name(),
+            params,
+            timeout,
+            |nested, frame| {
+                if frame.method() == Some("secret/resolve") {
+                    respond_secret_request(config, nested, &frame);
+                } else {
+                    let _ = nested.respond_error(
+                        frame.id(),
+                        -32_006,
+                        "method not found",
+                        "METHOD_NOT_FOUND",
+                        false,
+                    );
+                }
+            },
+        )
+    } else {
+        current
+            .supervisor
+            .request(method.wire_name(), params, timeout)
+    }
+    .map_err(|error| RuntimeCommandError::from_process(&error))?;
     let value = frame_to_value(&response).map_err(|_| RuntimeCommandError::unavailable())?;
     if let Some(error) = value.get("error") {
         return Err(command_error_from_rpc(error));

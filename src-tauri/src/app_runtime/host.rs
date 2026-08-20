@@ -11,6 +11,7 @@ use super::config::{
     TurnCancelResult, TurnStartInput, recovery_state,
 };
 use super::history::HistoryMethod;
+use super::settings_query::SettingsQueryMethod;
 use crate::workspace_read::{WorkspaceHandle, WorkspaceRegistry};
 use serde_json::Value;
 #[cfg(feature = "tauri-smoke")]
@@ -231,6 +232,34 @@ impl RuntimeHost {
             });
         }
         bridge.history_request(method, params)
+    }
+
+    /// Routes the fixed Skills/MCP settings queries through the current Ready
+    /// generation; unlike configuration this command never starts a sidecar.
+    pub(crate) fn settings_query(
+        &self,
+        method: SettingsQueryMethod,
+        params: Value,
+    ) -> Result<Value, RuntimeCommandError> {
+        let bridge = self
+            .bridge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(RuntimeCommandError {
+                code: "RUNTIME_NOT_READY",
+                message: "runtime is not ready",
+                retryable: true,
+            })?;
+        let status = bridge.state()?;
+        if status.status != RuntimeStatusKind::Ready {
+            return Err(RuntimeCommandError {
+                code: "RUNTIME_NOT_READY",
+                message: "runtime is not ready",
+                retryable: true,
+            });
+        }
+        bridge.settings_query(method, params)
     }
 
     /// Freezes a validated workspace/profile snapshot and cleanly replaces a

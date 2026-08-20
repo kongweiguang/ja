@@ -4,10 +4,10 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useJaConnection } from "./ConnectionProvider";
-import { TauriSettingsAdapter, type LoadedSettings, type SettingsDocument, type SettingsProfile } from "@/ipc/settings";
+import { TauriSettingsAdapter, type LoadedSettings, type SettingsDocument, type SettingsMcpServer, type SettingsProfile } from "@/ipc/settings";
 import { createHistoryAdapter, type HistoryAdapter, type HistoryThread } from "@/ipc/history";
-import type { RuntimeStatus } from "@/ipc/runtime";
-import type { AppearanceSettings, ModelProfileSave, PermissionMode, SettingsPorts, SettingsSnapshot } from "@/features/settings/types";
+import type { RuntimeSettingsResult, RuntimeStatus } from "@/ipc/runtime";
+import type { AppearanceSettings, McpServerProjection, McpServerSave, McpToolProjection, ModelProfileSave, PermissionMode, SettingsPorts, SettingsSnapshot, SkillProjection } from "@/features/settings/types";
 import { useUiPreferencesStore } from "@/stores/uiPreferences";
 import { useTimelineStore } from "@/stores/timelineStore";
 
@@ -96,7 +96,11 @@ function projectName(rootPath: string): string {
 }
 
 /** Maps only persisted settings into the existing Settings feature projection. */
-function toSettingsSnapshot(document: SettingsDocument): SettingsSnapshot {
+function toSettingsSnapshot(
+  document: SettingsDocument,
+  runtimeSkills: SkillProjection[] = [],
+  runtimeMcpServers: McpServerProjection[] = [],
+): SettingsSnapshot {
   const profiles = document.profiles.map((profile) => ({
     id: profile.profileRevision,
     profileRevision: profile.profileRevision,
@@ -118,21 +122,25 @@ function toSettingsSnapshot(document: SettingsDocument): SettingsSnapshot {
     // MCP configuration is real document data; enabled entries stay visibly
     // unverified until the sidecar supplies a health/tool projection, never
     // being rendered as connected from a boolean setting alone.
-    mcpServers: document.mcpServers.map((server) => ({
-      id: server.mcpRevision,
-      mcpRevision: server.mcpRevision,
-      name: server.name,
-      transport: server.transport,
-      endpoint: server.endpoint,
-      protocolVersion: server.protocolVersion,
-      ...(server.credentialRef == null ? {} : { credentialRef: server.credentialRef }),
-      enabled: server.enabled,
-       // Configuration says whether a server is enabled, not whether its
-       // process or tools are healthy; that evidence belongs to the sidecar.
-       status: server.enabled ? "unknown" as const : "disabled" as const,
-       tools: [],
-     })),
-    skills: [],
+    mcpServers: document.mcpServers.map((server) => {
+      const observed = runtimeMcpServers.find((item) => item.id === server.mcpRevision);
+      return ({
+        id: server.mcpRevision,
+        mcpRevision: server.mcpRevision,
+        name: server.name,
+        transport: server.transport,
+        endpoint: server.endpoint,
+        protocolVersion: server.protocolVersion,
+        ...(server.credentialRef == null ? {} : { credentialRef: server.credentialRef }),
+        enabled: server.enabled,
+        // Configuration says whether a server is enabled, not whether its
+        // process or tools are healthy; that evidence belongs to the sidecar.
+        status: observed?.status ?? (server.enabled ? "unknown" as const : "disabled" as const),
+        tools: observed?.tools ?? [],
+        ...(observed?.lastError === undefined ? {} : { lastError: observed.lastError }),
+      });
+    }),
+    skills: runtimeSkills,
     permissionMode: active?.accessMode ?? "workspace",
     appearance: {
       theme: document.theme,
@@ -148,6 +156,45 @@ function toSettingsSnapshot(document: SettingsDocument): SettingsSnapshot {
       cachePath: "unknown",
     },
   };
+}
+
+/** Maps AgentScope's health vocabulary to the compact settings projection. */
+function skillStatus(status: "healthy" | "degraded" | "invalid" | "disabled"): SkillProjection["status"] {
+  return status === "healthy" ? "ready" : status === "disabled" ? "disabled" : "error";
+}
+
+/** Projects the upstream SkillSummary without copying skill content into React state. */
+function projectSkills(result: RuntimeSettingsResult<"skill/list">): SkillProjection[] {
+  return result.skills.map((skill) => ({
+    id: skill.skillRevision,
+    name: skill.name,
+    source: skill.scope === "builtin" ? "builtin" : skill.scope === "workspace" ? "workspace" : "user",
+    description: skill.description ?? "",
+    enabled: skill.enabled,
+    status: skillStatus(skill.status),
+    ...(skill.status === "healthy" ? { lastGood: "刚刚" } : {}),
+  }));
+}
+
+/** Maps an upstream MCP summary; tool details are fetched only after a probe. */
+function projectMcpServers(result: RuntimeSettingsResult<"mcp/list">): McpServerProjection[] {
+  return result.servers.map((server) => ({
+    id: server.mcpRevision,
+    mcpRevision: server.mcpRevision,
+    name: server.name,
+    transport: server.transport,
+    endpoint: server.endpoint,
+    protocolVersion: server.protocolVersion,
+    ...(server.credentialRef === undefined ? {} : { credentialRef: server.credentialRef }),
+    enabled: server.enabled ?? true,
+    status: server.status === "healthy" ? "connected" : server.status === "disabled" ? "disabled" : server.status === "unavailable" ? "error" : "unknown",
+    tools: [],
+  }));
+}
+
+/** Converts AgentScope MCP tool metadata into the settings chip projection. */
+function projectMcpTools(result: RuntimeSettingsResult<"mcp/tools/read">): McpToolProjection[] {
+  return result.tools.map((tool) => ({ name: tool.name, policy: tool.policy }));
 }
 
 /** Returns the active profile only when the document's pointer resolves. */
@@ -199,7 +246,7 @@ export function useJaSession({
   projectPicker = defaultProjectPicker,
   historyAdapter = defaultHistoryAdapter,
 }: { settingsAdapter?: SettingsAdapter; projectPicker?: ProjectPicker; historyAdapter?: HistoryAdapter } = {}): JaSession {
-  const { configureAndStart } = useJaConnection();
+  const { configureAndStart, queryRuntime } = useJaConnection();
   const setThemeMode = useUiPreferencesStore((state) => state.setThemeMode);
   const [loadedSettings, setLoadedSettings] = useState<LoadedSettings>();
   const [settingsLoading, setSettingsLoading] = useState(true);
@@ -213,6 +260,8 @@ export function useJaSession({
   const [threads, setThreads] = useState<HistoryThread[]>([]);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [historyError, setHistoryError] = useState<string>();
+  const [runtimeSkills, setRuntimeSkills] = useState<SkillProjection[]>([]);
+  const [runtimeMcpServers, setRuntimeMcpServers] = useState<McpServerProjection[]>([]);
   const settingsRef = useRef<LoadedSettings | undefined>(undefined);
   const loadStartedRef = useRef(false);
   const projectRef = useRef<JaProject | undefined>(undefined);
@@ -234,6 +283,8 @@ export function useJaSession({
     setView("workspace");
     setHistoryBusy(false);
     setHistoryError(undefined);
+    setRuntimeSkills([]);
+    setRuntimeMcpServers([]);
     setProjectError(message);
     useTimelineStore.getState().reset();
   }, []);
@@ -375,6 +426,27 @@ export function useJaSession({
     }
   }, [applyHistorySnapshot, createAndRestoreThread, historyAdapter, isCurrentHistoryRequest]);
 
+  /**
+   * Reads the existing AgentScope Skills/MCP projections after a Ready
+   * generation is established. A projection failure is non-fatal to opening a
+   * workspace; the UI falls back to unknown/empty rather than claiming health.
+   */
+  const refreshRuntimeSettings = useCallback(async (): Promise<{ skills: SkillProjection[]; mcpServers: McpServerProjection[] }> => {
+    try {
+      const [skills, mcpServers] = await Promise.all([
+        queryRuntime("skill/list", {}),
+        queryRuntime("mcp/list", {}),
+      ]);
+      setRuntimeSkills(projectSkills(skills));
+      setRuntimeMcpServers(projectMcpServers(mcpServers));
+      return { skills: projectSkills(skills), mcpServers: projectMcpServers(mcpServers) };
+    } catch {
+      setRuntimeSkills([]);
+      setRuntimeMcpServers([]);
+      return { skills: [], mcpServers: [] };
+    }
+  }, [queryRuntime]);
+
   /** Loads once on mount; the sidecar must not be configured by this effect. */
   const reloadSettings = useCallback(async (): Promise<void> => {
     setSettingsLoading(true);
@@ -426,8 +498,8 @@ export function useJaSession({
       permissionMode: "workspace" as const,
       appearance: { theme: "system" as const, palette: "developer_blue" as const, reducedMotion: false, highContrast: false },
       runtime: { sidecarVersion: "unknown", nativeImage: "unknown" as const, dataPath: "unknown", logPath: "unknown", cachePath: "unknown" },
-    } : toSettingsSnapshot(loadedSettings.document),
-    [loadedSettings],
+    } : toSettingsSnapshot(loadedSettings.document, runtimeSkills, runtimeMcpServers),
+    [loadedSettings, runtimeMcpServers, runtimeSkills],
   );
 
   /** Saves a complete document with the current revision as the CAS guard. */
@@ -470,6 +542,7 @@ export function useJaSession({
         return;
       }
       setConfiguredStatus(status);
+      await refreshRuntimeSettings();
       await loadProjectHistory(selected, intent, nextProfile.profileRevision);
     } catch (error) {
       if (isCurrentProjectIntent(intent)) {
@@ -481,7 +554,7 @@ export function useJaSession({
         setProjectBusy(false);
       }
     }
-  }, [configureAndStart, failClosedProject, isCurrentProjectIntent, loadProjectHistory, project]);
+  }, [configureAndStart, failClosedProject, isCurrentProjectIntent, loadProjectHistory, project, refreshRuntimeSettings]);
 
   /** Merges a UI profile DTO into the native document without losing native-only policy arrays. */
   const saveProfile = useCallback(async (profile: ModelProfileSave): Promise<void> => {
@@ -562,6 +635,105 @@ export function useJaSession({
     setThemeMode(appearance.theme);
   }, [saveDocument, setThemeMode]);
 
+  /** Persists one MCP definition while preserving advanced non-sensitive maps. */
+  const saveMcp = useCallback(async (server: McpServerSave): Promise<void> => {
+    const current = settingsRef.current;
+    if (current === undefined) {
+      throw new Error("settings unavailable");
+    }
+    const existing = current.document.mcpServers.find((item) => item.mcpRevision === server.mcpRevision);
+    const merged: SettingsMcpServer = {
+      ...(existing ?? {
+        args: [],
+        env: {},
+        headers: {},
+        queryParams: {},
+      }),
+      ...server,
+    };
+    const saved = await saveDocument({
+      ...current.document,
+      revision: current.document.revision + 1,
+      mcpServers: existing === undefined
+        ? [...current.document.mcpServers, merged]
+        : current.document.mcpServers.map((item) => item.mcpRevision === server.mcpRevision ? merged : item),
+    });
+    await reconfigureProject(saved);
+  }, [reconfigureProject, saveDocument]);
+
+  /** Runs one real MCP initialize/tools-list probe and refreshes its chips. */
+  const testMcp = useCallback(async (mcpRevision: string): Promise<"unknown" | "connected" | "disabled" | "testing" | "error"> => {
+    const current = settingsRef.current;
+    const server = current?.document.mcpServers.find((item) => item.mcpRevision === mcpRevision);
+    const active = activeProfile(current?.document);
+    if (server === undefined || !server.enabled) {
+      return "disabled";
+    }
+    const credentialBearing = server.credentialRef ?? server.auth?.credentialRef;
+    const testResult = await queryRuntime("mcp/test", {
+      mcpRevision,
+      ...(credentialBearing == null || active === undefined ? {} : { profileRevision: active.profileRevision }),
+    });
+    const tools = await queryRuntime("mcp/tools/read", { mcpRevision });
+    const projectedTools = projectMcpTools(tools);
+    setRuntimeMcpServers((items) => items.map((item) => item.id === mcpRevision
+      ? { ...item, status: testResult.status === "healthy" ? "connected" : "error", tools: projectedTools, lastError: testResult.status === "healthy" ? undefined : "MCP Server 不可用。" }
+      : item));
+    return testResult.status === "healthy" ? "connected" : "error";
+  }, [queryRuntime]);
+
+  /** Re-runs the same bounded probe; AgentScope owns the actual MCP client lifecycle. */
+  const reloadMcp = useCallback(async (mcpRevision: string): Promise<void> => {
+    await testMcp(mcpRevision);
+  }, [testMcp]);
+
+  /** Disables a configured server through the existing settings CAS/reconfigure path. */
+  const closeMcp = useCallback(async (mcpRevision: string): Promise<void> => {
+    const current = settingsRef.current;
+    const server = current?.document.mcpServers.find((item) => item.mcpRevision === mcpRevision);
+    if (server === undefined) {
+      throw new Error("MCP server unavailable");
+    }
+    await saveMcp({
+      mcpRevision: server.mcpRevision,
+      name: server.name,
+      transport: server.transport,
+      endpoint: server.endpoint,
+      protocolVersion: server.protocolVersion,
+      ...(server.credentialRef == null ? {} : { credentialRef: server.credentialRef }),
+      enabled: false,
+    });
+  }, [saveMcp]);
+
+  /** Reloads AgentScope skill repositories by rebuilding the current generation. */
+  const reloadSkill = useCallback(async (skillRevision: string): Promise<SkillProjection | undefined> => {
+    const refreshed = await refreshRuntimeSettings();
+    return refreshed.skills.find((skill) => skill.id === skillRevision);
+  }, [refreshRuntimeSettings]);
+
+  /** Persists profile skill selection; builtin skills remain always enabled upstream. */
+  const toggleSkill = useCallback(async (skillRevision: string, enabled: boolean): Promise<void> => {
+    const current = settingsRef.current;
+    const active = activeProfile(current?.document);
+    const observed = runtimeSkills.find((skill) => skill.id === skillRevision);
+    if (current === undefined || active === undefined || observed === undefined) {
+      throw new Error("skill unavailable");
+    }
+    if (observed.source === "builtin" && !enabled) {
+      throw new Error("builtin skill cannot be disabled");
+    }
+    const selected = new Set(active.skillRevisions);
+    if (enabled) selected.add(skillRevision); else selected.delete(skillRevision);
+    const saved = await saveDocument({
+      ...current.document,
+      revision: current.document.revision + 1,
+      profiles: current.document.profiles.map((profile) => profile.profileRevision === active.profileRevision
+        ? { ...profile, skillRevisions: [...selected] }
+        : profile),
+    });
+    await reconfigureProject(saved);
+  }, [reconfigureProject, runtimeSkills, saveDocument]);
+
   /** Opens one directory and starts only after a real settings profile resolves. */
   const chooseProject = useCallback(async (): Promise<void> => {
     const current = settingsRef.current;
@@ -614,6 +786,7 @@ export function useJaSession({
       setProject(selected);
       setConfiguredStatus(status);
       setView("workspace");
+      await refreshRuntimeSettings();
       await loadProjectHistory(selected, intent, activeProfile(current.document)?.profileRevision);
     } catch {
       if (isCurrentProjectIntent(intent)) {
@@ -628,7 +801,7 @@ export function useJaSession({
         setProjectBusy(false);
       }
     }
-  }, [configureAndStart, failClosedProject, isCurrentProjectIntent, loadProjectHistory, projectPicker]);
+  }, [configureAndStart, failClosedProject, isCurrentProjectIntent, loadProjectHistory, projectPicker, refreshRuntimeSettings]);
 
   /** Creates a real durable thread so a new conversation survives reload. */
   const newConversation = useCallback(async (): Promise<void> => {
@@ -711,9 +884,15 @@ export function useJaSession({
   const settingsPorts = useMemo<SettingsPorts>(() => ({
     onSaveProfile: saveProfile,
     onActivateProfile: activateProfile,
+    onSaveMcp: saveMcp,
+    onTestMcp: testMcp,
+    onReloadMcp: reloadMcp,
+    onCloseMcp: closeMcp,
+    onToggleSkill: toggleSkill,
+    onReloadSkill: reloadSkill,
     onPermissionChange: savePermission,
     onAppearanceChange: saveAppearance,
-  }), [activateProfile, saveAppearance, savePermission, saveProfile]);
+  }), [activateProfile, closeMcp, reloadMcp, reloadSkill, saveAppearance, saveMcp, savePermission, saveProfile, testMcp, toggleSkill]);
 
   return {
     loadedSettings,

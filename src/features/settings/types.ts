@@ -14,6 +14,7 @@ export type PermissionMode = "read_only" | "workspace" | "full_access";
 export type SettingsPalette = "developer_blue" | "dark_graphite" | "warm_paper";
 export type ThemeMode = "system" | "light" | "dark";
 export type McpTransport = "stdio" | "streamable_http";
+export type McpProtocolVersion = "2024-11-05" | "2025-03-26" | "2025-06-18";
 export type SkillSource = "builtin" | "user" | "workspace";
 export type SkillStatus = "ready" | "disabled" | "reloading" | "error";
 export type McpStatus = "unknown" | "connected" | "disabled" | "testing" | "error";
@@ -63,7 +64,7 @@ export interface McpServerSave {
   name: string;
   transport: McpTransport;
   endpoint: string;
-  protocolVersion: string;
+  protocolVersion: McpProtocolVersion;
   credentialRef?: string;
   enabled: boolean;
 }

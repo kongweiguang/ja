@@ -9,7 +9,7 @@ import { Check, ChevronDown, CircleAlert, CircleCheck, CircleDashed, Cloud, Lapt
 import { cloneElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import { type UseFormSetError } from "react-hook-form";
 import { z } from "zod";
-import type { CapabilityProbe, McpServerDraft, ModelProfileDraft, ModelProfileSave, ModelProtocol, ModelProvider, SettingsSection, SettingsPalette, SkillSource, McpServerSave } from "./types";
+import type { CapabilityProbe, McpProtocolVersion, McpServerDraft, ModelProfileDraft, ModelProfileSave, ModelProtocol, ModelProvider, SettingsSection, SettingsPalette, SkillSource, McpServerSave } from "./types";
 
 /** Keep the native credential namespace identical to Rust's CredentialRef. */
 export const CREDENTIAL_REF_PATTERN = /^cred_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
@@ -68,7 +68,7 @@ export const mcpSchema = z.object({
   name: z.string().trim().min(1, "请填写 Server 名称。"),
   transport: z.enum(["stdio", "streamable_http"]),
   endpoint: z.string().trim().min(1, "请填写 executable 或 URL。"),
-  protocolVersion: z.string().trim().min(1, "请填写 MCP protocol version。"),
+  protocolVersion: z.enum(["2024-11-05", "2025-03-26", "2025-06-18"], { message: "请选择受支持的 MCP protocol version。" }),
   credentialRef: optionalCredentialRef,
   enabled: z.boolean(),
 }).superRefine((values, context) => {
@@ -165,12 +165,13 @@ export function toModelSavePayload(values: ModelProfileDraft, revision = values.
 /** Map MCP form values without inventing unsupported timeout/header fields. */
 export function toMcpSavePayload(values: McpServerDraft, revision = values.mcpRevision ?? canonicalRevision("mcp")): McpServerSave {
   const credentialRef = values.credentialRef.trim() || undefined;
+  const protocolVersion = values.protocolVersion.trim() as McpProtocolVersion;
   return {
     mcpRevision: revision,
     name: values.name.trim(),
     transport: values.transport,
     endpoint: values.endpoint.trim(),
-    protocolVersion: values.protocolVersion.trim(),
+    protocolVersion,
     credentialRef,
     enabled: values.enabled,
   };

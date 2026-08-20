@@ -392,6 +392,42 @@ impl SidecarSupervisor {
         result
     }
 
+    /// Runs a bounded client request while allowing only the explicitly
+    /// supplied nested server-request handler. This reuses Session's reader
+    /// and pending registry instead of adding another supervisor queue.
+    pub fn request_with_server_request_handler<F>(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        handler: F,
+    ) -> Result<RpcFrame, AgentProcessError>
+    where
+        F: FnMut(&Session, RpcFrame),
+    {
+        self.sync_terminal_signals();
+        if *self
+            .stopping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Err(AgentProcessError::ShuttingDown);
+        }
+        if self.lifecycle.state() != LifecycleState::Ready {
+            return Err(match self.lifecycle.state() {
+                LifecycleState::Stopping => AgentProcessError::ShuttingDown,
+                _ => AgentProcessError::NotReady,
+            });
+        }
+        let generation = self.lifecycle.generation();
+        self.lifecycle.mark_busy(generation)?;
+        let session = self.session.clone().ok_or(AgentProcessError::NotReady)?;
+        let result = session.request_with_server_request_handler(method, params, timeout, handler);
+        let _ = self.lifecycle.mark_ready_again(generation);
+        self.sync_terminal_signals();
+        result
+    }
+
     /// Provides a clone of the current session only for host cancellation;
     /// it does not create a second event-pump consumer or supervisor owner.
     pub(crate) fn session_for_cancellation(&self) -> Option<Session> {

@@ -10,6 +10,7 @@ mod config;
 pub(crate) mod history;
 mod host;
 mod projection;
+pub(crate) mod settings_query;
 
 #[cfg(feature = "test-support")]
 pub use bridge::BridgeTestTrace;
@@ -33,6 +34,7 @@ pub fn register_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
         ja_runtime_recovery_state,
         ja_runtime_acknowledge_recovery,
         ja_runtime_configure,
+        settings_query::ja_runtime_query,
         ja_approval_respond,
         ja_turn_start,
         ja_turn_cancel,

@@ -15,6 +15,13 @@ import {
   isRuntimeGenerationValid,
   type JaEvent,
 } from "./runtimeEvents";
+import {
+  parseMethodParams,
+  parseMethodResult,
+  type ClientMethod,
+  type MethodParams,
+  type MethodResult,
+} from "./methods";
 
 /** The Rust host owns every lifecycle command and exposes one fixed event. */
 export const JA_RUNTIME_COMMANDS = {
@@ -27,7 +34,17 @@ export const JA_RUNTIME_COMMANDS = {
   configure: "ja_runtime_configure",
   turnStart: "ja_turn_start",
   turnCancel: "ja_turn_cancel",
+  query: "ja_runtime_query",
 } as const;
+
+/** Settings only expose these existing sidecar methods; arbitrary RPC stays unavailable to WebView. */
+export type RuntimeSettingsMethod = Extract<ClientMethod, "skill/list" | "mcp/list" | "mcp/test" | "mcp/tools/read">;
+export type RuntimeSettingsParams<M extends RuntimeSettingsMethod> = MethodParams<M>;
+export type RuntimeSettingsResult<M extends RuntimeSettingsMethod> = MethodResult<M>;
+export type RuntimeQuery = <M extends RuntimeSettingsMethod>(
+  method: M,
+  params: RuntimeSettingsParams<M>,
+) => Promise<RuntimeSettingsResult<M>>;
 
 export const JA_RUNTIME_EVENTS = {
   frame: "ja://rpc/frame",
@@ -451,6 +468,8 @@ export interface RuntimeHostAdapter {
   turnStart(input: TurnStartInput): Promise<TurnAccepted>;
   /** Optional during the transition so existing host test doubles stay valid. */
   turnCancel?(input: TurnCancelInput): Promise<TurnCancelResult>;
+  /** Queries the fixed Skills/MCP settings surface; no generic method tunnel is exposed. */
+  query?: RuntimeQuery;
   subscribe(listener: RuntimeHostListener): Promise<RuntimeHostUnsubscribe>;
 }
 
@@ -530,6 +549,38 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
       throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true);
     }
     return result;
+  }
+
+  /**
+   * Sends one allow-listed settings query through Rust and validates both
+   * method-specific input and result at the WebView boundary. The sidecar
+   * request remains a product capability, never a caller-selected RPC path.
+   */
+  async query<M extends RuntimeSettingsMethod>(
+    method: M,
+    params: RuntimeSettingsParams<M>,
+  ): Promise<RuntimeSettingsResult<M>> {
+    let parsedParams: RuntimeSettingsParams<M>;
+    try {
+      parsedParams = parseMethodParams(method, params) as RuntimeSettingsParams<M>;
+    } catch {
+      throw new RuntimeHostError("INVALID_INPUT", "请求参数无效", false);
+    }
+    try {
+      const result = await this.bridge.invoke<unknown>(JA_RUNTIME_COMMANDS.query, {
+        input: { method, params: parsedParams },
+      });
+      assertHostPayloadSafe(result);
+      return parseMethodResult(method, result) as RuntimeSettingsResult<M>;
+    } catch (error) {
+      if (error instanceof RuntimeHostError) {
+        throw normalizeRuntimeError(error);
+      }
+      if (error instanceof z.ZodError) {
+        throw new RuntimeHostError("RUNTIME_UNAVAILABLE", SAFE_RUNTIME_ERRORS["RUNTIME_UNAVAILABLE"]?.message ?? "运行时暂不可用", true);
+      }
+      throw normalizeRuntimeError(error);
+    }
   }
 
   async subscribe(listener: RuntimeHostListener): Promise<RuntimeHostUnsubscribe> {
