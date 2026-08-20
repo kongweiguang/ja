@@ -340,10 +340,14 @@
                             <classesDirectory>${project.build.outputDirectory}</classesDirectory>
                             <buildArgs>
                                 <buildArg>--no-fallback</buildArg>
+                                <!-- Keep the production SQLite schema in the closed-world image; JVM classpath resources alone are not retained. -->
+                                <buildArg>-H:IncludeResources=db/migration/.*</buildArg>
                                 <!-- Keep Solon's Logback configuration in the PE so diagnostics stay off protocol stdout. -->
                                 <buildArg>-H:IncludeResources=.*logback.*</buildArg>
                                 <!-- Keep the built-in AgentScope coding skill available to the native classpath repository. -->
                                 <buildArg>-H:IncludeResources=.*skills.*</buildArg>
+                                <!-- Solon's existing Jansi logging adapter calls System.load; grant the image's unnamed module native access to keep stderr clean. -->
+                                <buildArg>--enable-native-access=ALL-UNNAMED</buildArg>
                             </buildArgs>
                             <!-- Use the vendor metadata repository; no project-local fake metadata is added. -->
                             <metadataRepository>
