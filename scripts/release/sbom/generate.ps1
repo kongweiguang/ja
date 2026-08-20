@@ -405,7 +405,8 @@ function Get-MavenBomAudit {
             elseif ($license.license.name) { $rootLicense += [string]$license.license.name }
         }
     }
-    $rootExpected = @($rootLicense | Where-Object { $_ -match '(?i)GPL-3\.0-or-later|GNU General Public License.*3' }).Count -gt 0
+    # CycloneDX may normalize SPDX GPL-3.0-or-later to the equivalent ``GPL-3.0+`` token.
+    $rootExpected = @($rootLicense | Where-Object { $_ -match '(?i)GPL-3\.0(?:-or-later|\+)|GNU General Public License.*3' }).Count -gt 0
     return [PSCustomObject][ordered]@{
         bomFormat = [string]$bom.bomFormat
         specVersion = [string]$bom.specVersion

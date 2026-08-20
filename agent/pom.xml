@@ -20,6 +20,13 @@
 
     <name>JA Agent</name>
     <description>JA coding harness agent runtime</description>
+    <licenses>
+        <license>
+            <name>GNU General Public License v3.0 or later</name>
+            <url>https://www.gnu.org/licenses/gpl-3.0.html</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
 
     <properties>
         <!-- Keep the Java ABI and the Native Image entry point identical across JVM and native builds. -->
