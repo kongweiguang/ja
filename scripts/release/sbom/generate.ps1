@@ -423,23 +423,51 @@ function Get-MavenBomAudit {
 function Get-LicenseArchiveAudit {
     <#
     .SYNOPSIS
-    Checks whether the repository contains audited third-party license text files.
+    Checks whether the repository contains an approved, hash-addressed third-party license archive.
 
     .DESCRIPTION
-    The empty archive is a deliberate truth-preserving state in this repository.  Counting files
-    here creates a release gate without copying guessed license text or claiming that package
-    metadata alone satisfies redistribution obligations.
+    The archive manifest is the review boundary.  A non-empty directory with a pending source
+    review must not silently close the release gate, so the status is checked in addition to the
+    text-file count.  This function only validates evidence shape; it does not classify licenses.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot
     )
 
     $licenseRoot = Resolve-RepositoryPath -Path 'LICENSES' -BasePath $RepositoryRoot -RequireExisting
-    $files = @(Get-ChildItem -LiteralPath $licenseRoot -Recurse -File | Where-Object { $_.Name -ne 'README.md' })
+    $textRoot = Join-Path $licenseRoot 'approved\text'
+    $files = @()
+    if (Test-Path -LiteralPath $textRoot -PathType Container) {
+        $files = @(Get-ChildItem -LiteralPath $textRoot -File | Sort-Object Name)
+    }
+    $manifestPath = Join-Path $licenseRoot 'approved\manifest.json'
+    $manifest = $null
+    $manifestStatus = 'missing'
+    $manifestError = $null
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        try {
+            $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+            $manifestStatus = [string]$manifest.status
+        } catch {
+            $manifestStatus = 'invalid'
+            $manifestError = 'manifest JSON could not be parsed'
+        }
+    }
+    $mappingCount = 0
+    $pendingCount = 0
+    if ($null -ne $manifest) {
+        if ($manifest.PSObject.Properties['mappings']) { $mappingCount = @($manifest.mappings).Count }
+        if ($manifest.PSObject.Properties['missingReview']) { $pendingCount = @($manifest.missingReview).Count }
+    }
     return [PSCustomObject][ordered]@{
         path = 'LICENSES'
         textFileCount = [int]$files.Count
-        files = @($files | ForEach-Object { Get-RelativeRepositoryPath -Path $_.FullName -BasePath $RepositoryRoot } | Sort-Object)
+        files = @($files | ForEach-Object { Get-RelativeRepositoryPath -Path $_.FullName -BasePath $RepositoryRoot })
+        manifest = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { Get-RelativeRepositoryPath -Path $manifestPath -BasePath $RepositoryRoot } else { $null }
+        manifestStatus = $manifestStatus
+        manifestError = $manifestError
+        mappingCount = [int]$mappingCount
+        pendingReviewCount = [int]$pendingCount
     }
 }
 
@@ -550,6 +578,10 @@ if (Test-Path -LiteralPath $mavenInput -PathType Leaf) {
 $archive = Get-LicenseArchiveAudit -RepositoryRoot $root
 if ($archive.textFileCount -eq 0) {
     Add-Blocker -Blockers $blockers -Code 'LICENSE_ARCHIVE_EMPTY' -Reason 'LICENSES contains no audited third-party license text files'
+} elseif ($archive.manifestStatus -eq 'missing') {
+    Add-Blocker -Blockers $blockers -Code 'LICENSE_ARCHIVE_MANIFEST_MISSING' -Reason 'LICENSES/approved/manifest.json is required to connect text hashes to reviewed components'
+} elseif ($archive.manifestStatus -ne 'approved') {
+    Add-Blocker -Blockers $blockers -Code 'LICENSE_ARCHIVE_REVIEW_PENDING' -Reason ('license archive status is {0}; explicit legal/source review must produce status=approved' -f $archive.manifestStatus)
 }
 
 $artifacts = @(Get-ArtifactAudit -Paths $ArtifactPath -RepositoryRoot $root)

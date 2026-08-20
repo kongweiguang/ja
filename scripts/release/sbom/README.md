@@ -46,7 +46,9 @@ pwsh -NoProfile -File scripts/release/sbom/generate.ps1 `
 - `MAVEN_BOM_INPUT_MISSING`：没有预先生成的 CycloneDX Java BOM；
 - `PROJECT_LICENSE_METADATA_MISMATCH`：BOM 根组件没有声明 JA 的
   `GPL-3.0-or-later`；
-- `LICENSE_ARCHIVE_EMPTY`：`LICENSES/` 没有经过核对的第三方许可证正文；
+- `LICENSE_ARCHIVE_EMPTY`：`LICENSES/approved/text/` 没有经过核对的第三方许可证正文；
+- `LICENSE_ARCHIVE_MANIFEST_MISSING`：没有把正文 hash 映射到依赖和来源的归档 manifest；
+- `LICENSE_ARCHIVE_REVIEW_PENDING`：归档已生成但仍等待明确的来源/法律复核批准；
 - `ARTIFACTS_NOT_PROVIDED`：没有实际安装包/ bundle 可供校验；
 - `CORRESPONDING_SOURCE_NOT_PROVIDED`：没有 GPL 对应源码归档或持久源码提供方式；
 - `GIT_TREE_DIRTY`：来源不是干净 commit。
@@ -64,8 +66,21 @@ pwsh -NoProfile -File scripts/release/sbom/collect-license-candidates.ps1 `
 该脚本只复制 npm 包目录、Cargo registry/source 和 Maven 本地 JAR 中实际存在的
 `LICENSE`/`LICENCE`/`COPYING`/`NOTICE` 字节，并按 SHA-256 去重；`manifest.json` 会列出
 每个组件的声明、来源、映射和缺失项。输出状态固定为 `candidate-review-pending`，不计入
-`LICENSES/approved/`，也不会自动关闭 `LICENSE_ARCHIVE_EMPTY`。缺少原文时必须从固定的
+`LICENSES/approved/`，也不会自动关闭来源/法律复核门。缺少原文时必须从固定的
 官方来源补齐并保留版权/NOTICE，不能根据 SPDX 名称自行重写文本。
+
+候选经过逐项来源复核后，可用固定 SPDX 数据提交生成 hash-addressed archive：
+
+```powershell
+pwsh -NoProfile -File scripts/release/sbom/promote-license-candidates.ps1 `
+  -CandidateDirectory release/sbom/license-candidate-<run-id> `
+  -AllowNetwork -ConfirmSourceReview
+```
+
+该命令默认生成 `status=source-verified-pending-legal-review`，不会把“目录非空”误当作
+发布批准；只有发布 owner 完成版权/NOTICE、Native/Tauri 再分发和 GPL 兼容性复核后，才
+能显式增加 `-MarkApproved` 生成 `status=approved`。SPDX 文本来源由固定 commit、URL 和
+SHA-256 写入 `LICENSES/approved/manifest.json`，已有非空归档不会被覆盖。
 
 ## Java BOM 的边界
 

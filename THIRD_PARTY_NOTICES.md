@@ -3,10 +3,9 @@
 
 # 第三方依赖与 notices
 
-本文件是 JA 的治理入口，不是“已经完成审计”的依赖清单。仓库仍在早期实现阶段，
-当前依赖输入会随着 `package.json`、`pnpm-lock.yaml`、`src-tauri/Cargo.toml`、
-`Cargo.lock`、`agent/pom.xml` 以及 AgentScope 版本决策变化；目前没有经过发布门禁
-生成的完整 SBOM、源码对应包或第三方许可证归档。
+本文件是 JA 的治理入口，不是脱离版本的静态依赖清单。每个发布候选都必须绑定
+`package.json`、`pnpm-lock.yaml`、`src-tauri/Cargo.toml`、`Cargo.lock`、`agent/pom.xml`
+和 AgentScope 版本；归档状态以 `LICENSES/approved/manifest.json` 和发布报告为准。
 
 ## 发布前必须生成的事实
 
@@ -35,7 +34,7 @@ AgentScope 以外部依赖方式使用时，不把其源码或本地 checkout �
 
 - [LICENSE](./LICENSE) 是 JA 自身的 GPL-3.0-or-later 正文。
 - [LICENSES/](./LICENSES/) 只存放在发布审计中确认需要随源码/产物再分发的第三方
-  license 文本；不要凭猜测添加清单或复制未知来源的文件。
+  license 文本；`source-verified-pending-legal-review` 仍不是发布批准。
 - lockfile、Native Image metadata、源代码和构建脚本属于对应源码的一部分，不能由
   `.gitignore` 误排除。
 
