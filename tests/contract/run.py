@@ -591,6 +591,20 @@ def tool(name: str) -> str:
     return f"{name}.cmd" if os.name == "nt" and name in {"mvn", "pnpm"} else name
 
 
+def java_tool(name: str) -> str:
+    """
+    Prefer the executable under JAVA_HOME so the contract gate cannot validate one JDK and run
+    another when Windows PATH still points at an older installation.
+    """
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        suffix = ".exe" if os.name == "nt" else ""
+        candidate = Path(java_home) / "bin" / f"{name}{suffix}"
+        if candidate.is_file():
+            return str(candidate)
+    return name
+
+
 def require_marker(stage: str, output: bytes, pattern: str) -> re.Match[str]:
     """Require a machine-readable success marker so a passing unrelated test suite cannot satisfy the gate."""
     text = output.decode("utf-8", errors="replace")
@@ -704,11 +718,11 @@ def load_expected_counts() -> None:
 
 def require_jdk25() -> None:
     """Require the requested Java major before Maven can silently select another installed JDK."""
-    result = run_command("jdk25", ["java", "--version"], ROOT)
+    result = run_command("jdk25", [java_tool("java"), "--version"], ROOT)
     output = result.stdout + result.stderr
     if re.search(rb"(?:^|\s)25(?:[.\s-])", output, flags=re.MULTILINE) is None:
         raise GateFailure(f"FAIL stage=jdk25 classification=jdk25_required outputHash={safe_digest(output)}")
-    javac = run_command("javac25", ["javac", "--version"], ROOT)
+    javac = run_command("javac25", [java_tool("javac"), "--version"], ROOT)
     javac_output = javac.stdout + javac.stderr
     if re.search(rb"(?:^|\s)25(?:[.\s-])", javac_output, flags=re.MULTILINE) is None:
         raise GateFailure(f"FAIL stage=javac25 classification=jdk25_required outputHash={safe_digest(javac_output)}")
@@ -956,7 +970,7 @@ def run_java(property_path: Path, digest: str, classification_digest: str, temp:
     classpath = os.pathsep.join([str(build_directory / "classes"), classpath_file.read_text(encoding="utf-8").strip()])
     run_command(
         "java-compile",
-        ["javac", "-encoding", "UTF-8", "-cp", classpath, "-d", str(classes), str(adapter_source)],
+        [java_tool("javac"), "-encoding", "UTF-8", "-cp", classpath, "-d", str(classes), str(adapter_source)],
         ROOT,
     )
     env = os.environ.copy()
@@ -969,7 +983,7 @@ def run_java(property_path: Path, digest: str, classification_digest: str, temp:
     result = run_command(
         "java-adapter",
         [
-            "java",
+            java_tool("java"),
             "-cp",
             os.pathsep.join([str(classes), classpath]),
             "io.github.kongweiguang.ja.protocol.JavaCorpusProbe",
