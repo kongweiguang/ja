@@ -52,6 +52,12 @@ agent/native-image/
 artifacts/
 bundle/
 release/
+# @author kongweiguang
+# Keep the checked-in release evidence scripts visible; generated release outputs remain ignored.
+!scripts/release/
+!scripts/release/sbom/
+!scripts/release/sbom/*.ps1
+!scripts/release/sbom/*.md
 *.appimage
 *.dmg
 *.msi

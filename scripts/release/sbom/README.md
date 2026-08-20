@@ -51,6 +51,22 @@ pwsh -NoProfile -File scripts/release/sbom/generate.ps1 `
 - `CORRESPONDING_SOURCE_NOT_PROVIDED`：没有 GPL 对应源码归档或持久源码提供方式；
 - `GIT_TREE_DIRTY`：来源不是干净 commit。
 
+## 候选许可证归档
+
+可先在离线缓存中生成候选原文和组件映射，供发布 owner 逐项复核：
+
+```powershell
+pwsh -NoProfile -File scripts/release/sbom/collect-license-candidates.ps1 `
+  -MavenBomPath agent/target/ja-maven-bom.json `
+  -OutputDirectory release/sbom/license-candidate-<run-id>
+```
+
+该脚本只复制 npm 包目录、Cargo registry/source 和 Maven 本地 JAR 中实际存在的
+`LICENSE`/`LICENCE`/`COPYING`/`NOTICE` 字节，并按 SHA-256 去重；`manifest.json` 会列出
+每个组件的声明、来源、映射和缺失项。输出状态固定为 `candidate-review-pending`，不计入
+`LICENSES/approved/`，也不会自动关闭 `LICENSE_ARCHIVE_EMPTY`。缺少原文时必须从固定的
+官方来源补齐并保留版权/NOTICE，不能根据 SPDX 名称自行重写文本。
+
 ## Java BOM 的边界
 
 当前 `cyclonedx-maven-plugin:2.9.1:makeAggregateBom` 会声明 Maven 在线执行要求，即使
