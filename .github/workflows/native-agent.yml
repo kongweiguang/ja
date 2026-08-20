@@ -9,12 +9,30 @@ on:
       - ".github/workflows/native-agent.yml"
       - "agent/**"
       - "scripts/native/**"
+      - "src-tauri/**"
+      - "src/**"
+      - "public/**"
+      - "index.html"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "vite.config.*"
+      - "tsconfig*.json"
   push:
     branches: [main]
     paths:
       - ".github/workflows/native-agent.yml"
       - "agent/**"
       - "scripts/native/**"
+      - "src-tauri/**"
+      - "src/**"
+      - "public/**"
+      - "index.html"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "vite.config.*"
+      - "tsconfig*.json"
   workflow_dispatch:
 
 permissions:
@@ -36,18 +54,24 @@ jobs:
           - platform: windows
             arch: x86_64
             targetTriple: x86_64-pc-windows-msvc
+            tauriBundle: nsis
+            bundleExtension: .exe
             runner: windows-2022
             nikSuffix: windows-amd64
             nikSha256: 8F8DBA29A26B0436C8A8A599F9C1A9C46929C417790C85788C2CD99DAF212B7A
           - platform: macos
             arch: x86_64
             targetTriple: x86_64-apple-darwin
+            tauriBundle: dmg
+            bundleExtension: .dmg
             runner: macos-26-intel
             nikSuffix: macos-amd64
             nikSha256: 0BC3B9B18ED89275FA3992D25863310734EEED0C79673210708C44369B835310
           - platform: macos
             arch: arm64
             targetTriple: aarch64-apple-darwin
+            tauriBundle: dmg
+            bundleExtension: .dmg
             runner: macos-26
             nikSuffix: macos-aarch64
             nikSha256: 8C74D049FA2B83A6A23F6981293EC956E7195C5FF546B8EB0DD20DF0BD92A99B
@@ -88,6 +112,52 @@ jobs:
           printf 'JA_NATIVE_EVIDENCE=%s\n' "$evidence" >> "$GITHUB_ENV"
           python3 --version
           test "$(uname -m)" = "${{ matrix.arch }}"
+
+      - name: Install pinned pnpm
+        uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - name: Install pinned Node.js and restore pnpm cache
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.10.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install locked frontend dependencies (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm install --frozen-lockfile --prefer-offline --reporter=append-only
+
+      - name: Install locked frontend dependencies (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: pnpm install --frozen-lockfile --prefer-offline --reporter=append-only
+
+      - name: Verify frontend and Tauri toolchain (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --version
+          if ((node --version).Trim() -ne 'v24.10.0') { throw 'Node.js version drifted from the locked project toolchain' }
+          pnpm --version
+          if ((pnpm --version).Trim() -ne '10.33.0') { throw 'pnpm version drifted from the locked project toolchain' }
+          pnpm exec tauri --version
+
+      - name: Verify frontend and Tauri toolchain (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          test "$(node --version)" = "v24.10.0"
+          test "$(pnpm --version)" = "10.33.0"
+          pnpm exec tauri --version
 
       - name: Install pinned Liberica NIK (Windows)
         if: matrix.platform == 'windows'
@@ -264,6 +334,62 @@ jobs:
           stage="$RUNNER_TEMP/ja-native-stage"
           python3 -B scripts/native/stage-sidecar.py --artifact agent/target/ja --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$GITHUB_SHA" --build-report "$JA_NATIVE_EVIDENCE/build-report.json"
 
+      - name: Run unsigned Tauri NSIS bundle smoke (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
+          $source = Join-Path $stage 'sidecars/ja-agent-${{ matrix.targetTriple }}.exe'
+          $sourceManifest = Join-Path $stage 'sidecar-manifest.json'
+          $sidecars = Join-Path $PWD 'src-tauri/sidecars'
+          $target = Join-Path $sidecars 'ja-agent-${{ matrix.targetTriple }}.exe'
+          $evidence = Join-Path $env:RUNNER_TEMP 'ja-tauri-bundle-evidence'
+          New-Item -ItemType Directory -Force -Path $sidecars,$evidence | Out-Null
+          try {
+            if (-not (Test-Path -LiteralPath $source)) { throw 'staged Windows sidecar is missing' }
+            if (-not (Test-Path -LiteralPath $sourceManifest)) { throw 'staged sidecar manifest is missing' }
+            if (Test-Path -LiteralPath $target) { throw 'src-tauri/sidecars already contains the target sidecar' }
+            Copy-Item -LiteralPath $source -Destination $target
+            '{"noSign":true,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --no-sign --bundles nsis"}' | Set-Content -LiteralPath (Join-Path $evidence 'bundle-contract.json') -Encoding utf8NoBOM
+            pnpm exec tauri build --ci --no-sign --bundles nsis
+            if ($LASTEXITCODE -ne 0) { throw "Tauri NSIS bundle failed with exit code $LASTEXITCODE" }
+            python -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/nsis' --extension '${{ matrix.bundleExtension }}' --output-dir $evidence --platform windows --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit $env:GITHUB_SHA --sidecar-manifest $sourceManifest --no-sign
+            if ($LASTEXITCODE -ne 0) { throw "bundle evidence collection failed with exit code $LASTEXITCODE" }
+          } finally {
+            foreach ($path in @($target)) {
+              if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+            }
+          }
+          if (Test-Path -LiteralPath $target) { throw 'generated Windows sidecar cleanup failed' }
+
+      - name: Run unsigned Tauri DMG bundle smoke (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/ja-native-stage"
+          source="$stage/sidecars/ja-agent-${{ matrix.targetTriple }}"
+          source_manifest="$stage/sidecar-manifest.json"
+          sidecars="src-tauri/sidecars"
+          target="$sidecars/ja-agent-${{ matrix.targetTriple }}"
+          evidence="$RUNNER_TEMP/ja-tauri-bundle-evidence"
+          mkdir -p "$sidecars" "$evidence"
+          cleanup() {
+            rm -f -- "$target"
+          }
+          trap cleanup EXIT
+          test -f "$source"
+          test -f "$source_manifest"
+          test ! -e "$target"
+          cp -- "$source" "$target"
+          printf '%s\n' '{"noSign":true,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --no-sign --bundles dmg"}' > "$evidence/bundle-contract.json"
+          pnpm exec tauri build --ci --no-sign --bundles dmg
+          python3 -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/dmg' --extension '${{ matrix.bundleExtension }}' --output-dir "$evidence" --platform macos --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit "$GITHUB_SHA" --sidecar-manifest "$source_manifest" --no-sign
+          cleanup
+          trap - EXIT
+          test ! -e "$target"
+
       - name: Reject secret markers in bounded evidence (Windows)
         if: always() && matrix.platform == 'windows'
         shell: pwsh
@@ -306,6 +432,29 @@ jobs:
             echo 'Native build report was not produced.' >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Publish unsigned Tauri bundle summary (Windows)
+        if: always() && matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $manifest = Join-Path $env:RUNNER_TEMP 'ja-tauri-bundle-evidence/tauri-bundle-manifest.json'
+          if (Test-Path -LiteralPath $manifest) {
+            Get-Content -Raw $manifest | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          } else {
+            'Tauri bundle smoke did not produce a manifest; signing/notarization remain unverified.' | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Publish unsigned Tauri bundle summary (macOS)
+        if: always() && matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/ja-tauri-bundle-evidence/tauri-bundle-manifest.json"
+          if [ -f "$manifest" ]; then
+            cat "$manifest" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Tauri bundle smoke did not produce a manifest; signing/notarization remain unverified.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload native build evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -316,6 +465,8 @@ jobs:
             agent/target/ja.exe
             ${{ runner.temp }}/ja-native-evidence
             ${{ runner.temp }}/ja-native-stage
+            src-tauri/target/release/bundle/${{ matrix.tauriBundle }}
+            ${{ runner.temp }}/ja-tauri-bundle-evidence
           if-no-files-found: warn
           compression-level: 0
           retention-days: 7
