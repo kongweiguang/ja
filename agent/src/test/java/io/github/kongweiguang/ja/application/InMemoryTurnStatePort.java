@@ -176,7 +176,15 @@ final class InMemoryTurnStatePort implements TurnStatePort {
                 reservationId, transitioned, null);
     }
 
-    /** Resolves cancellation publication and retains an acknowledgement tombstone. */
+    /**
+     * Resolves cancellation publication and retains an acknowledgement tombstone.
+     *
+     * <p>The test barrier is published and signalled while holding this instance lock. The
+     * completed {@code ackEntered} reference intentionally remains visible until the next
+     * {@link #blockNextAck()} call: the observer can start after a fast acknowledgement and must
+     * still obtain the latch that carried the signal. The lock publishes the reference, while
+     * {@link CountDownLatch#countDown()} provides the normal happens-before edge for the wait.
+     */
     @Override
     public CancellationPublishAcknowledgement acknowledgeCancellationPublished(String reservationId) {
         Objects.requireNonNull(reservationId, "reservationId");
@@ -191,7 +199,6 @@ final class InMemoryTurnStatePort implements TurnStatePort {
             release = ackRelease;
             if (entered != null) {
                 entered.countDown();
-                ackEntered = null;
             }
         }
         if (release != null) {
