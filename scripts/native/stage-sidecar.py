@@ -92,6 +92,37 @@ def validate_build_report(report_path: Path, source: dict[str, Any], source_comm
         raise RuntimeError("build report does not match the native artifact")
 
 
+def manifest_for(
+    source: dict[str, Any],
+    staged: dict[str, Any],
+    platform: str,
+    arch: str,
+    target_triple: str,
+    source_commit: str,
+    mode: str,
+) -> dict[str, Any]:
+    """Build one portable staging record shared by copy and offline dry-run paths."""
+
+    return {
+        "schemaVersion": 1,
+        "product": "JA",
+        "sourceCommit": source_commit,
+        "target": {
+            "platform": platform,
+            "arch": arch,
+            "targetTriple": target_triple,
+        },
+        "nativeImageOnly": True,
+        "noFallback": True,
+        "stagingMode": mode,
+        "sidecar": {
+            "relativePath": f"sidecars/{staged['fileName']}",
+            "sourceArtifact": source,
+            "stagedArtifact": staged,
+        },
+    }
+
+
 def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
     """Atomically publish the manifest so consumers never observe a partially-written JSON file."""
 
@@ -111,6 +142,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arch", required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--build-report", type=Path)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate identity/report and print the expected Tauri sidecar without copying files",
+    )
     return parser.parse_args()
 
 
@@ -126,31 +162,45 @@ def main() -> int:
 
         output_root = args.output_dir.resolve()
         sidecars_root = contained_path(output_root, output_root / "sidecars")
-        sidecars_root.mkdir(parents=True, exist_ok=True)
         staged_name = sidecar_file_name(args.target_triple)
         staged_path = contained_path(sidecars_root, sidecars_root / staged_name)
+        if args.dry_run:
+            expected = {
+                "fileName": staged_name,
+                "sizeBytes": source["sizeBytes"],
+                "sha256": source["sha256"],
+            }
+            manifest = manifest_for(
+                source,
+                expected,
+                args.platform,
+                args.arch,
+                args.target_triple,
+                args.source_commit,
+                "dry-run",
+            )
+            manifest["tauriBundle"] = {
+                "status": "skipped",
+                "skippedReason": "offline staging check does not invoke tauri build or platform signing",
+            }
+            print(json.dumps(manifest, ensure_ascii=False, indent=2))
+            return 0
+
+        sidecars_root.mkdir(parents=True, exist_ok=True)
         shutil.copy2(args.artifact, staged_path)
         staged = artifact_entry(staged_path)
         if staged["sha256"] != source["sha256"] or staged["sizeBytes"] != source["sizeBytes"]:
             raise RuntimeError("staged sidecar differs from the native artifact")
 
-        manifest = {
-            "schemaVersion": 1,
-            "product": "JA",
-            "sourceCommit": args.source_commit,
-            "target": {
-                "platform": args.platform,
-                "arch": args.arch,
-                "targetTriple": args.target_triple,
-            },
-            "nativeImageOnly": True,
-            "noFallback": True,
-            "sidecar": {
-                "relativePath": f"sidecars/{staged_name}",
-                "sourceArtifact": source,
-                "stagedArtifact": staged,
-            },
-        }
+        manifest = manifest_for(
+            source,
+            staged,
+            args.platform,
+            args.arch,
+            args.target_triple,
+            args.source_commit,
+            "copy",
+        )
         write_manifest(output_root / "sidecar-manifest.json", manifest)
     except (OSError, RuntimeError) as failure:
         raise SystemExit(f"cannot stage native sidecar: {failure}") from failure

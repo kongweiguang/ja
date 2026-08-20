@@ -230,6 +230,16 @@ jobs:
           set -euo pipefail
           python3 -B scripts/native/make-build-report.py --artifact agent/target/ja --sbom "$JA_NATIVE_EVIDENCE/ja-agent.json" --smoke "$JA_NATIVE_EVIDENCE/smoke.json" --output "$JA_NATIVE_EVIDENCE/build-report.json" --checksum-output "$JA_NATIVE_EVIDENCE/ja.sha256" --platform macos --arch '${{ matrix.arch }}' --runner '${{ matrix.runner }}' --source-commit "$GITHUB_SHA" --nik-version "$NIK_VERSION" --nik-java-version "$NIK_JAVA_VERSION" --nik-sha256 "$NIK_SHA256" --no-fallback
 
+      - name: Validate sidecar staging contract (Windows dry-run)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage-dry-run'
+          $dryRun = Join-Path $env:JA_NATIVE_EVIDENCE 'sidecar-dry-run.json'
+          python -B scripts/native/stage-sidecar.py --artifact agent/target/ja.exe --output-dir $stage --target-triple '${{ matrix.targetTriple }}' --platform windows --arch '${{ matrix.arch }}' --source-commit $env:GITHUB_SHA --build-report (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') --dry-run | Tee-Object -FilePath $dryRun
+          if ($LASTEXITCODE -ne 0) { throw "sidecar dry-run failed with exit code $LASTEXITCODE" }
+
       - name: Stage Tauri sidecar resource (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -237,6 +247,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
           python -B scripts/native/stage-sidecar.py --artifact agent/target/ja.exe --output-dir $stage --target-triple '${{ matrix.targetTriple }}' --platform windows --arch '${{ matrix.arch }}' --source-commit $env:GITHUB_SHA --build-report (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json')
+
+      - name: Validate sidecar staging contract (macOS dry-run)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/ja-native-stage-dry-run"
+          python3 -B scripts/native/stage-sidecar.py --artifact agent/target/ja --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$GITHUB_SHA" --build-report "$JA_NATIVE_EVIDENCE/build-report.json" --dry-run | tee "$JA_NATIVE_EVIDENCE/sidecar-dry-run.json"
 
       - name: Stage Tauri sidecar resource (macOS)
         if: matrix.platform == 'macos'
