@@ -9,7 +9,7 @@ import { useJaSession, type ProjectPicker, type SettingsAdapter } from "./app/us
 import { useJaWorkbench, type JaWorkbenchAdapters } from "./app/useJaWorkbench";
 import { Button } from "./components/primitives/Button";
 import { Settings } from "./features/settings";
-import { Composer, type ComposerSubmit } from "./features/composer";
+import { Composer, type ComposerAccessMode, type ComposerSubmit } from "./features/composer";
 import { ChatTimeline } from "./features/timeline";
 import { Workbench } from "./features/workspace";
 import type { ApprovalSummary, Turn } from "./ipc/runtimeEvents";
@@ -191,9 +191,41 @@ function Workspace({ session }: WorkspaceProps): ReactElement {
   const approvalDecisions = useTimelineStore(useShallow((state) => selectApprovalDecisions(state)));
   const activeTurn = turns.find((turn) => ["queued", "running", "waiting_approval", "interrupting"].includes(turn.status));
   const profile = session.activeProfile;
-  // Runtime model switching is not wired yet. Expose one option so the
-  // Composer cannot emit a profile choice that the host silently ignores.
-  const models = profile === undefined ? [] : [{ id: profile.profileRevision, label: `${profile.name} · ${profile.model}` }];
+  const { activateProfile, settingsPorts } = session;
+  const onPermissionChange = settingsPorts.onPermissionChange;
+  const models = session.settingsSnapshot.profiles.map((candidate) => ({ id: candidate.profileRevision, label: `${candidate.name} · ${candidate.model}` }));
+  const [modelSwitchBusy, setModelSwitchBusy] = useState(false);
+  const [modelSwitchError, setModelSwitchError] = useState<string>();
+  const [permissionSwitchBusy, setPermissionSwitchBusy] = useState(false);
+  const [permissionSwitchError, setPermissionSwitchError] = useState<string>();
+
+  /** Rebinds the whole sidecar generation so a turn never uses a stale profile. */
+  const changeModel = useCallback(async (profileRevision: string): Promise<void> => {
+    if (profileRevision === profile?.profileRevision) return;
+    setModelSwitchBusy(true);
+    setModelSwitchError(undefined);
+    try {
+      await activateProfile(profileRevision);
+    } catch {
+      setModelSwitchError("切换模型失败，请检查设置和 sidecar 状态。 ");
+    } finally {
+      setModelSwitchBusy(false);
+    }
+  }, [activateProfile, profile?.profileRevision]);
+
+  /** Persists the selected access mode before the next turn can observe it. */
+  const changeAccessMode = useCallback(async (accessMode: ComposerAccessMode): Promise<void> => {
+    if (profile === undefined || profile.accessMode === accessMode || onPermissionChange === undefined) return;
+    setPermissionSwitchBusy(true);
+    setPermissionSwitchError(undefined);
+    try {
+      await onPermissionChange(accessMode);
+    } catch {
+      setPermissionSwitchError("切换访问模式失败，请检查设置和 sidecar 状态。 ");
+    } finally {
+      setPermissionSwitchBusy(false);
+    }
+  }, [onPermissionChange, profile]);
 
   useEffect(() => {
     if (Object.keys(pendingTurnIds).length === 0) {
@@ -230,7 +262,7 @@ function Workspace({ session }: WorkspaceProps): ReactElement {
     // an unbound model and making the selection appear to work.
     const requestedProfileRevision = model?.trim() || profile.profileRevision;
     if (requestedProfileRevision !== profile.profileRevision) {
-      throw new Error("模型切换尚未接入，请先更新活动模型");
+      return;
     }
     submitGuards.current.add(requestThreadId);
     try {
@@ -279,16 +311,18 @@ function Workspace({ session }: WorkspaceProps): ReactElement {
   }
 
   const ready = boot.status === "ready" || boot.status === "busy";
-  const composerDisabled = !ready || profile === undefined || threadId === "" || session.projectBusy || session.historyBusy;
+  const composerDisabled = !ready || profile === undefined || threadId === "" || session.projectBusy || session.historyBusy || modelSwitchBusy || permissionSwitchBusy;
   return (
     <section className="ja-conversation" aria-label="coding 对话">
       <header className="ja-conversation-header"><div><p className="ja-kicker">{session.project.displayName}</p><h1>开始 coding</h1></div><span className="ja-conversation-mode">{profile?.name ?? "未配置模型"}</span></header>
       {boot.status === "recovery_required" ? <RecoveryPanel /> : null}
       {session.projectError === undefined ? null : <p className="ja-inline-error" role="alert">{session.projectError}</p>}
+      {modelSwitchError === undefined ? null : <p className="ja-inline-error" role="alert">{modelSwitchError}</p>}
+      {permissionSwitchError === undefined ? null : <p className="ja-inline-error" role="alert">{permissionSwitchError}</p>}
       {session.historyError === undefined ? null : <p className="ja-inline-error" role="alert">{session.historyError}</p>}
       <ChatTimeline items={items} turns={turns as Turn[]} approvals={approvals} approvalDecisions={approvalDecisions} onApprovalDecision={(approval, decision) => void approve(approval, decision)} />
       {/* Remount transient composer state per thread so A's in-flight submit/cancel cannot disable B. */}
-      <Composer key={threadId} text={draftText} onTextChange={updateDraft} accessMode={profile?.accessMode ?? "workspace"} model={profile?.profileRevision} models={models} activeTurn={activeTurn !== undefined || pendingTurnId !== undefined} disabled={composerDisabled} onSend={send} onCancel={cancel} />
+      <Composer key={threadId} text={draftText} onTextChange={updateDraft} accessMode={profile?.accessMode ?? "workspace"} model={profile?.profileRevision} models={models} activeTurn={activeTurn !== undefined || pendingTurnId !== undefined} disabled={composerDisabled} onModelChange={(value) => void changeModel(value)} onAccessModeChange={(value) => void changeAccessMode(value)} onSend={send} onCancel={cancel} />
     </section>
   );
 }

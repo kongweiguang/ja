@@ -31,6 +31,7 @@ beforeAll(() => {
 const fixture: SettingsSnapshot = {
   ...defaultSettingsSnapshot,
   revision: 1,
+  activeProfileRevision: "profile_anthropic",
   profiles: [{
     id: "profile_anthropic",
     profileRevision: "profile_anthropic",
@@ -93,6 +94,16 @@ describe("JA Settings feature", () => {
     expect(payload).not.toHaveProperty("probe");
     expect(payload).not.toHaveProperty("endpointPath");
     expect(payload).not.toHaveProperty("stream");
+  });
+
+  it("activates a saved non-active model through the host port", async () => {
+    const user = userEvent.setup();
+    const onActivateProfile = vi.fn(async () => undefined);
+    const inactive = { ...fixture.profiles[0]!, id: "profile_openai", profileRevision: "profile_openai", name: "OpenAI backup", model: "gpt-test" };
+    render(<Settings snapshot={{ ...fixture, profiles: [fixture.profiles[0]!, inactive] }} ports={{ onActivateProfile }} />);
+    await user.click(screen.getByRole("button", { name: /OpenAI backup/ }));
+    await user.click(screen.getByRole("button", { name: "设为活动" }));
+    expect(onActivateProfile).toHaveBeenCalledWith("profile_openai");
   });
 
   /** Save failures must remain actionable without presenting a local-only

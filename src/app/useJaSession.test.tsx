@@ -140,6 +140,30 @@ describe("useJaSession history lifecycle", () => {
     expect(result.current.threads[0]?.title).toBe("新对话");
   });
 
+  it("persists an active profile change without losing native profile policy fields", async () => {
+    const runtime = runtimeAdapter();
+    const document = documentFixture();
+    document.profiles.push({ ...document.profiles[0]!, profileRevision: "profile_backup", name: "Backup", model: "backup" });
+    const save = vi.fn(async (_expectedRevision: number, next: SettingsDocument): Promise<SettingsDocument> => next);
+    const adapter: SettingsAdapter = {
+      load: vi.fn(async (): Promise<LoadedSettings> => ({ document, source: "Default", recovered: false, migrated: false })),
+      save,
+    };
+    const { result } = renderHook(() => useJaSession({ settingsAdapter: adapter, projectPicker: { pick: vi.fn(async () => null) }, historyAdapter: {
+      workspaceList: vi.fn(async () => ({ workspaces: [] })),
+      threadList: vi.fn(async () => ({ threads: [] })),
+      threadCreate: vi.fn(async () => ({ thread: thread("ws_fixture", "thr_fixture", "Fixture") })),
+      threadRead: vi.fn(async () => snapshot(thread("ws_fixture", "thr_fixture", "Fixture"))),
+    } }), { wrapper: wrapper(runtime) });
+    await waitFor(() => expect(result.current.activeProfile).toBeDefined());
+
+    await act(async () => { await result.current.activateProfile("profile_backup"); });
+
+    expect(save).toHaveBeenCalledWith(0, expect.objectContaining({ revision: 1, activeProfileRevision: "profile_backup" }));
+    expect(result.current.activeProfile?.profileRevision).toBe("profile_backup");
+    expect(result.current.loadedSettings?.document.profiles.find((profile) => profile.profileRevision === "profile_backup")).toMatchObject({ accessMode: "workspace", skillRevisions: [], mcpRevisions: [] });
+  });
+
   it("restores the first snapshot and drops a late selection result", async () => {
     const runtime = runtimeAdapter();
     let selectedWorkspace = "";

@@ -151,7 +151,7 @@ describe("JA application shell", () => {
     expect(native.calls).not.toContain("start");
   });
 
-  it("exposes only the active model and starts turns with its profile revision", async () => {
+  it("exposes saved models and starts a turn with the activated profile revision", async () => {
     const native = createRuntime();
     const picker = vi.fn(async () => "C:\\dev\\demo");
     render(<App runtime={native.runtime} settingsAdapter={createSettingsAdapter(true)} projectPicker={{ pick: picker }} historyAdapter={createHistoryAdapter()} />);
@@ -160,15 +160,19 @@ describe("JA application shell", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "开始 coding" })).toBeInTheDocument());
     const modelSelect = screen.getByRole("combobox", { name: "模型" });
     expect(modelSelect).toHaveValue("profile_fixture");
-    expect(modelSelect.querySelectorAll("option")).toHaveLength(1);
+    expect(modelSelect.querySelectorAll("option")).toHaveLength(2);
     expect(modelSelect.querySelector("option")).toHaveTextContent("Fixture model · fixture");
     expect(native.calls.indexOf("configure")).toBeGreaterThanOrEqual(0);
     expect(native.calls.indexOf("configure")).toBeLessThan(native.calls.indexOf("start"));
     expect(native.configureInputs[0]).toMatchObject({ rootPath: "C:\\dev\\demo", trust: "trusted", workspaceId: expect.stringMatching(/^ws_/), settings: { activeProfileRevision: "profile_fixture" } });
+    await userEvent.selectOptions(modelSelect, "profile_inactive");
+    await waitFor(() => expect(native.calls).toContain("configure"));
+    await waitFor(() => expect(modelSelect).toHaveValue("profile_inactive"));
+    expect(native.configureInputs.at(-1)).toMatchObject({ settings: { activeProfileRevision: "profile_inactive" } });
     await userEvent.type(screen.getByRole("textbox", { name: "消息" }), "检查项目");
     await userEvent.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() => expect(native.calls).toContain("turnStart"));
-    expect(native.turnInputs[0]).toMatchObject({ profileRevision: "profile_fixture", accessMode: "workspace" });
+    expect(native.turnInputs[0]).toMatchObject({ profileRevision: "profile_inactive", accessMode: "read_only" });
   });
 
   it("saves a profile with CAS while retaining native-only policy fields", async () => {
@@ -188,6 +192,22 @@ describe("JA application shell", () => {
     expect(saved.revision).toBe(1);
     expect(saved.activeProfileRevision).toBe("profile_fixture");
     expect(saved.profiles[0]).toMatchObject({ accessMode: "workspace", skillRevisions: ["skill_fixture"], mcpRevisions: ["mcp_fixture"], name: "Updated fixture" });
+  });
+
+  it("persists a composer access-mode change before the next turn", async () => {
+    const native = createRuntime();
+    const adapter = createSettingsAdapter(true);
+    render(<App runtime={native.runtime} settingsAdapter={adapter} projectPicker={{ pick: vi.fn(async () => "C:\\dev\\demo") }} historyAdapter={createHistoryAdapter()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "选择项目目录" })).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: "选择项目目录" }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "开始 coding" })).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("radio", { name: "只读" }));
+
+    await waitFor(() => expect(adapter.save).toHaveBeenCalledOnce());
+    const saved = adapter.save.mock.calls[0]?.[1] as SettingsDocument;
+    expect(saved.profiles[0]?.accessMode).toBe("read_only");
+    expect(native.configureInputs.at(-1)).toMatchObject({ settings: { activeProfileRevision: "profile_fixture" } });
   });
 
   it("routes cancel through the active turn and does not create a second turn", async () => {

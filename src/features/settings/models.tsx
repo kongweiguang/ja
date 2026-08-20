@@ -14,9 +14,10 @@ import { canonicalRevision, emptyModelDraft, Field, localId, ProbeSummary, provi
  * so a generic endpoint is not mistaken for a native provider with stronger
  * guarantees.
  */
-export function ModelsSection({ profiles: initialProfiles, snapshotRevision = 0, onSaveProfile, onProbeProfile }: { profiles: ModelProfile[]; snapshotRevision?: number; onSaveProfile?: SettingsPorts["onSaveProfile"]; onProbeProfile?: SettingsPorts["onProbeProfile"] }): React.ReactElement {
+export function ModelsSection({ profiles: initialProfiles, activeProfileRevision, snapshotRevision = 0, onSaveProfile, onActivateProfile, onProbeProfile }: { profiles: ModelProfile[]; activeProfileRevision?: string; snapshotRevision?: number; onSaveProfile?: SettingsPorts["onSaveProfile"]; onActivateProfile?: SettingsPorts["onActivateProfile"]; onProbeProfile?: SettingsPorts["onProbeProfile"] }): React.ReactElement {
   const [profiles, setProfiles] = useState(initialProfiles);
-  const [selectedId, setSelectedId] = useState(initialProfiles[0]?.id);
+  const [selectedId, setSelectedId] = useState(activeProfileRevision ?? initialProfiles[0]?.id);
+  const [activating, setActivating] = useState(false);
   const [feedback, setFeedback] = useState<string>();
   const [probe, setProbe] = useState<CapabilityProbe>(initialProfiles[0]?.probe ?? { status: "unknown" });
   const lastSnapshotRevision = useRef(snapshotRevision);
@@ -43,9 +44,9 @@ export function ModelsSection({ profiles: initialProfiles, snapshotRevision = 0,
       return;
     }
     setProfiles(initialProfiles);
-    setSelectedId(initialProfiles[0]?.id);
+    setSelectedId(activeProfileRevision ?? initialProfiles[0]?.id);
     setFeedback(undefined);
-  }, [formState.isDirty, initialProfiles, snapshotRevision]);
+  }, [activeProfileRevision, formState.isDirty, initialProfiles, snapshotRevision]);
 
   /** Update the visible profile only after the optional native save accepts it. */
   const save = async (values: ModelProfileDraft): Promise<void> => {
@@ -89,6 +90,29 @@ export function ModelsSection({ profiles: initialProfiles, snapshotRevision = 0,
     }
   };
 
+  /** Activates only a saved profile; runtime rebinding remains owned by the host session. */
+  const activate = async (): Promise<void> => {
+    if (selected === undefined || activeProfileRevision === selected.profileRevision) return;
+    if (formState.isDirty) {
+      setFeedback("请先保存当前模型草稿，再切换活动模型。 ");
+      return;
+    }
+    if (onActivateProfile === undefined) {
+      setFeedback("切换模型等待 sidecar 接入。 ");
+      return;
+    }
+    setActivating(true);
+    setFeedback(undefined);
+    try {
+      await onActivateProfile(selected.profileRevision);
+      setFeedback("活动模型已切换，运行时正在重新绑定。 ");
+    } catch {
+      setFeedback("切换失败，请检查 sidecar 状态后重试。 ");
+    } finally {
+      setActivating(false);
+    }
+  };
+
   /** Add a local draft so typing never writes settings before Save is pressed. */
   const addProfile = (): void => {
     const id = localId("draft");
@@ -103,7 +127,7 @@ export function ModelsSection({ profiles: initialProfiles, snapshotRevision = 0,
       <SectionHeader title="Models" description="配置模型协议、能力和 credential ref；密钥明文不会进入 JA UI。" action={<Button type="button" variant="secondary" size="sm" onClick={addProfile}><Plus size={15} aria-hidden="true" />新增模型</Button>} />
       <div className="ja-settings-model-layout">
         <div className="ja-settings-profile-list" aria-label="模型配置列表">
-          {profiles.length === 0 ? <p className="ja-settings-empty">还没有模型配置。</p> : profiles.map((profile) => <button key={profile.id} type="button" className={cn("ja-settings-profile-card", profile.id === selectedId && "is-active")} onClick={() => setSelectedId(profile.id)}><span className="ja-settings-profile-icon"><Cloud size={16} aria-hidden="true" /></span><span><strong>{profile.name || "未命名模型"}</strong><small>{profile.model || "未填写模型"}</small></span><span className={`ja-settings-status-dot is-${profile.probe.status}`} aria-label={`能力状态：${profile.probe.status}`} /></button>)}
+          {profiles.length === 0 ? <p className="ja-settings-empty">还没有模型配置。</p> : profiles.map((profile) => <button key={profile.id} type="button" className={cn("ja-settings-profile-card", profile.id === selectedId && "is-active")} onClick={() => setSelectedId(profile.id)}><span className="ja-settings-profile-icon"><Cloud size={16} aria-hidden="true" /></span><span><strong>{profile.name || "未命名模型"}</strong><small>{profile.model || "未填写模型"}</small>{profile.profileRevision === activeProfileRevision ? <small className="ja-settings-profile-active">当前活动</small> : null}</span><span className={`ja-settings-status-dot is-${profile.probe.status}`} aria-label={`能力状态：${profile.probe.status}`} /></button>)}
           <p className="ja-settings-privacy"><KeyRound size={14} aria-hidden="true" />只保存 credential ref，不保存密钥。</p>
         </div>
         <form className="ja-settings-form" onSubmit={(event) => void handleSubmit(save)(event)} noValidate>
@@ -117,7 +141,7 @@ export function ModelsSection({ profiles: initialProfiles, snapshotRevision = 0,
           </div>
           <div className="ja-settings-provider-note"><span>Tool calling、streaming 与 reasoning 仅显示 sidecar probe 结果。</span></div>
           <div className="ja-settings-probe-row"><ProbeSummary probe={probe} /><Button type="button" variant="ghost" size="sm" onClick={() => void probeModel()} disabled={formState.isSubmitting || probe.status === "probing"}><Play size={14} aria-hidden="true" />探测能力</Button></div>
-          <div className="ja-settings-form-actions">{feedback === undefined ? null : <p className="ja-settings-feedback" role="status">{feedback}</p>}<Button type="submit" variant="primary" size="md" loading={formState.isSubmitting}>保存模型</Button></div>
+          <div className="ja-settings-form-actions">{feedback === undefined ? null : <p className="ja-settings-feedback" role="status">{feedback}</p>}<Button type="submit" variant="primary" size="md" loading={formState.isSubmitting}>保存模型</Button>{selected !== undefined && selected.profileRevision !== activeProfileRevision ? <Button type="button" variant="secondary" size="md" loading={activating} disabled={formState.isSubmitting || formState.isDirty || activating} onClick={() => void activate()}>设为活动</Button> : null}</div>
         </form>
       </div>
     </div>

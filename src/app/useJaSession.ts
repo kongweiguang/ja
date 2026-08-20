@@ -67,6 +67,7 @@ export interface JaSession {
   historyBusy: boolean;
   historyError: string | undefined;
   settingsPorts: SettingsPorts;
+  activateProfile: (profileRevision: string) => Promise<void>;
   reloadSettings: () => Promise<void>;
 }
 
@@ -112,6 +113,7 @@ function toSettingsSnapshot(document: SettingsDocument): SettingsSnapshot {
   const active = document.profiles.find((profile) => profile.profileRevision === document.activeProfileRevision);
   return {
     revision: document.revision,
+    ...(document.activeProfileRevision === undefined || document.activeProfileRevision === null ? {} : { activeProfileRevision: document.activeProfileRevision }),
     profiles,
     // MCP configuration is real document data; enabled entries stay visibly
     // unverified until the sidecar supplies a health/tool projection, never
@@ -417,6 +419,7 @@ export function useJaSession({
   const settingsSnapshot = useMemo(
     () => loadedSettings === undefined ? {
       revision: 0,
+      activeProfileRevision: undefined,
       profiles: [],
       skills: [],
       mcpServers: [],
@@ -506,6 +509,27 @@ export function useJaSession({
         : current.document.profiles.map((item) => item.profileRevision === profile.profileRevision ? merged : item),
     };
     const saved = await saveDocument(nextDocument);
+    await reconfigureProject(saved);
+  }, [reconfigureProject, saveDocument]);
+
+  /** Persists the selected profile pointer and restarts the bound workspace runtime. */
+  const activateProfile = useCallback(async (profileRevision: string): Promise<void> => {
+    const current = settingsRef.current;
+    if (current === undefined) {
+      throw new Error("settings unavailable");
+    }
+    const target = current.document.profiles.find((profile) => profile.profileRevision === profileRevision);
+    if (target === undefined) {
+      throw new Error("profile unavailable");
+    }
+    if (current.document.activeProfileRevision === profileRevision) {
+      return;
+    }
+    const saved = await saveDocument({
+      ...current.document,
+      revision: current.document.revision + 1,
+      activeProfileRevision: profileRevision,
+    });
     await reconfigureProject(saved);
   }, [reconfigureProject, saveDocument]);
 
@@ -686,9 +710,10 @@ export function useJaSession({
 
   const settingsPorts = useMemo<SettingsPorts>(() => ({
     onSaveProfile: saveProfile,
+    onActivateProfile: activateProfile,
     onPermissionChange: savePermission,
     onAppearanceChange: saveAppearance,
-  }), [saveAppearance, savePermission, saveProfile]);
+  }), [activateProfile, saveAppearance, savePermission, saveProfile]);
 
   return {
     loadedSettings,
@@ -710,6 +735,7 @@ export function useJaSession({
     historyBusy,
     historyError,
     settingsPorts,
+    activateProfile,
     reloadSettings,
   };
 }

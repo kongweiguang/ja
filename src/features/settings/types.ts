@@ -125,6 +125,8 @@ export interface RuntimeSettings {
  */
 export interface SettingsPorts {
   onSaveProfile?: (profile: ModelProfileSave) => Promise<void>;
+  /** Activates a persisted profile and lets the host restart its bound runtime. */
+  onActivateProfile?: (profileRevision: string) => Promise<void>;
   onProbeProfile?: (profile: ModelProfileSave) => Promise<CapabilityProbe>;
   onSaveMcp?: (server: McpServerSave) => Promise<void>;
   onTestMcp?: (id: string) => Promise<McpStatus>;
@@ -140,6 +142,7 @@ export interface SettingsPorts {
 
 export interface SettingsSnapshot {
   revision: number;
+  activeProfileRevision?: string;
   profiles: ModelProfile[];
   skills: SkillProjection[];
   mcpServers: McpServerProjection[];
@@ -155,6 +158,7 @@ export interface SettingsSnapshot {
  */
 export const defaultSettingsSnapshot: SettingsSnapshot = {
   revision: 0,
+  activeProfileRevision: undefined,
   profiles: [],
   skills: [],
   mcpServers: [],
