@@ -1,0 +1,5 @@
+# @author kongweiguang
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# SQLite migrations are hashed from exact UTF-8 bytes; keep checkout bytes stable on Windows.
+*.sql text eol=lf

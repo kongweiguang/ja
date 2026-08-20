@@ -22,6 +22,7 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -40,10 +41,22 @@ class StdioRuntimeChildIntegrationTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String READY_TOKEN = "0123456789abcdef0123456789abcdef";
 
+    /**
+     * Resolves the current JVM launcher using the host platform suffix instead of assuming
+     * Windows. The child integration tests intentionally launch the same Java runtime as Maven,
+     * so using the platform-native name keeps the full-duplex process contract portable.
+     */
+    private static String javaExecutable() {
+        String executable = System.getProperty("os.name", "")
+                .toLowerCase(Locale.ROOT)
+                .contains("win") ? "java.exe" : "java";
+        return Path.of(System.getProperty("java.home"), "bin", executable).toString();
+    }
+
     /** Verifies initialize/ready/fake Turn/shutdown through an actual Java child process. */
     @Test
     void childCompletesHandshakeFakeTurnAndCleanShutdown() throws Exception {
-        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        String java = javaExecutable();
         Process process = startChild(java);
         CompletableFuture<String> stderr = CompletableFuture.supplyAsync(() -> readAll(process));
         try (BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
@@ -96,7 +109,7 @@ class StdioRuntimeChildIntegrationTest {
     /** Verifies the real fake child round-trips one approval using only the private JSON-RPC id. */
     @Test
     void childApprovalFixtureRoundTripsPrivateRequestAndCleanShutdown() throws Exception {
-        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        String java = javaExecutable();
         Process process = startChild(java);
         CompletableFuture<String> stderr = CompletableFuture.supplyAsync(() -> readAll(process));
         BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
@@ -258,7 +271,7 @@ class StdioRuntimeChildIntegrationTest {
     /** Verifies shutdown interrupts a child waiting for approval and still reaches exit zero. */
     @Test
     void childShutdownWhileApprovalWaitsDoesNotHang() throws Exception {
-        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        String java = javaExecutable();
         Process process = startChild(java);
         CompletableFuture<String> stderr = CompletableFuture.supplyAsync(() -> readAll(process));
         BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
@@ -324,7 +337,7 @@ class StdioRuntimeChildIntegrationTest {
     /** Verifies explicit fake data roots persist the history surface across two real App children. */
     @Test
     void childFakeHistoryPersistsOnlyWithExplicitDataDirectory() throws Exception {
-        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        String java = javaExecutable();
         Path root = Files.createTempDirectory("ja-fake-history-child-");
         Path workspace = Files.createDirectory(root.resolve("workspace"));
         Path data = root.resolve("data");
@@ -419,7 +432,7 @@ class StdioRuntimeChildIntegrationTest {
     /** Verifies an identical client request id cannot admit a second fake turn. */
     @Test
     void duplicateTurnRequestIdIsRejectedWithoutSecondTurn() throws Exception {
-        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        String java = javaExecutable();
         Process process = startChild(java);
         BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
                 process.getOutputStream(), StandardCharsets.UTF_8));
@@ -473,7 +486,7 @@ class StdioRuntimeChildIntegrationTest {
     /** Verifies business requests are rejected before ready and EOF still exits normally. */
     @Test
     void childRejectsTurnBeforeHandshakeAndExitsOnEof() throws Exception {
-        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        String java = javaExecutable();
         Process process = startChild(java);
         CompletableFuture<String> stderr = CompletableFuture.supplyAsync(() -> readAll(process));
         try (BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
@@ -557,7 +570,7 @@ class StdioRuntimeChildIntegrationTest {
      */
     @Test
     void childActivatesFakeProfileThenCancelsTurnAndShutsDown() throws Exception {
-        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        String java = javaExecutable();
         Path root = Files.createTempDirectory("ja-fake-child-");
         Path workspace = Files.createDirectory(root.resolve("workspace"));
         Path data = root.resolve("data");
@@ -650,7 +663,7 @@ class StdioRuntimeChildIntegrationTest {
     /** Verifies fake activation rejects a data file and a final symlink with the stable state error. */
     @Test
     void childRejectsInvalidFakeDataDirectories() throws Exception {
-        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        String java = javaExecutable();
         Path root = Files.createTempDirectory("ja-fake-invalid-data-");
         Path workspace = Files.createDirectory(root.resolve("workspace"));
         Path dataFile = Files.createFile(root.resolve("data-file"));
@@ -707,7 +720,7 @@ class StdioRuntimeChildIntegrationTest {
     /** Verifies shutdown exits with stdin still open and drains an accepted turn terminal. */
     @Test
     void childShutdownExitsWithOpenStdinAndDrainsAcceptedTurn() throws Exception {
-        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        String java = javaExecutable();
         Process process = startChild(java);
         CompletableFuture<String> stderr = CompletableFuture.supplyAsync(() -> readAll(process));
         BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
@@ -758,7 +771,7 @@ class StdioRuntimeChildIntegrationTest {
     /** Verifies large Unicode output is split by UTF-8 bytes and preserves trailing whitespace. */
     @Test
     void childStreamsLargeUnicodeWithCompleteFinalItem() throws Exception {
-        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        String java = javaExecutable();
         Process process = startChild(java);
         BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
                 process.getOutputStream(), StandardCharsets.UTF_8));
@@ -809,7 +822,7 @@ class StdioRuntimeChildIntegrationTest {
     /** Verifies a pipelined shutdown cannot overtake the ready notification. */
     @Test
     void pipelinedShutdownWaitsForReadyOnControlLane() throws Exception {
-        String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+        String java = javaExecutable();
         Process process = startChild(java);
         BufferedWriter input = new BufferedWriter(new OutputStreamWriter(
                 process.getOutputStream(), StandardCharsets.UTF_8));
