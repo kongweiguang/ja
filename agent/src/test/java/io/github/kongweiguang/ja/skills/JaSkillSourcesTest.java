@@ -4,7 +4,7 @@
 package io.github.kongweiguang.ja.skills;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -17,10 +17,10 @@ import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.skill.AgentSkill;
 import io.agentscope.core.skill.repository.AgentSkillRepository;
 import io.agentscope.core.tool.ToolCallParam;
-import io.agentscope.core.tool.Toolkit;
+import io.agentscope.harness.agent.HarnessAgent;
 import io.agentscope.harness.agent.middleware.HarnessSkillMiddleware;
-import io.agentscope.harness.agent.skill.LazyResourceCapable;
 import io.agentscope.harness.agent.skill.runtime.SkillLoadTool;
+import io.github.kongweiguang.ja.tools.JaSandboxFilesystem;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -55,7 +55,9 @@ class JaSkillSourcesTest {
                     .getSkill("workspace-skill");
             assertNotNull(workspaceSkill);
             assertTrue(workspaceSkill.getSkillContent().contains("workspace body"));
-            assertTrue(sources.repository(JaSkillSources.Source.WORKSPACE) instanceof LazyResourceCapable);
+            // The workspace repository is a settings projection only; AgentScope creates the
+            // context-aware runtime repository while building the Harness.
+            assertEquals(2, sources.repositories().size());
 
             writeSkill(workspaceRoot.resolve("skills"), "workspace-skill", "updated summary",
                     "updated body", "workspace");
@@ -97,8 +99,9 @@ class JaSkillSourcesTest {
         }
     }
 
+    /** Verifies the Harness, rather than a JA repository, owns workspace loading and resources. */
     @Test
-    void harnessMiddlewareAndSkillLoadToolUseUpstreamResourcePath() throws Exception {
+    void harnessBuilderOwnsWorkspaceLayerAndSkillLoadTool() throws Exception {
         Path userRoot = Files.createDirectories(tempDir.resolve("user-skills"));
         Path workspaceRoot = Files.createDirectories(tempDir.resolve("workspace"));
         writeSkill(userRoot, "user-skill", "user summary", "user body", "user");
@@ -113,29 +116,43 @@ class JaSkillSourcesTest {
                     .getSkill("coding");
             AgentSkill userSkill = sources.repository(JaSkillSources.Source.USER)
                     .getSkill("user-skill");
-            AgentSkill skill = sources.repository(JaSkillSources.Source.WORKSPACE).getSkill("harness-skill");
             assertNotNull(builtinSkill);
             assertNotNull(userSkill);
-            assertNotNull(skill);
-            RuntimeContext context = RuntimeContext.empty();
-            HarnessSkillMiddleware middleware = new HarnessSkillMiddleware(
-                    sources.repositories(), new Toolkit(), sources.skillFilter());
-            String prompt = middleware.onSystemPrompt(null, context, "base").block();
-            assertNotNull(prompt);
-            assertTrue(prompt.contains("coding"));
-            assertTrue(prompt.contains("user-skill"));
-            assertTrue(prompt.contains("harness-skill"));
+            JaSandboxFilesystem filesystem = new JaSandboxFilesystem(workspaceRoot);
+            HarnessAgent agent = HarnessAgent.builder()
+                    .workspace(workspaceRoot)
+                    .abstractFilesystem(filesystem)
+                    .skillRepositories(sources.repositories())
+                    .skillFilter(sources.skillFilter())
+                    .build();
+            try {
+                RuntimeContext context = RuntimeContext.empty();
+                HarnessSkillMiddleware middleware = agent.getDelegate().getMiddlewares().stream()
+                        .filter(HarnessSkillMiddleware.class::isInstance)
+                        .map(HarnessSkillMiddleware.class::cast)
+                        .findFirst().orElseThrow();
+                String prompt = middleware.onSystemPrompt(agent.getDelegate(), context, "base").block();
+                assertNotNull(prompt);
+                assertTrue(prompt.contains("coding"));
+                assertTrue(prompt.contains("user-skill"));
+                assertTrue(prompt.contains("harness-skill"));
 
-            SkillLoadTool loader = (SkillLoadTool) middleware.runtime().loadTool();
-            String builtinBody = load(loader, context, builtinSkill, "SKILL.md");
-            String userBody = load(loader, context, userSkill, "SKILL.md");
-            String body = load(loader, context, skill, "SKILL.md");
-            assertTrue(builtinBody.contains("coding"), builtinBody);
-            assertTrue(userBody.contains("user body"), userBody);
-            assertTrue(body.contains("harness body"), body);
-            String guide = load(loader, context, skill, "references/guide.md");
-            assertTrue(guide.contains("harness resource"), guide);
-
+                SkillLoadTool loader = (SkillLoadTool) middleware.runtime().loadTool();
+                String builtinBody = load(loader, context, builtinSkill, "SKILL.md");
+                String userBody = load(loader, context, userSkill, "SKILL.md");
+                AgentSkill skill = middleware.runtime().currentCatalog(context).all().stream()
+                        .filter(entry -> entry.skill().getName().equals("harness-skill"))
+                        .findFirst().orElseThrow().skill();
+                String body = load(loader, context, skill, "SKILL.md");
+                assertTrue(builtinBody.contains("coding"), builtinBody);
+                assertTrue(userBody.contains("user body"), userBody);
+                assertTrue(body.contains("harness body"), body);
+                String guide = load(loader, context, skill, "references/guide.md");
+                assertTrue(guide.contains("harness resource"), guide);
+            } finally {
+                agent.close();
+                filesystem.close();
+            }
         }
     }
 
@@ -177,8 +194,9 @@ class JaSkillSourcesTest {
         }
     }
 
+    /** Verifies revision projection sees binary resource changes without a custom snapshot repository. */
     @Test
-    void revisionAndFrozenResourcesPreserveInvalidUtf8Bytes() throws Exception {
+    void revisionsPreserveInvalidUtf8BytesAndRemainLiveUntilRestart() throws Exception {
         Path userRoot = Files.createDirectories(tempDir.resolve("user-skills"));
         Path workspaceRoot = Files.createDirectories(tempDir.resolve("workspace"));
         writeSkill(workspaceRoot.resolve("skills"), "binary-skill", "summary", "body", "workspace");
@@ -196,18 +214,10 @@ class JaSkillSourcesTest {
             Files.write(resource, original);
             String originalRevision = revisionOf(sources, "binary-skill");
             sources.freeze(List.of(originalRevision));
-            LazyResourceCapable frozen = (LazyResourceCapable) sources.repository(
-                    JaSkillSources.Source.WORKSPACE);
-            byte[] captured = frozen.resourcesFor("binary-skill", RuntimeContext.empty())
-                    .readBinary("references/blob.bin").orElseThrow();
-            assertArrayEquals(original, captured);
-
-            captured[0] = 0;
-            assertArrayEquals(original, frozen.resourcesFor("binary-skill", RuntimeContext.empty())
-                    .readBinary("references/blob.bin").orElseThrow());
             Files.write(resource, changed);
-            assertArrayEquals(original, frozen.resourcesFor("binary-skill", RuntimeContext.empty())
-                    .readBinary("references/blob.bin").orElseThrow());
+            // Activation only installs AgentScope's name filter. The workspace source remains live
+            // and is reloaded on the next sidecar graph, rather than being snapshotted twice here.
+            assertNotEquals(originalRevision, revisionOf(sources, "binary-skill"));
         }
     }
 
@@ -234,16 +244,17 @@ class JaSkillSourcesTest {
         }
     }
 
+    /** Verifies duplicate skill names are accepted for AgentScope's later-repository precedence. */
     @Test
-    void freezeRejectsSameNameAcrossSourcesAndPreservesSnapshotAfterDiskEdit() throws Exception {
+    void duplicateNamesFollowUpstreamPrecedenceAndActivationRemainsLive() throws Exception {
         Path userRoot = Files.createDirectories(tempDir.resolve("user-skills"));
         Path workspaceRoot = Files.createDirectories(tempDir.resolve("workspace"));
         writeSkill(userRoot, "duplicate-skill", "user", "user body", "user");
         writeSkill(workspaceRoot.resolve("skills"), "duplicate-skill", "workspace", "workspace body",
                 "workspace");
         try (JaSkillSources sources = new JaSkillSources(userRoot, workspaceRoot)) {
-            assertEquals("SKILL_INVALID", assertThrows(IllegalArgumentException.class,
-                    () -> sources.freeze(List.of())).getMessage());
+            assertDoesNotThrow(() -> sources.freeze(List.of()));
+            assertFalse(sources.skillFilter().isAllowed("duplicate-skill"));
         }
 
         Path snapshotWorkspace = Files.createDirectories(tempDir.resolve("snapshot-workspace"));
@@ -262,16 +273,13 @@ class JaSkillSourcesTest {
                     StandardCharsets.UTF_8);
             Files.writeString(resource, "changed resource", StandardCharsets.UTF_8);
             assertTrue(captured.getSkillContent().contains("original body"));
-            assertEquals(revision, revisionOf(sources, "snapshot-skill"));
-            LazyResourceCapable frozen = (LazyResourceCapable) sources.repository(
-                    JaSkillSources.Source.WORKSPACE);
-            assertEquals("original resource", frozen.resourcesFor("snapshot-skill",
-                    RuntimeContext.empty()).read("references/guide.md").orElseThrow());
+            assertNotEquals(revision, revisionOf(sources, "snapshot-skill"));
         }
     }
 
+    /** Verifies the real AgentScope SkillLoadTool can lazily read the live workspace source. */
     @Test
-    void frozenRepositoryRemainsVisibleToRealSkillLoadTool() throws Exception {
+    void liveWorkspaceRepositoryRemainsVisibleToRealSkillLoadTool() throws Exception {
         Path userRoot = Files.createDirectories(tempDir.resolve("user-skills"));
         Path workspaceRoot = Files.createDirectories(tempDir.resolve("workspace"));
         writeSkill(workspaceRoot.resolve("skills"), "frozen-load-skill", "summary", "frozen body",
@@ -283,17 +291,32 @@ class JaSkillSourcesTest {
         try (JaSkillSources sources = new JaSkillSources(userRoot, workspaceRoot)) {
             String revision = revisionOf(sources, "frozen-load-skill");
             sources.freeze(List.of(revision));
-            RuntimeContext context = RuntimeContext.empty();
-            HarnessSkillMiddleware middleware = new HarnessSkillMiddleware(
-                    sources.repositories(), new Toolkit(), sources.skillFilter());
-            String prompt = middleware.onSystemPrompt(null, context, "base").block();
-            assertTrue(prompt.contains("frozen-load-skill"));
-            SkillLoadTool loader = (SkillLoadTool) middleware.runtime().loadTool();
-            AgentSkill skill = sources.repository(JaSkillSources.Source.WORKSPACE)
-                    .getSkill("frozen-load-skill");
-            assertTrue(load(loader, context, skill, "SKILL.md").contains("frozen body"));
-            assertTrue(load(loader, context, skill, "references/guide.md")
-                    .contains("frozen resource"));
+            JaSandboxFilesystem filesystem = new JaSandboxFilesystem(workspaceRoot);
+            HarnessAgent agent = HarnessAgent.builder()
+                    .workspace(workspaceRoot)
+                    .abstractFilesystem(filesystem)
+                    .skillRepositories(sources.repositories())
+                    .skillFilter(sources.skillFilter())
+                    .build();
+            try {
+                RuntimeContext context = RuntimeContext.empty();
+                HarnessSkillMiddleware middleware = agent.getDelegate().getMiddlewares().stream()
+                        .filter(HarnessSkillMiddleware.class::isInstance)
+                        .map(HarnessSkillMiddleware.class::cast)
+                        .findFirst().orElseThrow();
+                String prompt = middleware.onSystemPrompt(agent.getDelegate(), context, "base").block();
+                assertTrue(prompt.contains("frozen-load-skill"));
+                SkillLoadTool loader = (SkillLoadTool) middleware.runtime().loadTool();
+                AgentSkill skill = middleware.runtime().currentCatalog(context).all().stream()
+                        .filter(entry -> entry.skill().getName().equals("frozen-load-skill"))
+                        .findFirst().orElseThrow().skill();
+                assertTrue(load(loader, context, skill, "SKILL.md").contains("frozen body"));
+                assertTrue(load(loader, context, skill, "references/guide.md")
+                        .contains("frozen resource"));
+            } finally {
+                agent.close();
+                filesystem.close();
+            }
         }
     }
 

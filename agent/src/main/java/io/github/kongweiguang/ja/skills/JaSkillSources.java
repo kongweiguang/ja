@@ -12,14 +12,11 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.skill.AgentSkill;
 import io.agentscope.core.skill.SkillFilter;
 import io.agentscope.core.skill.repository.AgentSkillRepository;
-import io.agentscope.core.skill.repository.AgentSkillRepositoryInfo;
 import io.agentscope.core.skill.repository.ClasspathSkillRepository;
 import io.agentscope.core.skill.repository.FileSystemSkillRepository;
 import io.agentscope.harness.agent.HarnessAgent;
-import io.agentscope.harness.agent.filesystem.local.LocalFilesystem;
 import io.agentscope.harness.agent.skill.LazyResourceCapable;
 import io.agentscope.harness.agent.skill.SkillResources;
-import io.agentscope.harness.agent.skill.WorkspaceSkillRepository;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -50,7 +47,8 @@ import java.util.Set;
  *
  * <p>AgentScope remains responsible for markdown parsing, repository traversal, middleware
  * composition, and SkillLoadTool execution. JA only calculates a stable revision projection and
- * freezes the exact upstream {@link AgentSkill} values selected for one generation.
+ * applies the selected-name filter; AgentScope owns the live workspace repository and per-turn
+ * resource loading.
  */
 public final class JaSkillSources implements AutoCloseable {
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -93,28 +91,27 @@ public final class JaSkillSources implements AutoCloseable {
     }
 
     private final EnumMap<Source, AgentSkillRepository> repositories = new EnumMap<>(Source.class);
-    /** The only persisted activation projection; it is replaced atomically by freeze. */
+    /** Root used to create short-lived metadata views; never passed to the Harness builder. */
+    private final Path workspaceSkillsRoot;
+    /** The only activation projection; it is replaced atomically when profile selection is applied. */
     private Set<String> enabledNames = Set.of();
-    private boolean frozen;
+    private boolean activated;
     private boolean closed;
 
     /**
-     * Creates the built-in, user, and workspace mappings with upstream implementations. Built-in
-     * discovery stays on AgentScope's classpath repository and only materializes its exact resource
-     * when Native Image cannot provide the browsable directory URL.
+     * Creates the built-in and user runtime mappings with upstream implementations. Workspace
+     * metadata is read through a projection-only repository; the Harness receives no duplicate
+     * workspace repository and therefore keeps AgentScope's AbstractFilesystem-backed layer as the
+     * sole runtime workspace source.
      */
     public JaSkillSources(Path userSkillsRoot, Path workspaceRoot) throws IOException {
         Path userRoot = userSkillsRoot == null ? null : ensureDirectory(userSkillsRoot, "user");
+        workspaceSkillsRoot = workspaceRoot == null
+                ? null : ensureDirectory(workspaceRoot, "workspace").resolve("skills");
         repositories.put(Source.BUILTIN, builtinRepository(userRoot));
         if (userRoot != null) {
             repositories.put(Source.USER,
                     new FileSystemSkillRepository(userRoot, false, "user", false));
-        }
-        if (workspaceRoot != null) {
-            Path workspace = ensureDirectory(workspaceRoot, "workspace");
-            LocalFilesystem filesystem = new LocalFilesystem(workspace);
-            repositories.put(Source.WORKSPACE, new WorkspaceSkillRepository(
-                    filesystem, "skills", RuntimeContext::empty, "workspace", false));
         }
     }
 
@@ -253,42 +250,39 @@ public final class JaSkillSources implements AutoCloseable {
         }
     }
 
-    /** Returns the repositories in built-in → user → workspace precedence order. */
+    /** Returns only explicit repositories passed to Harness; the workspace projection is excluded. */
     public synchronized List<AgentSkillRepository> repositories() {
         ensureOpen();
-        return List.copyOf(repositories.values());
+        return repositories.entrySet().stream()
+                .filter(entry -> entry.getKey() != Source.WORKSPACE)
+                .map(Map.Entry::getValue)
+                .toList();
     }
 
-    /** Returns one upstream repository for direct composition with a Harness builder. */
+    /** Returns one repository for settings projection; workspace views are short-lived and never a Harness input. */
     public synchronized AgentSkillRepository repository(Source source) {
         ensureOpen();
-        return repositories.get(Objects.requireNonNull(source, "source"));
+        Source requested = Objects.requireNonNull(source, "source");
+        return requested == Source.WORKSPACE ? workspaceProjectionRepository() : repositories.get(requested);
     }
 
     /**
-     * Freezes the exact selected revisions before the Harness is built. This is the narrow adapter
-     * needed because upstream repositories expose live reads but no revision API; no markdown
-     * parser, catalog, watcher, or last-good state is introduced here.
+     * Activates selected revisions before the Harness is built. Repositories remain live and
+     * AgentScope's HarnessSkillMiddleware performs the actual merge, lazy loading, and duplicate
+     * name precedence; this method only maps product revisions to AgentScope's name filter.
      */
     public synchronized void freeze(List<String> selectedRevisions) {
         ensureOpen();
-        if (frozen) {
+        if (activated) {
             return;
         }
         List<Candidate> candidates = candidates();
         Map<String, Candidate> byRevision = new HashMap<>();
-        Map<String, List<Candidate>> byName = new HashMap<>();
         for (Candidate candidate : candidates) {
-            if (byRevision.put(candidate.revision(), candidate) != null) {
-                throw new IllegalArgumentException("SKILL_INVALID");
-            }
-            byName.computeIfAbsent(candidate.skill().getName(), ignored -> new ArrayList<>())
-                    .add(candidate);
-        }
-        for (List<Candidate> sameName : byName.values()) {
-            if (sameName.size() > 1) {
-                throw new IllegalArgumentException("SKILL_INVALID");
-            }
+            // AgentScope deliberately lets later repositories override duplicate names. A
+            // revision collision is likewise resolved by the later candidate instead of creating
+            // a second JA duplicate-rejection policy.
+            byRevision.put(candidate.revision(), candidate);
         }
         Set<String> selected = selectedRevisions == null
                 ? Set.of() : Set.copyOf(selectedRevisions);
@@ -303,14 +297,8 @@ public final class JaSkillSources implements AutoCloseable {
                 enabledNames.add(candidate.skill().getName());
             }
         }
-        for (Map.Entry<Source, AgentSkillRepository> entry : List.copyOf(repositories.entrySet())) {
-            List<Candidate> snapshot = candidates.stream()
-                    .filter(candidate -> candidate.source() == entry.getKey())
-                    .toList();
-            repositories.put(entry.getKey(), new FrozenRepository(entry.getValue(), snapshot));
-        }
         this.enabledNames = Set.copyOf(enabledNames);
-        frozen = true;
+        activated = true;
     }
 
     /**
@@ -336,14 +324,14 @@ public final class JaSkillSources implements AutoCloseable {
     public synchronized SkillFilter skillFilter() {
         ensureOpen();
         // Before activation discovery must remain live and must not invent a second enable state.
-        return frozen ? selectedFilter() : SkillFilter.all();
+        return activated ? selectedFilter() : SkillFilter.all();
     }
 
     /** Projects current upstream metadata, with revision/hash values derived from actual content. */
     public synchronized List<SkillView> projection() {
         ensureOpen();
         return candidates().stream().map(candidate -> view(candidate,
-                !frozen || enabledNames.contains(candidate.skill().getName()))).toList();
+                !activated || enabledNames.contains(candidate.skill().getName()))).toList();
     }
 
     /** Projects builtin-only or selected profile state without mutating the active generation. */
@@ -354,7 +342,7 @@ public final class JaSkillSources implements AutoCloseable {
                 candidate.source() == Source.BUILTIN || selected.contains(candidate.revision()))).toList();
     }
 
-    /** Closes upstream repositories, including classpath jar resources and frozen snapshots. */
+    /** Closes explicit repositories, including classpath resources; projection views are per-call. */
     @Override
     public synchronized void close() {
         if (closed) {
@@ -371,28 +359,47 @@ public final class JaSkillSources implements AutoCloseable {
     /** Reads all upstream skills once so revision, duplicate, and selection checks share one view. */
     private List<Candidate> candidates() {
         List<Candidate> result = new ArrayList<>();
-        for (Map.Entry<Source, AgentSkillRepository> entry : repositories.entrySet()) {
-            try {
-                for (AgentSkill skill : entry.getValue().getAllSkills()) {
-                    if (skill != null && skill.getName() != null && !skill.getName().isBlank()) {
-                        Materialized materialized = materialize(entry.getValue(), skill);
-                        result.add(new Candidate(entry.getKey(), materialized.skill(),
-                                materialized.resources(),
-                                revision(entry.getKey(), materialized.skill(),
-                                        materialized.resources())));
-                    }
-                }
-            } catch (RuntimeException exception) {
-                throw new IllegalArgumentException("SKILL_INVALID");
+        AgentSkillRepository workspaceProjection = workspaceProjectionRepository();
+        try {
+            List<Map.Entry<Source, AgentSkillRepository>> sources = new ArrayList<>();
+            repositories.forEach((source, repository) ->
+                    sources.add(Map.entry(source, repository)));
+            if (workspaceProjection != null) {
+                sources.add(Map.entry(Source.WORKSPACE, workspaceProjection));
             }
+            for (Map.Entry<Source, AgentSkillRepository> entry : sources) {
+                try {
+                    for (AgentSkill skill : entry.getValue().getAllSkills()) {
+                        if (skill != null && skill.getName() != null && !skill.getName().isBlank()) {
+                            Materialized materialized = materialize(entry.getValue(), skill);
+                            result.add(new Candidate(entry.getKey(), materialized.skill(),
+                                    materialized.resources(),
+                                    revision(entry.getKey(), materialized.skill(),
+                                            materialized.resources())));
+                        }
+                    }
+                } catch (RuntimeException exception) {
+                    throw new IllegalArgumentException("SKILL_INVALID");
+                }
+            }
+        } finally {
+            closeQuietly(workspaceProjection);
         }
         return List.copyOf(result);
     }
 
+    /** Creates a fresh metadata repository so settings refresh observes same-size file edits. */
+    private AgentSkillRepository workspaceProjectionRepository() {
+        if (workspaceSkillsRoot == null || !Files.isDirectory(workspaceSkillsRoot)) {
+            return null;
+        }
+        return new FileSystemSkillRepository(workspaceSkillsRoot, false, "workspace", false);
+    }
+
     /**
-     * Materializes resources only at projection/freeze boundaries because AgentScope's workspace
-     * repository intentionally exposes them lazily. This keeps resource hashing and the frozen
-     * SkillLoadTool snapshot faithful without replacing the upstream repository implementation.
+     * Materializes resources only at projection/activation boundaries because AgentScope's runtime
+     * workspace repository intentionally exposes them lazily. This keeps revision hashing faithful
+     * without replacing the upstream repository or its SkillLoadTool path.
      */
     private static Materialized materialize(AgentSkillRepository repository, AgentSkill skill) {
         Map<String, String> declared = skill.getResources() == null
@@ -452,124 +459,6 @@ public final class JaSkillSources implements AutoCloseable {
                 candidate.revision().substring("skill_".length()));
     }
 
-    /** Builds an upstream-only snapshot repository so a later disk edit cannot change this graph. */
-    private static final class FrozenRepository implements AgentSkillRepository, LazyResourceCapable {
-        private final AgentSkillRepository delegate;
-        private final Map<String, AgentSkill> skills;
-        private final Map<String, ResourceSnapshot> resources;
-        private final String source;
-
-        /** Retains parsed upstream AgentSkill values and closes the original repository later. */
-        private FrozenRepository(AgentSkillRepository delegate, List<Candidate> snapshot) {
-            this.delegate = Objects.requireNonNull(delegate, "delegate");
-            this.source = delegate.getSource();
-            Map<String, AgentSkill> values = new LinkedHashMap<>();
-            Map<String, ResourceSnapshot> resourceValues = new LinkedHashMap<>();
-            for (Candidate candidate : snapshot) {
-                values.put(candidate.skill().getName(), candidate.skill());
-                resourceValues.put(candidate.skill().getName(), candidate.resources());
-            }
-            this.skills = Map.copyOf(values);
-            this.resources = Map.copyOf(resourceValues);
-        }
-
-        /** Returns the immutable parsed skill instead of rereading SKILL.md from disk. */
-        @Override
-        public AgentSkill getSkill(String name) {
-            return skills.get(name);
-        }
-
-        /** Returns the immutable skill names captured during activation. */
-        @Override
-        public List<String> getAllSkillNames() {
-            return List.copyOf(skills.keySet());
-        }
-
-        /** Returns the immutable AgentScope values used by Harness middleware. */
-        @Override
-        public List<AgentSkill> getAllSkills() {
-            return List.copyOf(skills.values());
-        }
-
-        /** Snapshot repositories are read-only; settings changes create a new graph. */
-        @Override
-        public boolean save(List<AgentSkill> skills, boolean overwrite) {
-            return false;
-        }
-
-        /** Snapshot repositories never delete user files as an activation side effect. */
-        @Override
-        public boolean delete(String name) {
-            return false;
-        }
-
-        /** Checks only the captured map so disk deletion cannot affect a running generation. */
-        @Override
-        public boolean skillExists(String name) {
-            return skills.containsKey(name);
-        }
-
-        /** Retains upstream source metadata for Harness namespace resolution. */
-        @Override
-        public AgentSkillRepositoryInfo getRepositoryInfo() {
-            return new AgentSkillRepositoryInfo("frozen", source, false);
-        }
-
-        /** Returns the original upstream source label used by middleware. */
-        @Override
-        public String getSource() {
-            return source;
-        }
-
-        /** A frozen snapshot cannot be made writable after activation. */
-        @Override
-        public void setWriteable(boolean writeable) {
-            if (writeable) {
-                throw new UnsupportedOperationException("frozen_skill_repository");
-            }
-        }
-
-        /** Reports read-only status to the upstream repository contract. */
-        @Override
-        public boolean isWriteable() {
-            return false;
-        }
-
-        /** Closes the original repository once the graph no longer needs its classpath files. */
-        @Override
-        public void close() {
-            delegate.close();
-        }
-
-        /** Serves captured resources through the same Harness lazy-resource interface. */
-        @Override
-        public SkillResources resourcesFor(String name, RuntimeContext context) {
-            ResourceSnapshot snapshot = resources.get(name);
-            if (snapshot == null) {
-                return SkillResources.empty();
-            }
-            return new SkillResources() {
-                /** Reads a captured text resource without touching the workspace filesystem. */
-                @Override
-                public java.util.Optional<String> read(String path) {
-                    return java.util.Optional.ofNullable(snapshot.text().get(path));
-                }
-
-                /** Returns a cloned raw resource so callers cannot mutate the generation snapshot. */
-                @Override
-                public java.util.Optional<byte[]> readBinary(String path) {
-                    return java.util.Optional.ofNullable(snapshot.copyBinary(path));
-                }
-
-                /** Lists captured relative resource paths in stable order. */
-                @Override
-                public List<String> list() {
-                    return snapshot.paths();
-                }
-            };
-        }
-    }
-
     /** Carries an upstream parsed skill and its matching resource snapshot through projection. */
     private record Materialized(AgentSkill skill, ResourceSnapshot resources) {
     }
@@ -592,13 +481,13 @@ public final class JaSkillSources implements AutoCloseable {
             bytes = Map.copyOf(copies);
         }
 
-        /** Returns a cloned byte array to keep the frozen generation immutable to callers. */
+        /** Returns a cloned byte array so projection callers cannot mutate captured hash input. */
         private byte[] copyBinary(String path) {
             byte[] value = bytes.get(path);
             return value == null ? null : value.clone();
         }
 
-        /** Returns all captured paths once, preserving the SkillResources contract. */
+        /** Returns all captured paths once, preserving the upstream SkillResources contract. */
         private List<String> paths() {
             return bytes.keySet().stream().sorted().toList();
         }

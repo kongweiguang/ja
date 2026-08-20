@@ -186,8 +186,8 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
             // Keep user skills in the explicit sidecar data directory while the workspace source
             // remains rooted at the selected project; AgentScope still owns parsing and loading.
             skillSources = new JaSkillSources(data.resolve("skills"), root);
-            // Freeze the selected upstream AgentSkill values before the Harness graph is built;
-            // unknown/stale references therefore fail atomically without a half-installed engine.
+            // Validate and activate selected revisions before the Harness graph is built; the
+            // AgentScope repositories remain live and own parsing, merge precedence, and loading.
             skillSources.freeze(skillRevisions == null ? List.of() : skillRevisions);
             Toolkit toolkit = new Toolkit();
             List<McpActivation> frozenMcp = freezeMcpActivations(mcpActivations);

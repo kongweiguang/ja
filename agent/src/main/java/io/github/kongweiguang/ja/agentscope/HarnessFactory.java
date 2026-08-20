@@ -156,11 +156,9 @@ public final class HarnessFactory {
                 .disableSubagents()
                 .disableDynamicSubagents();
         if (skillSources != null) {
-            // JA supplies the explicit, generation-frozen repositories above. Disable only
-            // AgentScope's live marketplace and implicit workspace source so a running graph
-            // cannot reread disk or receive a duplicate workspace skill namespace. Direct unit
-            // callers without JA sources retain AgentScope defaults for compatibility.
-            builder.disableDynamicSkills().disableDefaultWorkspaceSkills();
+            // JA supplies only explicit builtin/user settings repositories. Keep AgentScope's
+            // live Layer-3/Layer-4 workspace repositories and dynamic middleware enabled: the
+            // upstream AbstractFilesystem is the sole context-aware workspace source.
             skillSources.configure(builder);
         }
         HarnessAgent built = builder.build();

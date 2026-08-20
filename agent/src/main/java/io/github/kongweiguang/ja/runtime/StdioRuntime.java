@@ -741,7 +741,8 @@ public final class StdioRuntime implements AutoCloseable {
             TurnRuntime runtime = activeTurnRuntime.get();
             List<JaSkillSources.SkillView> skills;
             if (runtime instanceof AgentScopeRuntimeGraph graph) {
-                // An active graph owns the frozen projection; it must not reread user files.
+                // An active graph owns the AgentScope-backed projection; no second JA catalog is
+                // created for the request, while the upstream repositories remain authoritative.
                 skills = graph.skillProjection();
             } else {
                 Path userRoot = configuration.dataDirectory() == null

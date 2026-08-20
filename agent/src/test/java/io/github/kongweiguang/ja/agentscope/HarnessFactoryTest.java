@@ -26,12 +26,17 @@ import io.agentscope.harness.agent.filesystem.model.ExecuteResponse;
 import io.agentscope.harness.agent.HarnessAgent;
 import io.agentscope.harness.agent.filesystem.local.LocalFilesystemWithShell;
 import io.agentscope.harness.agent.filesystem.sandbox.AbstractSandboxFilesystem;
+import io.agentscope.harness.agent.middleware.HarnessSkillMiddleware;
 import io.github.kongweiguang.ja.domain.ServerInstanceId;
 import io.github.kongweiguang.ja.protocol.JsonNodes;
 import io.github.kongweiguang.ja.protocol.RpcDirection;
 import io.github.kongweiguang.ja.protocol.RpcRequest;
 import io.github.kongweiguang.ja.runtime.TurnEvent;
+import io.github.kongweiguang.ja.skills.JaSkillSources;
 import io.github.kongweiguang.ja.tools.JaSandboxFilesystem;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -41,7 +46,6 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
 import org.junit.jupiter.api.io.TempDir;
-import java.nio.file.Path;
 
 /** Verifies that the product composition boundary uses the real Harness API safely. */
 final class HarnessFactoryTest {
@@ -98,6 +102,35 @@ final class HarnessFactoryTest {
             assertFalse(agent.getToolkit().getToolNames().contains("agent_send"));
         } finally {
             agent.close();
+        }
+    }
+
+    /** Confirms JA settings do not disable AgentScope's live workspace skill layer or freeze it. */
+    @Test
+    void jaSkillSourcesKeepUpstreamWorkspaceLayerLive(@TempDir Path workspace) throws Exception {
+        Files.createDirectories(workspace.resolve("skills/live-skill"));
+        Files.writeString(workspace.resolve("skills/live-skill/SKILL.md"),
+                "---\nname: live-skill\ndescription: live workspace skill\n---\nlive body",
+                StandardCharsets.UTF_8);
+        Path userSkills = Files.createDirectories(workspace.resolve("user-skills"));
+        JaSandboxFilesystem filesystem = new JaSandboxFilesystem(workspace);
+        try (JaSkillSources sources = new JaSkillSources(userSkills, workspace)) {
+            HarnessAgent agent = new HarnessFactory(HarnessFactory.Config.defaults(), filesystem,
+                    workspace, sources).create(new FixedModel());
+            try {
+                HarnessSkillMiddleware middleware = agent.getDelegate().getMiddlewares().stream()
+                        .filter(HarnessSkillMiddleware.class::isInstance)
+                        .map(HarnessSkillMiddleware.class::cast)
+                        .findFirst().orElseThrow();
+                assertFalse(middleware.isFrozen());
+                String prompt = middleware.onSystemPrompt(agent.getDelegate(), RuntimeContext.empty(),
+                        "base").block();
+                assertTrue(prompt.contains("live-skill"));
+            } finally {
+                agent.close();
+            }
+        } finally {
+            filesystem.close();
         }
     }
 
