@@ -70,7 +70,7 @@ Gate 直接证明：
   Windows 额外限制最多 1024 个 descendant，并在 deadline 内重复 bounded rescan、按叶到根
   校验 creation stamp 后回收，再以重复空扫描确认无残留；process-tree self-test 会真实创建
   8 个 descendant。超出预算或扫描失败会 fail-closed，不会无限等待。
-- Java 的 243 个测试、Rust 的平台化全量测试和前端的 224 个 Vitest 测试会先运行，随后
+- Java 的 245 个测试、Rust 的平台化全量测试和前端的 224 个 Vitest 测试会先运行，随后
   runner 额外重跑 full-duplex/nested、pending、cancel 和 ready-terminal race 定向筛选；
   每个命令都必须在超时和输出上限内退出并出现预期 marker。
 
