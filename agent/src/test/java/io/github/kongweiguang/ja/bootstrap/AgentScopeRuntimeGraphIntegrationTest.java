@@ -250,7 +250,7 @@ final class AgentScopeRuntimeGraphIntegrationTest {
         }
     }
 
-    /** Connects a real stdio MCP fixture before Harness creation and calls its aliased tool. */
+    /** Connects a real stdio MCP fixture after Harness creation and calls its aliased tool. */
     @Test
     void graphActivatesMcpOnSharedToolkitAndReapsChild(@TempDir Path temp) throws Exception {
         Path workspace = Files.createDirectory(temp.resolve("workspace-mcp"));
@@ -361,6 +361,52 @@ final class AgentScopeRuntimeGraphIntegrationTest {
         }
         assertTrue(awaitProcessExit(profileProcess), "profile MCP child remained after graph close");
         assertTrue(awaitProcessExit(toolsProcess), "tools.json MCP child remained after graph close");
+    }
+
+    /**
+     * Injects a raw tools.json name equal to the deterministic profile alias and verifies that
+     * the shared upstream Toolkit rejects the profile without allowing either registration to
+     * survive; both already-started transports must still be reaped by open-failure cleanup.
+     */
+    @Test
+    void graphRejectsProfileAliasThatConflictsWithToolsConfigRawName(@TempDir Path temp)
+            throws Exception {
+        Path workspace = Files.createDirectory(temp.resolve("workspace-mcp-alias-conflict"));
+        Path data = Files.createDirectory(temp.resolve("data-mcp-alias-conflict"));
+        Path profilePid = temp.resolve("mcp-profile-alias.pid");
+        Path toolsPid = temp.resolve("mcp-tools-alias.pid");
+        String java = javaExecutable();
+        String classpath = absoluteClasspath();
+        String profileServer = "mcp_profile_alias";
+        String rawName = mcpAlias(profileServer, "echo");
+        Files.writeString(workspace.resolve("tools.json"), JSON.writeValueAsString(Map.of(
+                "mcpServers", Map.of("mcp_tools_alias", Map.of(
+                        "transport", "stdio",
+                        "command", java,
+                        "args", List.of("-cp", classpath,
+                                "io.github.kongweiguang.ja.mcp.McpRuntimeTest$StdioFixture",
+                                toolsPid.toString(), "tools-alias", "2024-11-05", "normal",
+                                "alias-marker",
+                                rawName))))), StandardCharsets.UTF_8);
+        McpServerDefinition definition = new McpServerDefinition(
+                profileServer, "profile alias conflict", "stdio", java,
+                "2024-11-05", List.of("-cp", classpath,
+                        "io.github.kongweiguang.ja.mcp.McpRuntimeTest$StdioFixture",
+                        profilePid.toString(), "profile-alias"), Map.of(), Map.of(), Map.of(),
+                McpServerDefinition.Auth.none(), true);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> AgentScopeRuntimeGraph.open(workspace, data,
+                        new ServerInstanceId("srv_mcp_alias_conflict"), "profile_mcp_alias_conflict",
+                        "trusted", "full_access", new ToolModel(), List.of(),
+                        List.of(new AgentScopeRuntimeGraph.McpActivation(definition, null))));
+        assertEquals("mcp_server_unavailable", failure.getMessage());
+        assertTrue(awaitFile(profilePid), "profile MCP did not reach alias discovery");
+        assertTrue(awaitFile(toolsPid), "tools.json MCP did not reach raw-name registration");
+        long profileProcess = Long.parseLong(Files.readString(profilePid));
+        long toolsProcess = Long.parseLong(Files.readString(toolsPid));
+        assertTrue(awaitProcessExit(profileProcess), "profile MCP child remained after alias failure");
+        assertTrue(awaitProcessExit(toolsProcess), "tools.json MCP child remained after alias failure");
     }
 
     /** Runs a bounded patch turn and returns the fixture for a mode-specific file assertion. */
@@ -483,6 +529,28 @@ final class AgentScopeRuntimeGraphIntegrationTest {
     /** Computes the expected-hash value used by the JA apply_patch adapter. */
     private static String sha256(byte[] content) throws Exception {
         return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(content));
+    }
+
+    /** Mirrors only the existing provider-safe alias formula so the fixture can induce one collision. */
+    private static String mcpAlias(String namespace, String rawName) throws Exception {
+        String readable = "ja_" + aliasPart(namespace, 18) + "_" + aliasPart(rawName, 20);
+        String hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                .digest((namespace + "\u0000" + rawName).getBytes(StandardCharsets.UTF_8)))
+                .substring(0, 16);
+        String candidate = readable + "_" + hash;
+        if (candidate.length() <= 64) {
+            return candidate;
+        }
+        return candidate.substring(0, 64 - 1 - 16) + "_" + hash;
+    }
+
+    /** Keeps the fixture alias input within the same provider-safe character subset. */
+    private static String aliasPart(String value, int maxLength) {
+        String normalized = value.replaceAll("[^A-Za-z0-9_-]", "_");
+        if (normalized.isEmpty() || !Character.isLetterOrDigit(normalized.charAt(0))) {
+            normalized = "x_" + normalized;
+        }
+        return normalized.substring(0, Math.min(maxLength, normalized.length()));
     }
 
     /** Resolves the Java executable used by the isolated stdio fixture child. */

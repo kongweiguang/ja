@@ -256,11 +256,11 @@ public final class HarnessFactory {
      * <p>The graph-owned Toolkit adapter keeps AgentScope's MCP lifecycle map attached while
      * Harness construction performs its normal build steps. Keeping this tiny composition cleanup
      * here prevents upstream {@code tools.json} stdio transports from outliving the Harness
-     * without creating a second MCP registry.</p>
+     * without creating a second MCP registry. The shared Toolkit is used directly so cleanup
+     * also works when Harness construction fails before {@link #agent} is assigned.</p>
      */
     public void closeToolsConfigMcpClients(Collection<String> serverNames) {
-        HarnessAgent current = agent;
-        if (current == null || serverNames == null || serverNames.isEmpty()) {
+        if (serverNames == null || serverNames.isEmpty()) {
             return;
         }
         RuntimeException failure = null;
@@ -269,7 +269,7 @@ public final class HarnessFactory {
                 continue;
             }
             try {
-                current.getToolkit().removeMcpClient(serverName).block(Duration.ofSeconds(3));
+                toolkit.removeMcpClient(serverName).block(Duration.ofSeconds(3));
             } catch (RuntimeException exception) {
                 if (failure == null) {
                     failure = new IllegalStateException("mcp_tools_config_close_failed", exception);

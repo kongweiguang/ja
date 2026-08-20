@@ -537,8 +537,8 @@ class McpRuntimeTest {
     public static final class StdioFixture {
         /**
          * Speaks the minimal MCP request set and exits when the parent closes stdin.
-         * Optional identity/protocol arguments let graph tests prove alias routing and atomic
-         * failure without introducing a second bespoke MCP transport fixture.
+         * Optional identity/protocol/tool-name arguments let graph tests prove alias routing and
+         * atomic failure without introducing a second bespoke MCP transport fixture.
          */
         public static void main(String[] args) throws Exception {
             Path pidFile = Path.of(args[0]);
@@ -546,6 +546,7 @@ class McpRuntimeTest {
             String configuredProtocol = args.length > 2 ? args[2] : "2024-11-05";
             String behavior = args.length > 3 ? args[3] : "normal";
             Path behaviorMarker = args.length > 4 ? Path.of(args[4]) : null;
+            String toolName = args.length > 5 ? args[5] : "echo";
             boolean failOnce = "fail-once".equals(behavior)
                     && behaviorMarker != null && Files.notExists(behaviorMarker);
             if (failOnce) {
@@ -566,7 +567,8 @@ class McpRuntimeTest {
                         case "initialize" -> "{\"protocolVersion\":\"" + protocol
                                 + "\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\""
                                 + identity + "\",\"version\":\"1\"}}";
-                        case "tools/list" -> "{\"tools\":[{\"name\":\"echo\",\"description\":\""
+                        case "tools/list" -> "{\"tools\":[{\"name\":\"" + toolName
+                                + "\",\"description\":\""
                                 + identity + "\",\"inputSchema\":{\"type\":\"object\"},"
                                 + "\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false}}]}";
                         case "tools/call" -> "{\"content\":[{\"type\":\"text\",\"text\":\""

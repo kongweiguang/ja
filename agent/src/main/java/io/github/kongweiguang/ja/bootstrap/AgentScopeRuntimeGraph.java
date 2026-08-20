@@ -6,6 +6,7 @@ package io.github.kongweiguang.ja.bootstrap;
 import io.agentscope.core.model.Model;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.agentscope.AgentScopeTurnRuntime;
+import io.github.kongweiguang.ja.agentscope.AgentScopeEngine;
 import io.github.kongweiguang.ja.agentscope.HarnessFactory;
 import io.github.kongweiguang.ja.persistence.SqlitePersistence;
 import io.github.kongweiguang.ja.persistence.SqlitePersistenceConfig;
@@ -138,11 +139,11 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
     }
 
     /**
-     * Opens one generation after freezing selected MCP definitions and
-     * connecting every server on the shared AgentScope Toolkit.  A Harness is
-     * created only after all clients are READY, so one failed server cannot
-     * leave a half-registered agent graph visible to the host.  Profile and
-     * workspace tools.json names are checked before either source starts.
+     * Opens one generation after freezing selected MCP definitions on the shared AgentScope
+     * Toolkit. The upstream Harness is built first so its tools.json raw names are visible to
+     * the profile alias guard; a failed profile activation is cleaned up before the graph is
+     * published. Profile and workspace tools.json server names are checked before either source
+     * starts.
      */
     public static AgentScopeRuntimeGraph open(Path workspace, Path dataDirectory,
                                               ServerInstanceId serverInstanceId,
@@ -183,6 +184,9 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
         JaSandboxFilesystem filesystem = null;
         JaSkillSources skillSources = null;
         McpRuntime mcpRuntime = null;
+        HarnessFactory factory = null;
+        AgentScopeEngine engine = null;
+        Set<String> toolsConfigServerNames = Set.of();
         try {
             persistence = existingPersistence != null ? existingPersistence
                     : SqlitePersistence.open(SqlitePersistenceConfig.of(
@@ -196,10 +200,15 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
             skillSources.freeze(skillRevisions == null ? List.of() : skillRevisions);
             Toolkit toolkit = HarnessFactory.newToolkit();
             List<McpActivation> frozenMcp = freezeMcpActivations(mcpActivations);
-            Set<String> toolsConfigServerNames = McpRuntime
+            toolsConfigServerNames = McpRuntime
                     .rejectProfileToolsConfigNameConflicts(root, filesystem,
                             frozenMcp.stream().map(activation -> activation.definition().revision())
                                     .toList());
+            factory = new HarnessFactory(HarnessFactory.Config.defaults(),
+                    filesystem, root, skillSources, persistence.agentState(), toolkit);
+            // Build upstream tools.json MCP first so the shared Toolkit exposes its raw names to
+            // the profile adapter; no second discovery client or name registry is introduced.
+            engine = factory.createEngine(model);
             Map<String, String> secretMarkers = new HashMap<>();
             try {
                 for (McpActivation activation : frozenMcp) {
@@ -223,10 +232,9 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
                         throw new IllegalStateException("mcp_server_unavailable");
                     }
                 }
-                HarnessFactory factory = new HarnessFactory(HarnessFactory.Config.defaults(),
-                        filesystem, root, skillSources, persistence.agentState(), toolkit);
                 AgentScopeTurnRuntime turns = new AgentScopeTurnRuntime(
-                        factory.createEngine(model), serverInstanceId);
+                        engine, serverInstanceId);
+                engine = null;
                 return new AgentScopeRuntimeGraph(persistence, filesystem, skillSources, factory, turns,
                         mcpRuntime, toolkit, toolsConfigServerNames, serverInstanceId, wireProfileRevision,
                         workspaceTrust, profileAccessMode, existingPersistence == null);
@@ -237,12 +245,12 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
             }
         } catch (IOException failure) {
             IllegalStateException wrapped = new IllegalStateException("skill_sources_invalid", failure);
-            closeAfterOpenFailure(mcpRuntime, filesystem, skillSources, persistence,
-                    existingPersistence == null, wrapped);
+            closeAfterOpenFailure(factory, toolsConfigServerNames, engine, mcpRuntime,
+                    filesystem, skillSources, persistence, existingPersistence == null, wrapped);
             throw wrapped;
         } catch (RuntimeException failure) {
-            closeAfterOpenFailure(mcpRuntime, filesystem, skillSources, persistence,
-                    existingPersistence == null, failure);
+            closeAfterOpenFailure(factory, toolsConfigServerNames, engine, mcpRuntime,
+                    filesystem, skillSources, persistence, existingPersistence == null, failure);
             throw failure;
         }
     }
@@ -544,13 +552,34 @@ public final class AgentScopeRuntimeGraph implements TurnRuntime {
         }
     }
 
-    /** Releases partially opened resources without hiding the original startup failure. */
-    private static void closeAfterOpenFailure(McpRuntime mcpRuntime,
+    /**
+     * Releases a partially opened graph in ownership order without hiding the original startup
+     * failure; factory cleanup uses the shared Toolkit even when Harness construction never
+     * assigned its agent field.
+     */
+    private static void closeAfterOpenFailure(HarnessFactory factory,
+                                              Set<String> toolsConfigServerNames,
+                                              AgentScopeEngine engine,
+                                              McpRuntime mcpRuntime,
                                               JaSandboxFilesystem filesystem,
                                               JaSkillSources skillSources,
                                               SqlitePersistence persistence,
                                               boolean closePersistence,
                                               RuntimeException failure) {
+        if (engine != null) {
+            try {
+                engine.close();
+            } catch (RuntimeException cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+        }
+        if (factory != null) {
+            try {
+                factory.closeToolsConfigMcpClients(toolsConfigServerNames);
+            } catch (RuntimeException cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+        }
         if (mcpRuntime != null) {
             try {
                 mcpRuntime.close();
