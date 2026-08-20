@@ -40,6 +40,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class StdioRuntimeChildIntegrationTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String READY_TOKEN = "0123456789abcdef0123456789abcdef";
+    /**
+     * Keeps child startup bounded while allowing slower Intel/macOS Native Image runners to
+     * finish class initialization; the deadline is intentionally finite so a dead child still
+     * fails promptly instead of turning the integration suite into an unbounded wait.
+     */
+    private static final long CHILD_READ_TIMEOUT_SECONDS = 15;
 
     /**
      * Resolves the current JVM launcher using the host platform suffix instead of assuming
@@ -1007,7 +1013,7 @@ class StdioRuntimeChildIntegrationTest {
     private static JsonNode readJson(BufferedReader output) throws Exception {
         FutureTask<String> read = new FutureTask<>(output::readLine);
         Thread.ofVirtual().start(read);
-        String line = read.get(3, TimeUnit.SECONDS);
+        String line = read.get(CHILD_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         assertNotNull(line);
         assertFalse(line.isBlank());
         return JSON.readTree(line);
