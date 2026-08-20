@@ -37,7 +37,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class CapabilityProbeCache implements AutoCloseable {
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(5);
     private static final Duration CLOSE_WAIT = Duration.ofSeconds(1);
-    private static final Duration STOP_GRACE = Duration.ofMillis(50);
+    // A cooperative provider may need a few scheduler turns to observe cancellation on a busy
+    // Windows runner; keep the grace finite but wide enough to avoid false permanent-faults.
+    private static final Duration STOP_GRACE = Duration.ofMillis(250);
     private static final Duration IDLE_WORKER_TIMEOUT = Duration.ofMillis(100);
     private static final int DEFAULT_CONCURRENCY = 4;
     private static final int DEFAULT_MAX_ENTRIES = 256;
